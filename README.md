@@ -24,6 +24,7 @@
 
 - [今日工作總結](docs/2026-05-22-work-summary.md)
 - [Hermes agent-first 架構研究](docs/hermes-agent-first-architecture.md)
+- [Company Data Contract v0](docs/company-data-contract-v0.md)
 - [研究來源](docs/research-sources.md)
 - [OHYA SEO 架構參考快照](references/ohya-seo-architecture/SNAPSHOT.md)
 - [Closed Loop Kernel prototype](PROTOTYPE.md)
