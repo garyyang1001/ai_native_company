@@ -1,0 +1,397 @@
+YouTube Transcript
+Video ID: X_JsIHUfUjc
+Duration: 13:29
+Segments: 391
+URL: https://youtu.be/X_JsIHUfUjc
+
+0:00 This is based a little bit off a talk
+0:01 Diana gave. There's a video up over the
+0:03 weekend which is super cool. Um Jack
+0:04 Dorsey was tweeting some stuff like two
+0:06 or three weeks ago that I thought was
+0:08 super cool and I've kind of um stolen a
+0:10 bunch of those ideas and shove them into
+0:13 here. This talk is like pretty
+0:14 conceptual and high level about thinking
+0:17 about how to build companies. So the
+0:19 Roman legions were designed to
+0:23 project power over two continents or
+0:27 something from Rome at the center to
+0:30 like these people on Hadron's wall up in
+0:31 Scotland. And the idea was um this
+0:35 nested hierarchies with consistent spans
+0:37 of control and you had like named
+0:39 individual with spans of control to pass
+0:42 orders down and send information back up
+0:44 the hierarchy. And if you think about
+0:46 most companies today, they are organized
+0:48 like a Roman legion where human beings
+0:51 are the conduit for information flowing
+0:53 up and down. And so Jack Dorsey's tweet
+0:55 which I thought was great was it's like
+0:56 this underlying assumption that
+0:58 hierarchically organized companies are
+1:00 the are the way that we should be
+1:02 organizing like our economic units of
+1:04 value. And I think AI basically breaks
+1:07 that. If you talk to people a year ago
+1:09 about how AI was useful, they talked
+1:13 about productivity, like co-pilots,
+1:16 making engineers 20% more productive,
+1:18 adding co-pilots to workflows, shipping
+1:19 more software. But I think that is
+1:22 actually a broken way of thinking about
+1:25 AI. That's like Pete had a great blog
+1:26 post. We're basically just like taking
+1:28 the old way of working and adding like a
+1:30 more powerful engine onto it. And
+1:31 instead of that, I think you can
+1:33 reimagine like what a company is and how
+1:36 it acts. And so as Gary's talking like
+1:38 he I genuinely believe can produce more
+1:41 code than an entire engineering team.
+1:44 The thing that's really stuck with me is
+1:45 this idea of like extracting the domain
+1:48 knowledge from your company and defining
+1:50 it as a as like context or a set of
+1:53 skills or whatever you want to call it.
+1:55 But like this idea that there's domain
+1:56 knowledge or business knowledge or like
+1:58 some knowhow that's inside the heads of
+2:01 people and in Slack messages and in
+2:04 emails and in notion. All of this like
+2:07 information together defines how your
+2:09 company works. And if you can make that
+2:12 legible, you suddenly can can move from
+2:16 this hierarchal organization to a sort
+2:18 of intelligent AI powered organization
+2:21 with AI native software. AI isn't the
+2:24 some it's not something you bolt onto
+2:25 the side of a company. It's not like a
+2:27 tool you give to your engineers to make
+2:28 them more productive. But I think you
+2:30 can reimagine what a company is as a set
+2:33 of recursive self-improving AI loops. I
+2:37 think this is really, really, really
+2:38 important because when it gets there, I
+2:40 think the company starts to self-improve
+2:43 even when you're sleeping. So, let me
+2:45 give you an example. Diana's talks about
+2:47 this as well. this AI loop. You start
+2:49 with like a sensor layer, which is like
+2:51 that's a fancy word, but really it might
+2:53 be like emails from your customers.
+2:56 Might be support tickets, code changes,
+2:59 people canceling their subscription,
+3:02 product telemetry. It's like sensor data
+3:05 to get information from the outside
+3:06 world. And then a a policy layer,
+3:08 decision layer, like rules about what
+3:10 you can do, what it has to ask a human
+3:12 permission for, what it must log. A tool
+3:15 layer, that's kind of Gary's skills and
+3:17 code. Like the tool layer is Gary's
+3:19 code. It's basically deterministic APIs,
+3:21 things like query my database or look at
+3:24 my calendar. Um, a set of tools that the
+3:28 the AI can call a quality gate like that
+3:31 might be evalistic checks, safety
+3:33 filters, human review for high-risk
+3:35 stuff. and then a learning mechanism.
+3:38 It's like your system interacts with the
+3:40 real world, picks up where it doesn't
+3:42 work, and loops back into the top again.
+3:43 And if you can run every single step of
+3:45 that without human intervention, without
+3:47 with minimal human intervention, your
+3:49 system gets better and better and better
+3:51 while you're sleeping. And I can give
+3:53 you actual examples of this that are
+3:55 live right now. We started with an agent
+3:57 that you can ask and it it has
+3:58 deterministic tools to query our
+4:00 database. Pretty simple, like when did I
+4:02 last have office hours with this
+4:04 company? Then it got a little bit
+4:05 smarter which was like for this company
+4:07 I'm doing offices hours with right now
+4:09 they need introductions for anyone in
+4:11 petrochemicals or something and it could
+4:12 query the database in different ways and
+4:14 use rag and all sorts of stuff to like
+4:16 come up with five relevant founders for
+4:18 you to meet. But again this is like this
+4:19 is a sidekick right this is an agent
+4:21 this is like the old this is last year's
+4:23 version of how AI is making me better as
+4:26 a group partner. It's making me 20 or
+4:27 30% more effective. The aha moment for
+4:30 me came when we put a monitoring agent
+4:33 on top of that which looked at every
+4:35 single query every single YC employee
+4:38 was doing and saw when it worked and
+4:41 when it did not work and when it did not
+4:43 work it's like oh why not what would
+4:46 have made this query work do we need
+4:48 different deterministic tools do we need
+4:49 to update the skills file do we need a
+4:51 different database view do we need a new
+4:52 index and this happen this literally
+4:54 happens overnight now let's write the
+4:56 code put in a merge request to the YC
+4:58 codebase have an agent review it and
+5:00 merge it and deploy it. So when a human
+5:02 comes the next day to ask the same
+5:04 query, it will now succeed. For me, that
+5:07 was like the holy [ __ ] [ __ ] right?
+5:09 That's not just AI making you 20 or 30%
+5:11 more valuable. It is the AI going
+5:13 through this loop to figure out how to
+5:16 self-improve. And I think basically if
+5:18 you can identify parts of your company
+5:20 that work like this and eliminate as
+5:24 have the human and kind of a monitoring
+5:26 of supervisory capacity,
+5:28 you can just throw tokens at this
+5:30 problem and your company will get
+5:31 better. And so other examples might be
+5:34 if you have product analytics, having an
+5:36 agent go through your product analytics
+5:37 to to figure out what part of your sales
+5:40 funnel is presenting the highest amount
+5:42 of friction, researching best practices,
+5:44 putting in place an AB test, running it
+5:46 for a week, picking the best version,
+5:47 and deploying it. Then doing that again
+5:49 and again and again for your product.
+5:50 Just have a self-optimizing like product
+5:52 loop. Or you do it with customer service
+5:54 queries. You have customer suggestions
+5:56 coming in and in and in. you triage it
+5:59 with a kind of you have to have an agent
+6:01 which is like your chief product officer
+6:02 and your chief technology officer who
+6:03 make kind of judgment calls about okay
+6:05 this is a suggestion we just don't want
+6:07 to do we'll discard it but no this is a
+6:08 suggestion which is now in line with our
+6:10 road map um we can do it overnight let's
+6:13 write the code let's deploy it let's
+6:14 ship it to the customer without a human
+6:16 being involved so I think if you can
+6:18 think about each part of your company as
+6:21 a self-improving like recursive AI loop
+6:23 it becomes very very different to this
+6:24 like hierarchically organized Roman
+6:26 legion from a company so what So like if
+6:28 you want to do this, what are the
+6:29 implications? One is like burn tokens,
+6:31 not headcount. We are seeing companies
+6:33 get to demo day with about 5x more
+6:36 revenue per employee than they did 18
+6:39 months ago. And I think that's going to
+6:40 continue to series A and series B. And
+6:43 so I think you're going to be
+6:45 constrained on token usage, not on
+6:47 headcount really, really soon. The blunt
+6:49 measure now is just like measuring
+6:50 everyone's token usage, which is
+6:52 obviously like dumb and gameable at the
+6:55 extreme, but directionally I think is
+6:58 correct. We're in the phase of like what
+7:01 is possible right now and so everyone
+7:03 should be experimenting to the max to
+7:05 figure out what we can even do with this
+7:07 crazy new intelligence we have. As soon
+7:09 as you turn it into a leaderboard and
+7:10 people get promoted or fired based on
+7:12 it, obviously it gets gamed, obviously
+7:13 that's dumb. But I think directionally
+7:16 figuring out who in your organization is
+7:17 token maxing, who is not is like a good
+7:20 way to think about which employees you
+7:22 should be spending your time with. I
+7:23 think middle management is done. I just
+7:25 don't think you need middle management
+7:26 for this coordination problem. I think
+7:28 AI should be doing it. And for me, there
+7:29 are two roles. Jack Dorsey has three. I
+7:32 actually don't like the third one, so I
+7:33 deleted it. But there are two roles that
+7:35 really, really matter for me. I think
+7:36 everyone just has to be an IC now, a
+7:38 builder, an operator. And I think
+7:40 crucially having directly responsible
+7:42 individuals to get anything done I think
+7:45 you need a named human not a committee
+7:46 not a group of people just a single
+7:48 person and I think you can build
+7:50 companies based on IC's effectively I
+7:52 think just middle management is is over
+7:54 so building this self-improving company
+7:56 that's a dream and by the way I think
+7:58 like people are at the bleeding edge of
+8:00 this right now I'd be interested to see
+8:02 where you all are but it feels like
+8:03 people are like exploring the boundaries
+8:05 here I'm not sure anyone has a truly
+8:08 self-improving company in every
+8:09 function. I might be wrong. You might
+8:11 prove me wrong. What would I do? First
+8:13 of all, this is really, really
+8:14 important. I would make the entire
+8:16 organization legible to AI. What does
+8:18 that mean? It means you've got to record
+8:20 everything.
+8:22 Simplistically, all of our um partner
+8:25 emails. Now, if you email a YC partner,
+8:27 that email is in the YC database. Every
+8:30 Slack message, every DM, every office
+8:32 hour we've started recording for the
+8:33 last three or four months. every single
+8:35 thing that happens, if it is recorded,
+8:38 it happened to the AI. If it did not get
+8:40 recorded, it is it did not happen to
+8:42 your intelligence. You know what I mean?
+8:44 And so, I was talking with some founders
+8:46 over here um just now and we're having
+8:48 like really good conversations about
+8:49 their company, but every conversation I
+8:52 had, I was like, "Fuck, I need to be
+8:53 recording this conversation." Because
+8:55 some guy wanted an introduction to I
+8:57 can't even remember who the introduction
+8:58 was now. Who was that? I was talking to
+9:02 someone about and I promise you an
+9:03 introduction. said yes. And I said,
+9:04 "Email me afterwards cuz I would I'm
+9:06 going to forget this. I'm going to talk
+9:07 to 20 people." Yeah. So, it needs to be
+9:09 on my phone or a clip or or smart
+9:11 glasses or we deck out every room with
+9:13 like microphones. But basically,
+9:15 everything needs to be recorded so that
+9:16 it can be legible to the AI. And then,
+9:17 as Gary talked about like diorization,
+9:20 you cannot pump in 100,000 hours worth
+9:23 of recordings into a context window. So,
+9:25 you have to diorize it. You have to
+9:27 basically aggregate it down, synthesize
+9:28 it into the important parts, and then
+9:30 give the AI breadcrumbs. It's like,
+9:32 okay, so here's an example. Who's read
+9:34 the user manual? The YC user manual.
+9:36 Hopefully, everyone in this room has at
+9:37 least opened the user manual at one
+9:38 point in time, right? Like, it's fine.
+9:41 It was written 5 to 10 years ago, most
+9:42 of it. It's kind of out of date. So, Haj
+9:45 thought uh last weekend, since now we've
+9:48 got about 2,000 hours of recorded office
+9:50 hours in the last 3 months, why don't we
+9:51 regenerate the user manual? And so you
+9:54 can click like you give it a set of
+9:55 instructions. You basically diorize it
+9:57 down, synthes like categorize it into
+10:00 certain areas like fundraising, hiring,
+10:02 co-founder disputes, whatever. And then
+10:04 write me a new user manual. And by the
+10:06 end of the weekend, he had 150 page user
+10:08 manual, which is dramatically better
+10:10 than the existing user manual. And now
+10:12 we can also update it every single
+10:14 month. So our user manual becomes
+10:16 self-improving. Every new piece of
+10:18 advice we give, it's compared with the
+10:20 existing user manual and either
+10:21 incorporated or thrown away. So the user
+10:23 manual becomes this up-to-date living
+10:25 brain of the advice we give to founders.
+10:28 And obviously it doesn't stop as a user
+10:29 manual. You then pump it in as context
+10:31 to an AI agent and suddenly you can ask
+10:33 a super intelligent AI and get the
+10:35 combined wisdom of 16 YC partners in
+10:37 one,
+10:39 but only if it's legible. So you have to
+10:42 record everything. The second point is
+10:43 kind of the same, right? Like if it
+10:44 creates an artifact that can
+10:45 self-improve, it's legible. If it
+10:47 doesn't, you throw it away. The third
+10:49 point then is that every function can
+10:52 generate this used to say dashboards.
+10:54 It's not just dashboards. It's on demand
+10:55 software. Codeex 55 is now good enough.
+10:57 You can oneshot most simple inter like
+11:00 most internal software dashboards you
+11:03 can oneshot to a pretty high level of
+11:04 quality. I tried it over the weekend on
+11:06 a bunch of our stuff. It's just unreal.
+11:09 So all of your internal operations teams
+11:11 should be sitting on this layer of like
+11:14 kind of intelligence understanding and
+11:16 then creating their own dashboards and
+11:18 their own workflows. And I would see
+11:20 that those as entirely disposable. I
+11:23 would very preciously store all the
+11:25 data. So as Gary said, he puts it all
+11:28 all of his emails in markdown. Never
+11:29 throw anything away, but then treat the
+11:32 the software as ephemeral. You can you
+11:34 can generate it, you can regenerate it.
+11:36 The valuable part is like the
+11:38 comprehension inside people's heads of
+11:39 like this is how the function works.
+11:42 This is how we run a YC event. Whatever
+11:44 the software to actually run the event,
+11:45 you can generate for the event. You can
+11:47 throw it away. The mo the models get
+11:48 smarter in a month or two. Throw the
+11:50 software away. Give it your original set
+11:52 of instructions and regenerate the
+11:54 software. So I think the business
+11:55 context and and skills are the valuable
+11:58 part. I think the software on top of it
+12:00 is ephemeral. So what what are humans
+12:03 for in this world? I think basically
+12:05 we're talking about a company brain and
+12:07 I know a bunch of people in this room
+12:08 are building this but the bit in the
+12:10 middle like all of your data, all of
+12:12 your emails, your DMs, the skills, the
+12:15 knowhow that is like the company brain
+12:18 and I think the humans sit around the
+12:19 edge of this interfacing with the real
+12:21 world. So it's where this intelligence
+12:24 makes contact with reality. Human beings
+12:26 reach into places the models can't go
+12:28 yet. That might be like a conference. It
+12:32 might be a I'm trying to think of
+12:33 examples. I would say a phone call, but
+12:34 I think the AI can reach into phone
+12:36 calls pretty easily now. Um I think it's
+12:38 like novel situations, ethical
+12:40 considerations, high stakes moments, you
+12:42 know, it's like it's where the founder
+12:43 comes to us and is like thinking about
+12:47 breaking up with their co-founder,
+12:48 right? It's like those real high stakes,
+12:50 high emotion moments where you really
+12:52 want a human being. I think that's where
+12:54 the human fits for all of you like sales
+12:57 conversations. I think that's a human
+12:59 being in the room for the next 20 years.
+13:01 So the humans live I think around the
+13:02 edge and I'm over time and cool vision
+13:05 should bullhorn me. I will leave you
+13:07 this one question. If you were building
+13:09 your company today would you start it in
+13:12 this shape for most of you you're small
+13:15 enough to build it right and so I don't
+13:17 think you have any excuse and I know
+13:19 there are a few of you who are in the
+13:21 process of ripping up and rebuilding
+13:23 your company. So with that I will stop
+13:25 um and we'll hand over to Pete. Thank
+13:26 you for listening.
