@@ -1,0 +1,882 @@
+#!/usr/bin/env python3.11
+"""
+schema-generator — 為 好事發生數位 文章產生 Schema.org JSON-LD 結構化資料
+
+Deterministic — 不靠 LLM,用 HTML 解析偵測 FAQ / HowTo / Breadcrumb pattern
+
+Usage:
+  schema-generator <url> --html-file path.html    # 讀本地 HTML 檔
+  schema-generator <url> --stdin-json             # 從 stdin 讀 JSON 結構化資料(見下方格式)
+  schema-generator --from-md path/02-draft.md     # 讀本地 markdown (writer pipeline)
+  schema-generator <url> --inject                 # 輸出含 <script type="application/ld+json"> 的完整 block
+  schema-generator --batch --cache-dir DIR        # 批次處理:從 cache 目錄讀 HTML 檔
+
+stdin-json 格式 (由 agent 透過 fetcher-mcp / puppeteer 產生):
+  {
+    "url": "https://ohya.co/...",
+    "metas": {"og:title": "...", "description": "...", "og:image": "...", ...},
+    "canonical": "https://...",
+    "breadcrumb": {"links": [{"text":"首頁","href":"..."},...], "lastItem": "文章標題"},
+    "sections": [{"level":2,"text":"H2 text","content":"..."}, ...]
+  }
+
+Output (非 batch):
+  stdout: JSON array of schema objects (Article + BreadcrumbList + FAQPage? + HowTo?)
+  --inject: 輸出可直接貼進 <head> 的 <script> tags
+
+Output (batch):
+  {output_dir}/{slug}.json   per-article JSON-LD
+  {output_dir}/_summary.json  {total, with_faq, with_howto, errors}
+
+Requires:
+  - Python 3.11 + beautifulsoup4 + lxml (html-file mode)
+  - bin/neo4j-query (batch mode with --neo4j)
+  - Cloudflare 擋 curl,live fetch 不可用;用 --html-file / --stdin-json / --from-md
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from html import unescape
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+try:
+    from bs4 import BeautifulSoup, Tag
+except ImportError:
+    print(
+        "ERROR: missing beautifulsoup4. run: python3.11 -m pip install beautifulsoup4 lxml",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+BIN_DIR = Path(__file__).resolve().parent
+SITE_URL = "https://ohya.co"
+SITE_NAME = "Study Central 遊學無邊界"
+PUBLISHER_LOGO = f"{SITE_URL}/wp-content/uploads/2023/01/logo.png"
+
+# ---------------------------------------------------------------------
+# HTML fetching
+# ---------------------------------------------------------------------
+
+def fetch_html(url: str) -> str:
+    """Fetch live HTML via curl."""
+    result = subprocess.run(
+        [
+            "curl", "-sL", "--max-time", "20",
+            "-A", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "-H", "Accept: text/html,application/xhtml+xml",
+            "-H", "Accept-Language: zh-TW,zh;q=0.9,en;q=0.8",
+            url,
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"curl failed (exit {result.returncode}): {result.stderr[:200]}")
+    if not result.stdout.strip():
+        raise RuntimeError(f"Empty response from {url}")
+    return result.stdout
+
+
+def load_html(url: str, html_file: str | None = None) -> str:
+    if html_file:
+        return Path(html_file).read_text(encoding="utf-8")
+    return fetch_html(url)
+
+# ---------------------------------------------------------------------
+# Metadata extraction
+# ---------------------------------------------------------------------
+
+def extract_meta(soup: BeautifulSoup, url: str) -> dict:
+    """Extract article metadata from HTML meta tags and content."""
+    meta = {"url": url}
+
+    # og / meta tags
+    for tag in soup.find_all("meta"):
+        prop = tag.get("property", "") or tag.get("name", "")
+        content = tag.get("content", "")
+        if prop == "og:title":
+            meta["og_title"] = content
+        elif prop == "og:description" or prop == "description":
+            meta.setdefault("description", content)
+        elif prop == "og:image":
+            meta["image"] = content
+        elif prop == "article:published_time":
+            meta["published"] = content
+        elif prop == "article:modified_time":
+            meta["modified"] = content
+        elif prop == "og:url":
+            meta["canonical"] = content
+
+    # <title> fallback
+    title_tag = soup.find("title")
+    if title_tag:
+        meta.setdefault("og_title", title_tag.get_text(strip=True))
+
+    # canonical <link>
+    canon = soup.find("link", rel="canonical")
+    if canon and canon.get("href"):
+        meta.setdefault("canonical", canon["href"])
+
+    # Try to find author from page content
+    # Look for common WordPress author patterns
+    author_el = soup.select_one(".author-name, .entry-author-name, .post-author, [rel='author']")
+    if author_el:
+        meta["author"] = author_el.get_text(strip=True)
+
+    return meta
+
+
+def extract_breadcrumb(soup: BeautifulSoup, url: str) -> list[dict]:
+    """Extract breadcrumb from HTML or construct from URL."""
+    crumbs = [{"name": "首頁", "url": SITE_URL}]
+
+    # Try parsing breadcrumb nav from HTML
+    bc_el = soup.select_one(
+        "nav.breadcrumb, .breadcrumbs, .breadcrumb-trail, "
+        "[class*='breadcrumb'], nav[aria-label='breadcrumb']"
+    )
+    if bc_el:
+        links = bc_el.find_all("a")
+        for a in links:
+            href = a.get("href", "")
+            text = a.get_text(strip=True)
+            if text and text != "首頁" and href:
+                if not href.startswith("http"):
+                    href = SITE_URL + href
+                crumbs.append({"name": text, "url": href})
+        # Last item (current page, no link)
+        last_text = bc_el.get_text(strip=True)
+        # The last crumb is typically the page title without a link
+        spans = bc_el.find_all("span")
+        for s in spans:
+            if not s.find("a") and s.get_text(strip=True):
+                crumbs.append({"name": s.get_text(strip=True), "url": url})
+                break
+        return crumbs
+
+    # Fallback: construct from URL path
+    parsed = urlparse(url)
+    parts = [p for p in parsed.path.strip("/").split("/") if p]
+    if len(parts) >= 2:
+        category_slug = parts[0]
+        category_name = unquote(category_slug).replace("-", " ").title()
+        crumbs.append({
+            "name": category_name,
+            "url": f"{SITE_URL}/{category_slug}/",
+        })
+    # Article itself
+    title_tag = soup.find("title")
+    page_title = title_tag.get_text(strip=True) if title_tag else parts[-1] if parts else ""
+    # Strip site name suffix from title
+    page_title = re.sub(r'\s*[|–—]\s*Study Central.*$', '', page_title)
+    crumbs.append({"name": page_title, "url": url})
+
+    return crumbs
+
+# ---------------------------------------------------------------------
+# FAQ detection
+# ---------------------------------------------------------------------
+
+def detect_faq(soup: BeautifulSoup) -> list[dict]:
+    """Detect FAQ section: H2 containing 'FAQ' or '常見問題', then H3 questions underneath."""
+    faqs = []
+
+    # Find the FAQ heading
+    faq_heading = None
+    for h2 in soup.find_all(["h2"]):
+        text = h2.get_text(strip=True)
+        if re.search(r'FAQ|常見問題|Q\s*&\s*A|問答', text, re.I):
+            faq_heading = h2
+            break
+
+    if not faq_heading:
+        return faqs
+
+    # Collect H3 questions and their answers under this FAQ section
+    current_q = None
+    current_a_parts = []
+
+    for sibling in faq_heading.find_next_siblings():
+        if not isinstance(sibling, Tag):
+            continue
+        tag_name = sibling.name
+
+        # Stop at next H2 (new section)
+        if tag_name == "h2":
+            break
+
+        if tag_name == "h3":
+            # Save previous Q&A
+            if current_q and current_a_parts:
+                answer = " ".join(current_a_parts).strip()
+                if answer:
+                    faqs.append({"question": current_q, "answer": answer})
+            current_q = sibling.get_text(strip=True)
+            current_a_parts = []
+        elif current_q and tag_name in ("p", "ul", "ol", "div", "blockquote"):
+            text = sibling.get_text(separator=" ", strip=True)
+            if text:
+                current_a_parts.append(text)
+
+    # Save last Q&A
+    if current_q and current_a_parts:
+        answer = " ".join(current_a_parts).strip()
+        if answer:
+            faqs.append({"question": current_q, "answer": answer})
+
+    return faqs
+
+# ---------------------------------------------------------------------
+# HowTo detection
+# ---------------------------------------------------------------------
+
+def detect_howto(soup: BeautifulSoup) -> dict | None:
+    """Detect HowTo pattern: step-by-step content with numbered items or 'Step N' headings."""
+
+    # Strategy 1: H2/H3 with step keywords
+    step_headings = []
+    for h in soup.find_all(["h2", "h3"]):
+        text = h.get_text(strip=True)
+        if re.match(r'(步驟|Step|第\s*[一二三四五六七八九十\d]+\s*步|STEP)\s*[\d一二三四五六七八九十]', text, re.I):
+            step_headings.append(h)
+
+    if len(step_headings) >= 3:
+        steps = []
+        for h in step_headings:
+            step_name = h.get_text(strip=True)
+            # Collect text after heading until next heading
+            desc_parts = []
+            for sib in h.find_next_siblings():
+                if not isinstance(sib, Tag):
+                    continue
+                if sib.name in ("h2", "h3"):
+                    break
+                text = sib.get_text(separator=" ", strip=True)
+                if text:
+                    desc_parts.append(text)
+                    if len(" ".join(desc_parts)) > 500:
+                        break
+            steps.append({
+                "name": step_name,
+                "text": " ".join(desc_parts)[:500],
+            })
+        # Try to find the parent section name for HowTo name
+        howto_name = None
+        first_step = step_headings[0]
+        for prev in first_step.find_all_previous(["h2", "h1"]):
+            candidate = prev.get_text(strip=True)
+            if not re.match(r'(步驟|Step|STEP)', candidate, re.I):
+                howto_name = candidate
+                break
+        return {"name": howto_name or "操作步驟", "steps": steps}
+
+    # Strategy 2: <ol> with 5+ items inside a section with instructional heading
+    instructional_keywords = re.compile(
+        r'(怎麼|如何|攻略|教學|指南|步驟|方法|流程|申請|辦理)', re.I
+    )
+    for h2 in soup.find_all("h2"):
+        if not instructional_keywords.search(h2.get_text()):
+            continue
+        # Look for <ol> after this heading
+        for sib in h2.find_next_siblings():
+            if not isinstance(sib, Tag):
+                continue
+            if sib.name == "h2":
+                break
+            if sib.name == "ol":
+                items = sib.find_all("li")
+                if len(items) >= 4:
+                    steps = []
+                    for li in items:
+                        text = li.get_text(separator=" ", strip=True)
+                        steps.append({"name": text[:100], "text": text[:500]})
+                    return {
+                        "name": h2.get_text(strip=True),
+                        "steps": steps,
+                    }
+
+    return None
+
+# ---------------------------------------------------------------------
+# JSON-LD builders
+# ---------------------------------------------------------------------
+
+def build_article_schema(meta: dict) -> dict:
+    """Build Article JSON-LD."""
+    schema = {
+        "@context": "https://schema.org",
+        "@type": "Article",
+        "headline": meta.get("og_title", ""),
+        "url": meta.get("canonical", meta["url"]),
+        "mainEntityOfPage": {
+            "@type": "WebPage",
+            "@id": meta.get("canonical", meta["url"]),
+        },
+        "publisher": {
+            "@type": "Organization",
+            "name": SITE_NAME,
+            "logo": {
+                "@type": "ImageObject",
+                "url": PUBLISHER_LOGO,
+            },
+        },
+        "inLanguage": "zh-TW",
+    }
+
+    if meta.get("description"):
+        schema["description"] = meta["description"]
+    if meta.get("image"):
+        schema["image"] = meta["image"]
+    if meta.get("published"):
+        schema["datePublished"] = meta["published"]
+    if meta.get("modified"):
+        schema["dateModified"] = meta["modified"]
+    elif meta.get("published"):
+        schema["dateModified"] = meta["published"]
+    if meta.get("author"):
+        schema["author"] = {
+            "@type": "Person",
+            "name": meta["author"],
+        }
+    else:
+        schema["author"] = {
+            "@type": "Organization",
+            "name": SITE_NAME,
+        }
+
+    return schema
+
+
+def build_breadcrumb_schema(crumbs: list[dict]) -> dict:
+    """Build BreadcrumbList JSON-LD."""
+    items = []
+    for i, crumb in enumerate(crumbs, 1):
+        items.append({
+            "@type": "ListItem",
+            "position": i,
+            "name": crumb["name"],
+            "item": crumb["url"],
+        })
+    return {
+        "@context": "https://schema.org",
+        "@type": "BreadcrumbList",
+        "itemListElement": items,
+    }
+
+
+def build_faq_schema(faqs: list[dict]) -> dict:
+    """Build FAQPage JSON-LD."""
+    entities = []
+    for faq in faqs:
+        entities.append({
+            "@type": "Question",
+            "name": faq["question"],
+            "acceptedAnswer": {
+                "@type": "Answer",
+                "text": faq["answer"],
+            },
+        })
+    return {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": entities,
+    }
+
+
+def build_howto_schema(howto: dict) -> dict:
+    """Build HowTo JSON-LD."""
+    steps = []
+    for i, step in enumerate(howto["steps"], 1):
+        s = {
+            "@type": "HowToStep",
+            "position": i,
+            "name": step["name"],
+        }
+        if step.get("text"):
+            s["text"] = step["text"]
+        steps.append(s)
+    return {
+        "@context": "https://schema.org",
+        "@type": "HowTo",
+        "name": howto["name"],
+        "step": steps,
+    }
+
+# ---------------------------------------------------------------------
+# stdin-json mode (structured data from puppeteer / fetcher-mcp)
+# ---------------------------------------------------------------------
+
+def generate_schemas_from_json(data: dict) -> list[dict]:
+    """Generate schemas from pre-extracted JSON (no HTML parsing needed)."""
+    url = data["url"]
+    metas = data.get("metas", {})
+    schemas = []
+
+    # 1. Article
+    meta = {
+        "url": url,
+        "canonical": data.get("canonical", url),
+        "og_title": metas.get("og:title", ""),
+        "description": metas.get("description", metas.get("og:description", "")),
+        "image": metas.get("og:image", ""),
+        "published": metas.get("article:published_time", ""),
+        "modified": metas.get("article:modified_time", ""),
+    }
+    # Strip site name suffix from title
+    if meta["og_title"]:
+        meta["og_title"] = re.sub(r'\s*[|–—]\s*Study Central.*$', '', meta["og_title"])
+    schemas.append(build_article_schema(meta))
+
+    # 2. BreadcrumbList
+    bc = data.get("breadcrumb", {})
+    crumbs = [{"name": "首頁", "url": SITE_URL}]
+    for link in bc.get("links", []):
+        if link["text"] != "首頁":
+            crumbs.append({"name": link["text"], "url": link["href"]})
+    if bc.get("lastItem"):
+        crumbs.append({"name": bc["lastItem"], "url": url})
+    if len(crumbs) >= 2:
+        schemas.append(build_breadcrumb_schema(crumbs))
+
+    # 3. FAQPage — detect from sections
+    sections = data.get("sections", [])
+    faqs = detect_faq_from_sections(sections)
+    if faqs:
+        schemas.append(build_faq_schema(faqs))
+
+    # 4. HowTo — detect from sections
+    howto = detect_howto_from_sections(sections)
+    if howto:
+        schemas.append(build_howto_schema(howto))
+
+    return schemas
+
+
+def detect_faq_from_sections(sections: list[dict]) -> list[dict]:
+    """Detect FAQ from pre-extracted sections list."""
+    faqs = []
+    in_faq = False
+
+    for sec in sections:
+        if sec["level"] == 2 and re.search(r'FAQ|常見問題|Q\s*&\s*A|問答', sec["text"], re.I):
+            in_faq = True
+            continue
+        if sec["level"] == 2 and in_faq:
+            break  # Next H2 ends FAQ section
+        if in_faq and sec["level"] == 3 and sec.get("content"):
+            # Filter out non-FAQ H3s (footer items etc)
+            text = sec["text"]
+            if re.search(r'(辦公室|AUSTRALIA|相關文章|SYDNEY|BRISBANE|GOLD COAST)', text, re.I):
+                continue
+            faqs.append({"question": text, "answer": sec["content"]})
+
+    return faqs
+
+
+def detect_howto_from_sections(sections: list[dict]) -> dict | None:
+    """Detect HowTo from pre-extracted sections list."""
+    step_pattern = re.compile(
+        r'^(步驟|Step|第\s*[一二三四五六七八九十\d]+\s*步|STEP)\s*[\d一二三四五六七八九十]',
+        re.I,
+    )
+    step_sections = [s for s in sections if step_pattern.match(s["text"])]
+
+    if len(step_sections) >= 3:
+        # Find parent section name
+        first_idx = sections.index(step_sections[0])
+        howto_name = "操作步驟"
+        for i in range(first_idx - 1, -1, -1):
+            if sections[i]["level"] <= step_sections[0]["level"]:
+                howto_name = sections[i]["text"]
+                break
+        return {
+            "name": howto_name,
+            "steps": [
+                {"name": s["text"], "text": s.get("content", "")[:500]}
+                for s in step_sections
+            ],
+        }
+
+    return None
+
+
+# ---------------------------------------------------------------------
+# from-md mode (for writer pipeline)
+# ---------------------------------------------------------------------
+
+def generate_schemas_from_md(md_path: str, url: str | None = None) -> list[dict]:
+    """Generate schemas from local markdown file (writer draft)."""
+    text = Path(md_path).read_text(encoding="utf-8")
+    schemas = []
+
+    # Parse YAML frontmatter if present
+    fm = {}
+    if text.startswith("---"):
+        fm_end = text.find("\n---", 3)
+        if fm_end > 0:
+            fm_text = text[3:fm_end]
+            for line in fm_text.split("\n"):
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    fm[k.strip()] = v.strip().strip('"').strip("'")
+            text = text[fm_end + 4:]  # skip past closing ---
+
+    # Title: frontmatter > H1 > filename
+    title = fm.get("title", "")
+    if not title:
+        title_match = re.match(r'^#\s+(.+)$', text, re.M)
+        title = title_match.group(1).strip() if title_match else Path(md_path).stem
+
+    # Slug + URL
+    slug = fm.get("slug", "")
+    category = fm.get("category", "")
+    if not url:
+        if not slug:
+            parent = Path(md_path).resolve().parent.name
+            slug_match = re.match(r'\d{4}-\d{2}-\d{2}-(.+)', parent)
+            slug = slug_match.group(1) if slug_match else parent
+        if category:
+            url = f"{SITE_URL}/{category}/{slug}/"
+        else:
+            url = f"{SITE_URL}/{slug}/"
+
+    meta = {
+        "url": url,
+        "canonical": url,
+        "og_title": title,
+        "description": fm.get("meta_description", ""),
+    }
+    schemas.append(build_article_schema(meta))
+
+    # Parse H2/H3 structure for FAQ detection
+    sections = []
+    current_heading = None
+    current_content = []
+
+    for line in text.split("\n"):
+        h2_match = re.match(r'^##\s+(.+)$', line)
+        h3_match = re.match(r'^###\s+(.+)$', line)
+        if h2_match or h3_match:
+            if current_heading:
+                sections.append({
+                    "level": current_heading[0],
+                    "text": current_heading[1],
+                    "content": " ".join(current_content).strip()[:500],
+                })
+            level = 2 if h2_match else 3
+            heading_text = (h2_match or h3_match).group(1).strip()
+            current_heading = (level, heading_text)
+            current_content = []
+        elif current_heading:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                current_content.append(stripped)
+
+    # Save last section
+    if current_heading:
+        sections.append({
+            "level": current_heading[0],
+            "text": current_heading[1],
+            "content": " ".join(current_content).strip()[:500],
+        })
+
+    # BreadcrumbList
+    crumbs = [{"name": "首頁", "url": SITE_URL}]
+    if category:
+        crumbs.append({
+            "name": category.replace("-", " ").title(),
+            "url": f"{SITE_URL}/{category}/",
+        })
+    else:
+        parsed = urlparse(url)
+        parts = [p for p in parsed.path.strip("/").split("/") if p]
+        if len(parts) >= 2:
+            crumbs.append({
+                "name": unquote(parts[0]).replace("-", " ").title(),
+                "url": f"{SITE_URL}/{parts[0]}/",
+            })
+    crumbs.append({"name": title, "url": url})
+    schemas.append(build_breadcrumb_schema(crumbs))
+
+    # FAQ
+    faqs = detect_faq_from_sections(sections)
+    if faqs:
+        schemas.append(build_faq_schema(faqs))
+
+    # HowTo
+    howto = detect_howto_from_sections(sections)
+    if howto:
+        schemas.append(build_howto_schema(howto))
+
+    return schemas
+
+
+# ---------------------------------------------------------------------
+# Main pipeline (HTML mode)
+# ---------------------------------------------------------------------
+
+def generate_schemas(url: str, html_content: str) -> list[dict]:
+    """Parse HTML and generate all applicable JSON-LD schemas."""
+    soup = BeautifulSoup(html_content, "lxml")
+    schemas = []
+
+    # 1. Article (always)
+    meta = extract_meta(soup, url)
+    schemas.append(build_article_schema(meta))
+
+    # 2. BreadcrumbList (always)
+    crumbs = extract_breadcrumb(soup, url)
+    if len(crumbs) >= 2:
+        schemas.append(build_breadcrumb_schema(crumbs))
+
+    # 3. FAQPage (conditional)
+    faqs = detect_faq(soup)
+    if faqs:
+        schemas.append(build_faq_schema(faqs))
+
+    # 4. HowTo (conditional)
+    howto = detect_howto(soup)
+    if howto:
+        schemas.append(build_howto_schema(howto))
+
+    return schemas
+
+
+def schemas_to_inject(schemas: list[dict]) -> str:
+    """Wrap schemas in <script type="application/ld+json"> tags."""
+    parts = []
+    for s in schemas:
+        j = json.dumps(s, ensure_ascii=False, indent=2)
+        parts.append(f'<script type="application/ld+json">\n{j}\n</script>')
+    return "\n".join(parts)
+
+# ---------------------------------------------------------------------
+# Batch mode
+# ---------------------------------------------------------------------
+
+def get_all_articles_from_neo4j() -> list[dict]:
+    """Query Neo4j for all article URLs + metadata."""
+    cypher = (
+        "MATCH (a:Article) WHERE a.scraped_at IS NOT NULL "
+        "RETURN a.url AS url, a.slug AS slug, a.title AS title, "
+        "a.description AS description, "
+        "toString(a.published_at) AS published, "
+        "toString(a.updated_at) AS modified "
+        "ORDER BY a.slug"
+    )
+    neo4j_bin = BIN_DIR / "neo4j-query"
+    result = subprocess.run(
+        [str(neo4j_bin), cypher],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        print(f"ERROR: neo4j-query failed: {result.stderr[:200]}", file=sys.stderr)
+        sys.exit(1)
+
+    articles = []
+    for line in result.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            articles.append(row)
+        except json.JSONDecodeError:
+            # neo4j-query may output header/separator lines
+            continue
+    return articles
+
+
+def run_batch(output_dir: str, cache_dir: str | None = None):
+    """Batch generate JSON-LD for all articles.
+
+    Two modes:
+    - --cache-dir: read {slug}.html from a local directory (pre-fetched via puppeteer)
+    - --neo4j without cache: generate from Neo4j metadata only (Article schema + breadcrumb)
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    articles = get_all_articles_from_neo4j()
+    print(f"Found {len(articles)} articles in Neo4j", file=sys.stderr)
+
+    cache = Path(cache_dir) if cache_dir else None
+
+    summary = {
+        "scan_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "total": len(articles),
+        "with_faq": 0,
+        "with_howto": 0,
+        "generated": 0,
+        "skipped": 0,
+        "errors": 0,
+        "error_slugs": [],
+    }
+
+    for i, art in enumerate(articles):
+        slug = art.get("slug", f"unknown-{i}")
+        url = art.get("url", "")
+        if not url:
+            continue
+
+        try:
+            html_file = None
+            if cache:
+                candidate = cache / f"{slug}.html"
+                if candidate.exists():
+                    html_file = candidate
+                else:
+                    summary["skipped"] += 1
+                    continue
+
+            if html_file:
+                html_content = html_file.read_text(encoding="utf-8")
+                schemas = generate_schemas(url, html_content)
+            else:
+                # No HTML available — generate minimal schema from Neo4j metadata
+                meta = {
+                    "url": url,
+                    "canonical": url,
+                    "og_title": art.get("title", ""),
+                    "description": art.get("description", ""),
+                    "published": art.get("published", ""),
+                    "modified": art.get("modified", ""),
+                }
+                schemas = [build_article_schema(meta)]
+                # Add breadcrumb from URL
+                parsed = urlparse(url)
+                parts = [p for p in parsed.path.strip("/").split("/") if p]
+                crumbs = [{"name": "首頁", "url": SITE_URL}]
+                if len(parts) >= 2:
+                    crumbs.append({
+                        "name": unquote(parts[0]).replace("-", " ").title(),
+                        "url": f"{SITE_URL}/{parts[0]}/",
+                    })
+                crumbs.append({"name": art.get("title", slug), "url": url})
+                schemas.append(build_breadcrumb_schema(crumbs))
+
+            # Enrich Article schema with Neo4j metadata (more reliable than HTML meta)
+            for s in schemas:
+                if s.get("@type") == "Article":
+                    if art.get("title") and not s.get("headline"):
+                        s["headline"] = art["title"]
+                    if art.get("description") and not s.get("description"):
+                        s["description"] = art["description"]
+                    if art.get("published") and not s.get("datePublished"):
+                        s["datePublished"] = art["published"]
+                    if art.get("modified") and not s.get("dateModified"):
+                        s["dateModified"] = art["modified"]
+
+            types = {s["@type"] for s in schemas}
+            if "FAQPage" in types:
+                summary["with_faq"] += 1
+            if "HowTo" in types:
+                summary["with_howto"] += 1
+            summary["generated"] += 1
+
+            out_file = out / f"{slug}.json"
+            out_file.write_text(
+                json.dumps(schemas, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            print(
+                f"  [{i+1}/{len(articles)}] {slug}: "
+                f"{', '.join(sorted(types))}",
+                file=sys.stderr,
+            )
+
+        except Exception as e:
+            summary["errors"] += 1
+            summary["error_slugs"].append(slug)
+            print(f"  [{i+1}/{len(articles)}] {slug}: ERROR {e}", file=sys.stderr)
+
+    # Write summary
+    (out / "_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="為 好事發生數位 文章產生 Schema.org JSON-LD",
+    )
+    parser.add_argument("url", nargs="?", help="Article URL")
+    parser.add_argument("--html-file", help="讀本地 HTML 檔")
+    parser.add_argument("--stdin-json", action="store_true",
+                        help="從 stdin 讀 JSON 結構化資料")
+    parser.add_argument("--from-md", help="讀本地 markdown (writer pipeline)")
+    parser.add_argument("--inject", action="store_true",
+                        help="輸出可貼進 <head> 的 <script> tags")
+    parser.add_argument("--batch", action="store_true",
+                        help="批次模式:從 cache-dir 讀 HTML 檔")
+    parser.add_argument("--neo4j", action="store_true",
+                        help="搭配 --batch 使用,從 Neo4j 拿 article 清單 + metadata")
+    parser.add_argument("--cache-dir",
+                        help="批次模式:HTML 快取目錄 (每篇 {slug}.html)")
+    parser.add_argument("--output-dir",
+                        default=os.path.expanduser(
+                            "~/workspace/ohya/schema-data"),
+                        help="批次模式輸出目錄")
+
+    args = parser.parse_args()
+
+    # Mode 1: --from-md (writer pipeline)
+    if args.from_md:
+        schemas = generate_schemas_from_md(args.from_md, args.url)
+        if args.inject:
+            print(schemas_to_inject(schemas))
+        else:
+            print(json.dumps(schemas, ensure_ascii=False, indent=2))
+        return
+
+    # Mode 2: --stdin-json (agent pipeline via fetcher-mcp / puppeteer)
+    if args.stdin_json:
+        data = json.load(sys.stdin)
+        schemas = generate_schemas_from_json(data)
+        if args.inject:
+            print(schemas_to_inject(schemas))
+        else:
+            print(json.dumps(schemas, ensure_ascii=False, indent=2))
+        return
+
+    # Mode 3: --batch (bulk processing)
+    if args.batch:
+        run_batch(args.output_dir, args.cache_dir)
+        return
+
+    # Mode 4: single URL with --html-file
+    if not args.url:
+        parser.print_help()
+        sys.exit(1)
+
+    if not args.html_file:
+        print(
+            "ERROR: Cloudflare 擋 curl。請用 --html-file 提供本地 HTML,\n"
+            "       或用 --stdin-json 從 agent pipeline 輸入。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    html_content = load_html(args.url, args.html_file)
+    schemas = generate_schemas(args.url, html_content)
+
+    if args.inject:
+        print(schemas_to_inject(schemas))
+    else:
+        print(json.dumps(schemas, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

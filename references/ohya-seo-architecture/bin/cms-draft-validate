@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Dry-run validator for SEO Growth OS Phase 1.9 Payload CMS draft creation.
+
+This script is read-only with respect to Payload/CMS. It reads local article artifacts,
+optionally reads public Payload REST endpoints, and writes local dry-run reports only.
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import re
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+OLD_BRANDS = ["Study Central", "遊學無邊界", "StudyCentral"]
+EXPECTED_BRAND = "Ohya 好事發生數位"
+
+
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def parse_frontmatter(md: str) -> tuple[dict[str, str], str]:
+    if not md.startswith("---\n"):
+        return {}, md
+    end = md.find("\n---\n", 4)
+    if end == -1:
+        return {}, md
+    raw = md[4:end]
+    body = md[end + 5 :]
+    fm: dict[str, str] = {}
+    for line in raw.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fm[k.strip()] = v.strip().strip('"').strip("'")
+    return fm, body
+
+
+def inline_md_to_html(text: str) -> str:
+    text = html.escape(text, quote=False)
+    # markdown links: [text](url)
+    text = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        lambda m: f'<a href="{html.escape(m.group(2), quote=True)}">{m.group(1)}</a>',
+        text,
+    )
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    return text
+
+
+def markdown_table_to_html(lines: list[str]) -> str:
+    rows = []
+    for line in lines:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if all(re.fullmatch(r":?-{3,}:?", c or "") for c in cells):
+            continue
+        rows.append(cells)
+    if not rows:
+        return ""
+    head, *body = rows
+    out = ["<table>", "<thead><tr>"]
+    out.extend(f"<th>{inline_md_to_html(c)}</th>" for c in head)
+    out.append("</tr></thead>")
+    if body:
+        out.append("<tbody>")
+        for row in body:
+            out.append("<tr>")
+            out.extend(f"<td>{inline_md_to_html(c)}</td>" for c in row)
+            out.append("</tr>")
+        out.append("</tbody>")
+    out.append("</table>")
+    return "".join(out)
+
+
+def markdown_to_html(md_body: str) -> str:
+    lines = md_body.splitlines()
+    out: list[str] = []
+    para: list[str] = []
+    list_buf: list[str] = []
+    table_buf: list[str] = []
+
+    def flush_para():
+        nonlocal para
+        if para:
+            out.append(f"<p>{inline_md_to_html(' '.join(para).strip())}</p>")
+            para = []
+
+    def flush_list():
+        nonlocal list_buf
+        if list_buf:
+            out.append("<ul>" + "".join(f"<li>{inline_md_to_html(x)}</li>" for x in list_buf) + "</ul>")
+            list_buf = []
+
+    def flush_table():
+        nonlocal table_buf
+        if table_buf:
+            out.append(markdown_table_to_html(table_buf))
+            table_buf = []
+
+    for raw in lines:
+        line = raw.rstrip()
+        if not line.strip():
+            flush_para(); flush_list(); flush_table()
+            continue
+        if line.startswith("|") and line.endswith("|"):
+            flush_para(); flush_list(); table_buf.append(line)
+            continue
+        flush_table()
+        m = re.match(r"^(#{1,4})\s+(.+)$", line)
+        if m:
+            flush_para(); flush_list()
+            level = len(m.group(1))
+            out.append(f"<h{level}>{inline_md_to_html(m.group(2).strip())}</h{level}>")
+            continue
+        m = re.match(r"^[-*]\s+(.+)$", line)
+        if m:
+            flush_para(); list_buf.append(m.group(1).strip())
+            continue
+        para.append(line.strip())
+    flush_para(); flush_list(); flush_table()
+    return "\n".join(x for x in out if x)
+
+
+def html_to_minimal_lexical(content_html: str) -> dict[str, Any]:
+    # Posts collection's lexicalEditor has no BlocksFeature → custom blocks get stripped
+    # by Payload validation. Frontend uses content_html (per collection's comment "Used
+    # for rendering if present"). So content (richText) is just an empty stub for admin.
+    return {
+        "root": {
+            "type": "root",
+            "format": "",
+            "indent": 0,
+            "version": 1,
+            "direction": None,
+            "children": [
+                {
+                    "type": "paragraph",
+                    "format": "",
+                    "indent": 0,
+                    "version": 1,
+                    "direction": None,
+                    "textFormat": 0,
+                    "children": [],
+                }
+            ],
+        }
+    }
+
+
+def fetch_public_api(path: str, timeout: int = 20) -> Any:
+    url = f"https://ohya.co/api/{path.lstrip('/')}"
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.load(r)
+
+
+def collect_public_payload_reference() -> dict[str, Any]:
+    out: dict[str, Any] = {"read_only": True, "source": "https://ohya.co/api/*"}
+    for endpoint, key in [("categories?limit=100&depth=0", "categories"), ("authors?limit=100&depth=0", "authors")]:
+        try:
+            data = fetch_public_api(endpoint)
+            out[key] = [
+                {"id": d.get("id"), "name": d.get("name"), "slug": d.get("slug")}
+                for d in data.get("docs", [])
+            ]
+            out[f"{key}_ok"] = True
+        except Exception as e:  # noqa: BLE001
+            out[key] = []
+            out[f"{key}_ok"] = False
+            out[f"{key}_error"] = str(e)
+    return out
+
+
+def find_article_schema(schema: Any) -> dict[str, Any] | None:
+    if isinstance(schema, list):
+        for item in schema:
+            if isinstance(item, dict) and item.get("@type") == "Article":
+                return item
+    if isinstance(schema, dict) and schema.get("@type") == "Article":
+        return schema
+    return None
+
+
+def validate(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    md_path = Path(args.markdown)
+    schema_path = Path(args.schema)
+    plan_path = Path(args.plan)
+    link_audit_path = Path(args.link_audit)
+
+    markdown = md_path.read_text(encoding="utf-8")
+    frontmatter, body = parse_frontmatter(markdown)
+    schema = load_json(schema_path)
+    plan = load_json(plan_path)
+    link_audit = load_json(link_audit_path)
+    article_schema = find_article_schema(schema) or {}
+    content_html = markdown_to_html(body)
+
+    public_ref = collect_public_payload_reference() if args.fetch_public_reference else {"read_only": True, "skipped": True}
+    categories = public_ref.get("categories", [])
+    authors = public_ref.get("authors", [])
+
+    category_candidates = [c for c in categories if c.get("slug") in {"future-of-ai", "ai-agent-diary", "case-studies"}]
+    recommended_category = next((c for c in category_candidates if c.get("slug") == "future-of-ai"), None)
+    recommended_author = next((a for a in authors if a.get("slug") == "amazinghappens"), authors[0] if authors else None)
+
+    title = plan.get("draft_fields", {}).get("title") or frontmatter.get("title") or plan.get("title")
+    slug = plan.get("slug") or frontmatter.get("slug")
+    canonical_url = plan.get("canonical_url") or frontmatter.get("canonical_url")
+    meta_description = plan.get("draft_fields", {}).get("metaDescription") or frontmatter.get("meta_description")
+
+    checks: list[dict[str, Any]] = []
+
+    def check(name: str, ok: bool, severity: str, detail: str, data: Any = None):
+        item = {"name": name, "ok": bool(ok), "severity": severity, "detail": detail}
+        if data is not None:
+            item["data"] = data
+        checks.append(item)
+
+    check("plan_is_plan_only", plan.get("plan_only") is True and not plan.get("payload_written"), "blocking", "cms-draft-payload-plan 必須仍是 plan_only 且未寫 Payload")
+    check("slug_matches", bool(slug and slug == frontmatter.get("slug")), "blocking", "plan slug 與 markdown frontmatter slug 一致", {"plan_slug": slug, "frontmatter_slug": frontmatter.get("slug")})
+    check("slug_format", bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug or "")), "blocking", "slug 必須為小寫英數與 hyphen")
+    check("canonical_route", canonical_url == f"https://ohya.co/blog/{slug}/", "blocking", "canonical 必須走 /blog/{slug}/")
+    check("title_present", bool(title), "blocking", "title 必填")
+    check("meta_description_length", bool(meta_description and 50 <= len(meta_description) <= 180), "warning", "meta description 建議 50–180 字元", {"length": len(meta_description or "")})
+    check("link_audit_clean", link_audit.get("manual_needed") == 0 and link_audit.get("failed") == 0, "blocking", "link-audit 不可有 manual_needed / failed", {"manual_needed": link_audit.get("manual_needed"), "failed": link_audit.get("failed")})
+    combined_text = "\n".join([markdown, json.dumps(schema, ensure_ascii=False), json.dumps(plan, ensure_ascii=False)])
+    check("old_brand_absent", not any(b in combined_text for b in OLD_BRANDS), "blocking", "不得殘留 Study Central / 遊學無邊界 舊模板")
+    check("schema_article_brand", article_schema.get("publisher", {}).get("name") == EXPECTED_BRAND and article_schema.get("author", {}).get("name") == EXPECTED_BRAND, "blocking", "Article publisher / author 必須為 Ohya 好事發生數位", {"publisher": article_schema.get("publisher", {}).get("name"), "author": article_schema.get("author", {}).get("name")})
+    check("schema_image_missing_known", bool(article_schema.get("image")), "warning", "Article.image 目前缺主圖 URL；draft 可先不寫 featuredImage，但 schema publish 前需補")
+    check("publisher_logo_missing_known", bool(article_schema.get("publisher", {}).get("logo")), "warning", "publisher.logo 目前缺 Ohya logo URL；publish 前需補")
+    check("content_html_generated", len(content_html) > 1000 and "<h2>" in content_html, "blocking", "Markdown 已可轉成 content_html，且保留 H2 結構", {"content_html_chars": len(content_html)})
+    check("content_html_contains_links", "<a href=" in content_html, "warning", "content_html 需保留內外連結")
+    check("public_categories_readable", bool(categories), "warning", "公開 categories API 可讀，用於 category mapping")
+    check("category_auto_candidate", bool(recommended_category), "warning", "plan.category 仍為 null；建議候選 future-of-ai，但首次寫入前需 Gary/CMS 最後確認", recommended_category)
+    check("author_auto_candidate", bool(recommended_author), "warning", "公開 authors API 可讀；建議候選 amazinghappens/Gary，但首次寫入前需 Gary/CMS 最後確認", recommended_author)
+
+    blocking_failures = [c for c in checks if c["severity"] == "blocking" and not c["ok"]]
+    warnings = [c for c in checks if c["severity"] == "warning" and not c["ok"]]
+
+    candidate_payload = {
+        "collection": "posts",
+        "method": "POST /api/posts",
+        "write_mode": "draft_only_after_final_confirmation",
+        "data": {
+            "title": title,
+            "slug": slug,
+            "excerpt": meta_description,
+            "content": html_to_minimal_lexical(content_html),
+            "content_html": content_html,
+            "seo": {"seoTitle": title[:70] if title else None, "metaDescription": meta_description},
+            "categories": [recommended_category["id"]] if recommended_category else [],
+            "author": recommended_author["id"] if recommended_author else None,
+            "legacyUri": f"/blog/{slug}/",
+            "_status": "draft",
+        },
+        "intentionally_not_set_until_assets_confirmed": ["featuredImage", "seo.ogImage", "structuredData/custom schema field (not present in current Posts collection)"],
+    }
+
+    report = {
+        "ok": not blocking_failures,
+        "status": "pass_with_warnings" if not blocking_failures and warnings else ("pass" if not blocking_failures else "blocked"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "production_touched": False,
+        "payload_written": False,
+        "published": False,
+        "deployed": False,
+        "inputs": {
+            "markdown": str(md_path),
+            "schema": str(schema_path),
+            "plan": str(plan_path),
+            "link_audit": str(link_audit_path),
+        },
+        "payload_schema_findings": {
+            "repo": "/Users/garyyang/clients/ohya/repos/ohya-payload",
+            "posts_collection": "src/collections/Posts/index.ts",
+            "drafts_enabled": True,
+            "versions_max_per_doc": 25,
+            "write_path": "Authenticated Payload REST API: POST /api/posts with _status=draft; do not direct SQL update.",
+            "frontend_rendering": "src/lib/payload-api.ts prefers post.content_html over Lexical content, so draft executor can set both content and content_html.",
+            "current_posts_fields": ["title", "slug", "excerpt", "content", "content_html", "featuredImage", "author", "categories", "tags", "publishedAt", "seo.seoTitle", "seo.metaDescription", "seo.ogImage", "legacyUri", "_status"],
+            "no_structured_data_field": True,
+            "canonical_source": "Frontend route /blog/{slug}; legacyUri can store /blog/{slug}/, but Posts collection has no canonicalUrl field.",
+        },
+        "public_payload_reference": public_ref,
+        "recommended_mappings": {
+            "category": recommended_category,
+            "author": recommended_author,
+        },
+        "checks": checks,
+        "blocking_failures": blocking_failures,
+        "warnings": warnings,
+        "candidate_payload_path": str(Path(args.output).with_name("cms-draft-candidate-payload.json")),
+    }
+    return report, candidate_payload
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Validate CMS draft mapping without writing Payload")
+    parser.add_argument("--markdown", required=True)
+    parser.add_argument("--schema", required=True)
+    parser.add_argument("--plan", required=True)
+    parser.add_argument("--link-audit", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--fetch-public-reference", action="store_true", help="Read public categories/authors API only; no auth, no write")
+    args = parser.parse_args()
+
+    report, candidate_payload = validate(args)
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    Path(report["candidate_payload_path"]).write_text(json.dumps(candidate_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({
+        "ok": report["ok"],
+        "status": report["status"],
+        "output": str(out),
+        "candidate_payload": report["candidate_payload_path"],
+        "blocking_failures": len(report["blocking_failures"]),
+        "warnings": len(report["warnings"]),
+        "production_touched": False,
+        "payload_written": False,
+    }, ensure_ascii=False))
+    return 0 if report["ok"] else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse, json, sys
+from pathlib import Path
+
+ROOT = Path('/Users/garyyang/clients/ohya')
+sys.path.insert(0, str(ROOT / 'lib'))
+import seo_os_db  # noqa
+
+
+def out(data, code=0): print(json.dumps(data, ensure_ascii=False, indent=2, default=str)); return code
+
+def cmd_start(args):
+    seo_os_db.assert_not_production_unless_allowed()
+    row=seo_os_db.query_json(
+        """
+        INSERT INTO seo_os.agent_runs (task_id, agent, profile, status, input_prompt, stdout_path, stderr_path, model_provider, model_name, metadata)
+        VALUES (%s,%s,%s,'running',%s,%s,%s,%s,%s,%s::jsonb)
+        RETURNING id, task_id, agent, profile, started_at, status
+        """,
+        [args.task_id,args.agent,args.profile,args.input_prompt,args.stdout_path,args.stderr_path,args.model_provider,args.model_name,args.metadata]
+    )[0]
+    return out({'ok': True, 'agent_run': row, 'secret_redacted': True})
+
+def finish_like(args, status):
+    seo_os_db.assert_not_production_unless_allowed()
+    row=seo_os_db.query_json(
+        """
+        UPDATE seo_os.agent_runs
+        SET status=%s, ended_at=now(), final_message=%s, exit_code=%s, duration_seconds=EXTRACT(EPOCH FROM (now()-started_at))::int, error_message=%s
+        WHERE id=%s
+        RETURNING id, task_id, agent, started_at, ended_at, status, exit_code, duration_seconds, error_message
+        """,
+        [status,args.final_message,args.exit_code,getattr(args,'error_message',None),args.id]
+    )
+    return out({'ok': bool(row), 'agent_run': row[0] if row else None, 'secret_redacted': True}, 0 if row else 1)
+
+def cmd_finish(args): return finish_like(args, 'success')
+def cmd_fail(args): return finish_like(args, 'failed')
+
+def build():
+    p=argparse.ArgumentParser(description='SEO OS agent run log helper')
+    sub=p.add_subparsers(dest='cmd', required=True)
+    s=sub.add_parser('start'); s.add_argument('--agent', required=True); s.add_argument('--task-id'); s.add_argument('--profile'); s.add_argument('--input-prompt'); s.add_argument('--stdout-path'); s.add_argument('--stderr-path'); s.add_argument('--model-provider'); s.add_argument('--model-name'); s.add_argument('--metadata', default='{}'); s.set_defaults(func=cmd_start)
+    f=sub.add_parser('finish'); f.add_argument('id'); f.add_argument('--final-message'); f.add_argument('--exit-code', type=int, default=0); f.set_defaults(func=cmd_finish)
+    x=sub.add_parser('fail'); x.add_argument('id'); x.add_argument('--final-message'); x.add_argument('--exit-code', type=int); x.add_argument('--error-message'); x.set_defaults(func=cmd_fail)
+    return p
+
+if __name__ == '__main__':
+    a=build().parse_args(); raise SystemExit(a.func(a))

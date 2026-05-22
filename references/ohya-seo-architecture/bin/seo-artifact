@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse, hashlib, json, mimetypes, sys
+from pathlib import Path
+
+ROOT = Path('/Users/garyyang/clients/ohya')
+sys.path.insert(0, str(ROOT / 'lib'))
+import seo_os_db  # noqa
+
+
+def out(data, code=0): print(json.dumps(data, ensure_ascii=False, indent=2, default=str)); return code
+
+def file_meta(path: str):
+    p=Path(path)
+    if not p.exists() or not p.is_file():
+        return None
+    h=hashlib.sha256();
+    with p.open('rb') as f:
+        for chunk in iter(lambda:f.read(1024*1024), b''):
+            h.update(chunk)
+    return {'sha256': h.hexdigest(), 'size_bytes': p.stat().st_size, 'mime_type': mimetypes.guess_type(str(p))[0] or 'application/octet-stream'}
+
+
+def cmd_add(args):
+    seo_os_db.assert_not_production_unless_allowed()
+    meta=file_meta(args.path) if args.hash_file else None
+    row=seo_os_db.query_json(
+        """
+        INSERT INTO seo_os.artifacts (task_id, agent_run_id, type, path, google_doc_url, slug, url, agent, summary, status, sha256, mime_type, size_bytes, metadata)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        RETURNING id, created_at, type, path, slug, status, sha256, size_bytes
+        """,
+        [args.task_id,args.agent_run_id,args.type,args.path,args.google_doc_url,args.slug,args.url,args.agent,args.summary,args.status,(meta or {}).get('sha256'),(meta or {}).get('mime_type'),(meta or {}).get('size_bytes'),args.metadata]
+    )[0]
+    return out({'ok': True, 'artifact': row, 'secret_redacted': True})
+
+
+def cmd_find(args):
+    rows=seo_os_db.query_json(
+        """
+        SELECT id, created_at, type, path, google_doc_url, slug, agent, summary, status, sha256, size_bytes
+        FROM seo_os.artifacts
+        WHERE (%s::text IS NULL OR slug=%s)
+          AND (%s::text IS NULL OR type=%s)
+          AND (%s::text IS NULL OR path ILIKE '%%' || %s || '%%')
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        [args.slug,args.slug,args.type,args.type,args.path_contains,args.path_contains,args.limit]
+    )
+    return out({'ok': True, 'count': len(rows), 'artifacts': rows, 'secret_redacted': True})
+
+
+def build():
+    p=argparse.ArgumentParser(description='SEO OS artifact helper')
+    sub=p.add_subparsers(dest='cmd', required=True)
+    a=sub.add_parser('add'); a.add_argument('--type', required=True); a.add_argument('--path', required=True); a.add_argument('--task-id'); a.add_argument('--agent-run-id'); a.add_argument('--google-doc-url'); a.add_argument('--slug'); a.add_argument('--url'); a.add_argument('--agent'); a.add_argument('--summary'); a.add_argument('--status', default='active'); a.add_argument('--metadata', default='{}'); a.add_argument('--hash-file', action='store_true'); a.set_defaults(func=cmd_add)
+    f=sub.add_parser('find'); f.add_argument('--slug'); f.add_argument('--type'); f.add_argument('--path-contains'); f.add_argument('--limit', type=int, default=20); f.set_defaults(func=cmd_find)
+    return p
+
+if __name__ == '__main__':
+    a=build().parse_args(); raise SystemExit(a.func(a))

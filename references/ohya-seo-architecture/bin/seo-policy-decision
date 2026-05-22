@@ -1,0 +1,219 @@
+#!/Users/garyyang/clients/ohya/venv/bin/python
+"""seo-policy-decision — local-only policy decision helper MVP.
+
+Purpose:
+- Convert workflow/action risk into a deterministic decision.
+- Keep Gary approval only for high-risk/destructive/policy-unknown exceptions.
+- Optionally persist the decision into local seo_os.decisions/workflow_events.
+
+No Payload writes, deploys, pushes, production migrations, or network calls.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+ROOT = Path('/Users/garyyang/clients/ohya')
+sys.path.insert(0, str(ROOT / 'lib'))
+
+LOW_RISK_ACTIONS = {
+    'audit', 'query', 'research', 'outline', 'write', 'link_fix', 'refresh',
+    'article_refresh', 'pre_publish_audit', 'cms_patch_plan', 'media_asset',
+    'feedback_snapshot', 'next_task_generation', 'learning_signal',
+    'performance_feedback', 'compare', 'plan', 'dry_run',
+}
+DESTRUCTIVE_ACTIONS = {
+    'publish', 'unpublish', 'delete', 'redirect', 'canonical_change',
+    'schema_injection', 'published_content_correction', 'production_migration',
+    'production_schema_write', 'payload_write', 'deploy', 'push', 'force_push',
+    'zeabur_env_write', 'data_delete', 'launchd_unload',
+}
+KNOWN_TASK_TYPES = {
+    'audit', 'query', 'research', 'outline', 'write', 'link_fix', 'article_refresh',
+    'new_article', 'refresh', 'pre_publish_audit', 'cms_draft',
+    'published_content_correction', 'publish', 'internal_link_fix',
+    'cannibalization_scan', 'cms_patch_plan', 'media_asset', 'video_production',
+    'video_produce', 'video_replace', 'feedback_snapshot', 'next_task_generation',
+    'learning_signal', 'performance_feedback',
+}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+
+
+def json_out(data: dict[str, Any]) -> int:
+    print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+    return int(data.get('exit_code', 0))
+
+
+def is_destructive(args: argparse.Namespace) -> bool:
+    action = (args.action or '').strip()
+    ttype = (args.task_type or '').strip()
+    return bool(args.production_write or args.destructive or action in DESTRUCTIVE_ACTIONS or ttype in {'publish', 'published_content_correction'})
+
+
+def decide(args: argparse.Namespace) -> dict[str, Any]:
+    action = (args.action or args.task_type or '').strip()
+    ttype = (args.task_type or '').strip()
+    risk = (args.risk_level or 'unknown').strip().lower()
+    known = ttype in KNOWN_TASK_TYPES and (action in LOW_RISK_ACTIONS or action in DESTRUCTIVE_ACTIONS or action == ttype)
+    destructive = is_destructive(args)
+    explicit_approval = bool(args.approval_id)
+
+    result: dict[str, Any] = {
+        'ok': False,
+        'decision_id': str(uuid.uuid4()),
+        'checked_at': now_iso(),
+        'task_id': args.task_id,
+        'task_type': ttype,
+        'action': action,
+        'risk_level': risk,
+        'actor': args.actor,
+        'slug': args.slug,
+        'post_id': args.post_id,
+        'approval_id': args.approval_id,
+        'is_destructive': destructive,
+        'requires_gary_approval': True,
+        'next_allowed': False,
+        'local_only': True,
+        'production_side_effect': False,
+        'secret_redacted': True,
+        'exit_code': 1,
+        'policy_version': 'seo-policy-decision-mvp-v1',
+    }
+
+    if destructive:
+        if explicit_approval and args.approved:
+            result.update({
+                'ok': True,
+                'decision': 'approval_satisfied',
+                'requires_gary_approval': False,
+                'next_allowed': True,
+                'reason': 'Destructive/production write action has explicit approved approval_id.',
+                'exit_code': 0,
+            })
+        else:
+            result.update({
+                'decision': 'destructive_requires_approval',
+                'exception_type': 'destructive_or_production_side_effect',
+                'reason': 'Destructive or production-write action requires Gary explicit approval before execution.',
+                'recommended_next_action': 'create_approval_request',
+            })
+        return result
+
+    if not known or risk in {'unknown', 'policy_unknown'}:
+        result.update({
+            'decision': 'policy_exception',
+            'exception_type': 'policy_unknown',
+            'reason': 'Policy does not know this task/action/risk combination; route to Gary or coordinator exception review.',
+            'recommended_next_action': 'ask_gary_or_record_policy_rule',
+        })
+        return result
+
+    if risk in {'high', 'critical'}:
+        result.update({
+            'decision': 'policy_exception',
+            'exception_type': 'high_risk_non_destructive',
+            'reason': 'High-risk action is not destructive but still needs exception review until a narrower rule exists.',
+            'recommended_next_action': 'record_decision_or_add_policy_rule',
+        })
+        return result
+
+    result.update({
+        'ok': True,
+        'decision': 'auto_allowed',
+        'requires_gary_approval': False,
+        'next_allowed': True,
+        'reason': 'Known low/medium-risk local SEO workflow action; guardrail checks still apply at execution boundaries.',
+        'recommended_next_action': 'continue_workflow',
+        'exit_code': 0,
+    })
+    return result
+
+
+def persist_decision(result: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        import seo_os_db  # noqa: WPS433
+        decision_value = 'approve' if result.get('next_allowed') else 'needs_human_review'
+        scope = args.scope or ('publishing' if result.get('is_destructive') else 'workflow')
+        rows = seo_os_db.query_json(
+            """
+            INSERT INTO seo_os.decisions (
+              task_id, decision_maker_type, decision_maker_id, scope, slug,
+              decision, reason, source_message, applies_to_future, metadata
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+            RETURNING id, task_id, created_at, scope, slug, decision, reason
+            """,
+            [
+                args.task_id,
+                'system',
+                'seo-policy-decision',
+                scope,
+                args.slug,
+                decision_value,
+                result.get('reason'),
+                f"policy_decision={result.get('decision')}; action={result.get('action')}",
+                False,
+                json.dumps(result, ensure_ascii=False, default=str),
+            ],
+        )
+        row = rows[0]
+        ev = seo_os_db.record_workflow_event(
+            task_id=args.task_id,
+            event_type='decision_recorded',
+            actor_type='system',
+            actor_id='seo-policy-decision',
+            message=result.get('reason'),
+            metadata={'decision_row_id': str(row['id']), 'policy_decision': result.get('decision'), 'next_allowed': result.get('next_allowed')},
+        )
+        return {'ok': True, 'decision_row_id': str(row['id']), 'workflow_event_id': str(ev.get('id')) if ev.get('id') else None, 'secret_redacted': True}
+    except Exception as exc:  # pragma: no cover - surfaced by integration smoke
+        return {'ok': False, 'error_type': type(exc).__name__, 'error': str(exc), 'secret_redacted': True}
+
+
+def cmd_decide(args: argparse.Namespace) -> int:
+    result = decide(args)
+    if args.persist_db:
+        db_record = persist_decision(result, args)
+        result['db_record'] = db_record
+        if not db_record.get('ok'):
+            result['exit_code'] = 2
+            result['ok'] = False
+    return json_out(result)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Local-only SEO OS policy decision helper MVP')
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    d = sub.add_parser('decide')
+    d.add_argument('--task-id')
+    d.add_argument('--task-type', required=True)
+    d.add_argument('--action', required=True)
+    d.add_argument('--risk-level', default='unknown', choices=['low', 'medium', 'high', 'critical', 'unknown', 'policy_unknown'])
+    d.add_argument('--actor', default='system')
+    d.add_argument('--slug')
+    d.add_argument('--post-id')
+    d.add_argument('--production-write', action='store_true')
+    d.add_argument('--destructive', action='store_true')
+    d.add_argument('--approval-id')
+    d.add_argument('--approved', action='store_true')
+    d.add_argument('--scope', choices=['workflow', 'publishing', 'cms_draft', 'agent_output', 'performance_feedback', 'article'])
+    d.add_argument('--persist-db', action='store_true')
+    d.add_argument('--json', action='store_true')
+    d.set_defaults(func=cmd_decide)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

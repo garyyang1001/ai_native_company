@@ -1,0 +1,334 @@
+#!/Users/garyyang/clients/ohya/venv/bin/python
+"""seo-performance-snapshot — 拉 GSC multi-window 數據寫入 seo_os.performance_snapshots.
+
+Usage:
+  seo-performance-snapshot one <slug> [--url URL] [--periods 30,60,90,180,365] [--dry-run]
+  seo-performance-snapshot all [--limit N] [--periods 30,60,90,180,365] [--dry-run]
+
+Safety:
+  - Read-only against GSC API.
+  - UPSERT to local seo_os.performance_snapshots only (no production write).
+  - Never prints DB URI / OAuth token / secrets.
+  - Uses UNIQUE(slug, snapshot_date, period_days, source) for idempotency.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+ROOT = Path('/Users/garyyang/clients/ohya')
+sys.path.insert(0, str(ROOT / 'lib'))
+import seo_os_db  # noqa: E402
+
+try:
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+except ImportError:
+    print("ERROR: missing deps. run: ohya/venv/bin/pip install google-api-python-client google-auth-oauthlib", file=sys.stderr)
+    sys.exit(1)
+
+DEFAULT_PERIODS = [30, 60, 90, 180, 365]
+LEGACY_PERIODS = [28, 90]
+VALID_PERIOD_MIN = 1
+VALID_PERIOD_MAX = 730
+
+
+def first_existing_path(*candidates: str) -> str:
+    """Resolve credentials even when Hermes profile changes HOME."""
+    expanded = [os.path.expanduser(p) for p in candidates]
+    for p in expanded:
+        if os.path.exists(p):
+            return p
+    return expanded[0]
+
+
+TOKEN_FILE = first_existing_path(
+    "~/.credentials/gsc-token.json",
+    "/Users/garyyang/.credentials/gsc-token.json",
+)
+SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
+SITE_URL = "https://ohya.co/"
+
+
+def parse_periods(value: str | None) -> list[int]:
+    if not value:
+        return DEFAULT_PERIODS.copy()
+    raw = [part.strip() for part in value.split(',') if part.strip()]
+    periods: list[int] = []
+    for part in raw:
+        try:
+            period = int(part)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid period: {part}") from exc
+        if period < VALID_PERIOD_MIN or period > VALID_PERIOD_MAX:
+            raise argparse.ArgumentTypeError(f"period out of range {VALID_PERIOD_MIN}-{VALID_PERIOD_MAX}: {period}")
+        if period not in periods:
+            periods.append(period)
+    if not periods:
+        raise argparse.ArgumentTypeError("--periods must include at least one integer")
+    return periods
+
+
+def get_gsc_service():
+    if not os.path.exists(TOKEN_FILE):
+        raise RuntimeError(f"GSC token not found at {TOKEN_FILE}; run gsc-query --auth first")
+    creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(TOKEN_FILE, "w") as f:
+                f.write(creds.to_json())
+            os.chmod(TOKEN_FILE, 0o600)
+        else:
+            raise RuntimeError("GSC creds invalid; run gsc-query --auth")
+    return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
+
+
+def _query_gsc_for_url(svc, page_url: str, start: str, end: str) -> dict | None:
+    body = {
+        "startDate": start,
+        "endDate": end,
+        "dimensions": ["page"],
+        "dimensionFilterGroups": [{"filters": [{"dimension": "page", "operator": "equals", "expression": page_url}]}],
+        "rowLimit": 1,
+    }
+    resp = svc.searchanalytics().query(siteUrl=SITE_URL, body=body).execute()
+    rows = resp.get("rows", [])
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "clicks": int(r.get("clicks", 0)),
+        "impressions": int(r.get("impressions", 0)),
+        "ctr": float(r.get("ctr", 0.0)),
+        "avg_position": float(r.get("position", 0.0)),
+    }
+
+
+def query_gsc(svc, page_url: str, period_days: int) -> dict:
+    end = date.today() - timedelta(days=2)
+    start = end - timedelta(days=period_days - 1)
+    no_slash = page_url.rstrip("/")
+    with_slash = no_slash + "/"
+    best = None
+    best_variant = None
+    for variant in (no_slash, with_slash):
+        r = _query_gsc_for_url(svc, variant, start.isoformat(), end.isoformat())
+        if r and (best is None or r["clicks"] > best["clicks"] or r["impressions"] > best["impressions"]):
+            best = r
+            best_variant = variant
+    if best is None:
+        return {"clicks": 0, "impressions": 0, "ctr": 0.0, "avg_position": 0.0, "no_data": True, "period_days": period_days}
+    return {**best, "no_data": False, "period_days": period_days, "matched_url": best_variant}
+
+
+def metric(metrics_by_period: dict[int, dict], period: int, key: str, default=0):
+    return (metrics_by_period.get(period) or {}).get(key, default) or default
+
+
+def classify_bucket(metrics_by_period: dict[int, dict], lifecycle_age_days: int | None) -> tuple[str, float]:
+    """Return (bucket, priority_score). Higher score = needs more attention.
+
+    v1.1 uses multi-window 30/60/90/180/365. If caller passes legacy 28/90 only,
+    it still works by falling back to nearest available windows.
+    """
+    p30 = 30 if 30 in metrics_by_period else (28 if 28 in metrics_by_period else min(metrics_by_period or {30: {}}))
+    p60 = 60 if 60 in metrics_by_period else p30
+    p90 = 90 if 90 in metrics_by_period else p60
+    p180 = 180 if 180 in metrics_by_period else p90
+    p365 = 365 if 365 in metrics_by_period else p180
+
+    c30, i30, pos30 = metric(metrics_by_period, p30, "clicks"), metric(metrics_by_period, p30, "impressions"), metric(metrics_by_period, p30, "avg_position")
+    c60, i60 = metric(metrics_by_period, p60, "clicks"), metric(metrics_by_period, p60, "impressions")
+    c90, i90, pos90 = metric(metrics_by_period, p90, "clicks"), metric(metrics_by_period, p90, "impressions"), metric(metrics_by_period, p90, "avg_position")
+    c180, i180 = metric(metrics_by_period, p180, "clicks"), metric(metrics_by_period, p180, "impressions")
+    c365, i365 = metric(metrics_by_period, p365, "clicks"), metric(metrics_by_period, p365, "impressions")
+
+    if lifecycle_age_days is not None and lifecycle_age_days < 30:
+        return "new", float(i30)
+
+    if i30 == 0 and i60 == 0 and i90 == 0:
+        return "zombie", 100.0
+
+    if (i60 > 100 or i90 > 150) and c60 == 0 and c90 == 0:
+        return "stale", float(max(i60, i90))
+
+    expected_90_from_180 = c180 / 180 * 90 if c180 else 0
+    expected_90_from_365 = c365 / 365 * 90 if c365 else 0
+    baseline = max(expected_90_from_180, expected_90_from_365)
+    if c90 > 0 and baseline > 5 and c90 / baseline < 0.7:
+        return "decaying", float(max(i90 - c90, 0))
+
+    if i90 > i30 > 0 and c30 == 0:
+        return "stale", float(i90)
+
+    pos_for_almost = pos30 or pos90
+    if 11 <= pos_for_almost <= 20 and (i30 > 20 or i90 > 50):
+        return "almost_there", float(max(i30, i90) * 2)
+
+    if (pos90 and pos90 <= 10 and c90 > 0) or (pos30 and pos30 <= 10 and c30 > 0):
+        return "healthy", -float(max(c30, c90))
+
+    if (pos90 and pos90 > 30) or (pos30 and pos30 > 30) or (pos90 == 0 and i90 < 100):
+        return "unranked", float(i90 or i30)
+
+    return "needs_review", 0.0
+
+
+def upsert_snapshot(slug: str, url: str, period_days: int, metrics: dict,
+                     bucket: str, priority_score: float, deltas: dict, dry_run: bool):
+    payload = {
+        "slug": slug,
+        "url": url,
+        "snapshot_date": date.today().isoformat(),
+        "period_days": period_days,
+        "clicks": metrics["clicks"],
+        "impressions": metrics["impressions"],
+        "ctr": round(metrics["ctr"], 5) if metrics["ctr"] else None,
+        "avg_position": round(metrics["avg_position"], 3) if metrics["avg_position"] else None,
+        "clicks_delta": deltas.get("clicks_delta"),
+        "impressions_delta": deltas.get("impressions_delta"),
+        "position_delta": deltas.get("position_delta"),
+        "bucket": bucket,
+        "priority_score": round(priority_score, 3),
+        "source": "gsc",
+        "metadata": {"phase": "2.0", "helper_version": "v1.1", "multi_window": True, "matched_url": metrics.get("matched_url")},
+    }
+    if dry_run:
+        return {"dry_run": True, "would_upsert": payload}
+
+    seo_os_db.execute(
+        """
+        INSERT INTO seo_os.performance_snapshots
+            (slug, url, snapshot_date, period_days, clicks, impressions, ctr, avg_position,
+             clicks_delta, impressions_delta, position_delta, bucket, priority_score, source, metadata)
+        VALUES (%(slug)s, %(url)s, %(snapshot_date)s, %(period_days)s, %(clicks)s, %(impressions)s,
+                %(ctr)s, %(avg_position)s, %(clicks_delta)s, %(impressions_delta)s, %(position_delta)s,
+                %(bucket)s, %(priority_score)s, %(source)s, %(metadata)s::jsonb)
+        ON CONFLICT (slug, snapshot_date, period_days, source) DO UPDATE SET
+            clicks=EXCLUDED.clicks, impressions=EXCLUDED.impressions, ctr=EXCLUDED.ctr,
+            avg_position=EXCLUDED.avg_position, clicks_delta=EXCLUDED.clicks_delta,
+            impressions_delta=EXCLUDED.impressions_delta, position_delta=EXCLUDED.position_delta,
+            bucket=EXCLUDED.bucket, priority_score=EXCLUDED.priority_score,
+            metadata=EXCLUDED.metadata
+        """,
+        {**payload, "metadata": json.dumps(payload["metadata"])},
+    )
+    return {"dry_run": False, "upserted": True}
+
+
+def get_prior_metrics(slug: str, period_days: int) -> dict:
+    rows = seo_os_db.query_json(
+        """
+        SELECT clicks, impressions, avg_position
+        FROM seo_os.performance_snapshots
+        WHERE slug=%s AND period_days=%s AND source='gsc'
+        ORDER BY snapshot_date DESC LIMIT 1 OFFSET 1
+        """,
+        [slug, period_days],
+    )
+    return rows[0] if rows else {}
+
+
+def get_lifecycle_age(slug: str) -> int | None:
+    rows = seo_os_db.query_json(
+        "SELECT last_publish_at FROM seo_os.article_lifecycle WHERE slug=%s",
+        [slug],
+    )
+    if not rows or not rows[0].get("last_publish_at"):
+        return None
+    from datetime import datetime, timezone
+    pub = rows[0]["last_publish_at"]
+    if isinstance(pub, str):
+        pub = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - pub).days
+
+
+def compute_delta(current: dict, prior: dict) -> dict:
+    if not prior:
+        return {}
+    return {
+        "clicks_delta": current["clicks"] - (prior.get("clicks") or 0),
+        "impressions_delta": current["impressions"] - (prior.get("impressions") or 0),
+        "position_delta": round(current["avg_position"] - float(prior.get("avg_position") or 0), 3) if current["avg_position"] else None,
+    }
+
+
+def snapshot_one(slug: str, url: str, dry_run: bool, periods: list[int]) -> dict:
+    svc = get_gsc_service()
+    metrics_by_period = {period: query_gsc(svc, url, period) for period in periods}
+    age_days = get_lifecycle_age(slug)
+    bucket, score = classify_bucket(metrics_by_period, age_days)
+
+    results = {}
+    deltas_by_period = {}
+    for period, metrics in metrics_by_period.items():
+        prior = get_prior_metrics(slug, period)
+        deltas = compute_delta(metrics, prior)
+        deltas_by_period[str(period)] = deltas
+        results[str(period)] = upsert_snapshot(slug, url, period, metrics, bucket, score, deltas, dry_run)
+
+    return {
+        "ok": True,
+        "slug": slug,
+        "url": url,
+        "periods": periods,
+        "lifecycle_age_days": age_days,
+        "metrics_by_period": {str(k): v for k, v in metrics_by_period.items()},
+        "bucket": bucket,
+        "priority_score": round(score, 3),
+        "deltas_by_period": deltas_by_period,
+        "results_by_period": results,
+        "secret_redacted": True,
+        "local_only": True,
+        "production_side_effect": False,
+    }
+
+
+def cmd_one(args):
+    url = args.url or f"https://ohya.co/blog/{args.slug}"
+    out = snapshot_one(args.slug, url, args.dry_run, parse_periods(args.periods))
+    print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+
+
+def cmd_all(args):
+    periods = parse_periods(args.periods)
+    rows = seo_os_db.query_json(
+        "SELECT slug, url FROM seo_os.article_lifecycle WHERE state IN ('published','monitoring','monitored') ORDER BY slug LIMIT %s",
+        [args.limit],
+    )
+    results = []
+    for r in rows:
+        url = r["url"] or f"https://ohya.co/blog/{r['slug']}"
+        try:
+            results.append(snapshot_one(r["slug"], url, args.dry_run, periods))
+        except Exception as e:
+            results.append({"slug": r["slug"], "ok": False, "error": str(e), "local_only": True, "production_side_effect": False})
+    print(json.dumps({"ok": True, "count": len(results), "periods": periods, "results": results, "secret_redacted": True, "local_only": True, "production_side_effect": False}, ensure_ascii=False, indent=2, default=str))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    sp = p.add_subparsers(dest="cmd", required=True)
+    o = sp.add_parser("one", help="snapshot one slug")
+    o.add_argument("slug")
+    o.add_argument("--url")
+    o.add_argument("--periods", default=','.join(map(str, DEFAULT_PERIODS)), help="comma-separated days, default 30,60,90,180,365; legacy example: 28,90")
+    o.add_argument("--dry-run", action="store_true")
+    o.set_defaults(func=cmd_one)
+    a = sp.add_parser("all", help="snapshot all published articles in lifecycle")
+    a.add_argument("--limit", type=int, default=100)
+    a.add_argument("--periods", default=','.join(map(str, DEFAULT_PERIODS)), help="comma-separated days, default 30,60,90,180,365")
+    a.add_argument("--dry-run", action="store_true")
+    a.set_defaults(func=cmd_all)
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

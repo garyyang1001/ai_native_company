@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse, json, sys
+from pathlib import Path
+
+ROOT = Path('/Users/garyyang/clients/ohya')
+sys.path.insert(0, str(ROOT / 'lib'))
+import seo_os_db  # noqa
+
+
+def out(data, code=0):
+    print(json.dumps(data, ensure_ascii=False, indent=2, default=str)); return code
+
+
+def cmd_add(args):
+    seo_os_db.assert_not_production_unless_allowed()
+    row = seo_os_db.query_json(
+        """
+        INSERT INTO seo_os.workflow_events (task_id, agent_run_id, event_type, actor_type, actor_id, message, metadata)
+        VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb)
+        RETURNING id, task_id, agent_run_id, event_type, actor_type, actor_id, message, created_at
+        """,
+        [args.task_id, args.agent_run_id, args.event_type, args.actor_type, args.actor_id, args.message, args.metadata],
+    )[0]
+    return out({'ok': True, 'event': row, 'secret_redacted': True})
+
+
+def cmd_list(args):
+    rows = seo_os_db.query_json(
+        """
+        SELECT id, task_id, agent_run_id, event_type, actor_type, actor_id, message, created_at, metadata
+        FROM seo_os.workflow_events
+        WHERE (%s::uuid IS NULL OR task_id = %s::uuid)
+          AND (%s::text IS NULL OR event_type = %s)
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        [args.task_id, args.task_id, args.event_type, args.event_type, args.limit],
+    )
+    return out({'ok': True, 'count': len(rows), 'events': rows, 'secret_redacted': True})
+
+
+def build():
+    p = argparse.ArgumentParser(description='SEO OS workflow event helper')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    a = sub.add_parser('add')
+    a.add_argument('--task-id')
+    a.add_argument('--agent-run-id')
+    a.add_argument('--event-type', required=True)
+    a.add_argument('--actor-type', default='system')
+    a.add_argument('--actor-id')
+    a.add_argument('--message')
+    a.add_argument('--metadata', default='{}')
+    a.set_defaults(func=cmd_add)
+    l = sub.add_parser('list')
+    l.add_argument('--task-id')
+    l.add_argument('--event-type')
+    l.add_argument('--limit', type=int, default=20)
+    l.set_defaults(func=cmd_list)
+    return p
+
+
+if __name__ == '__main__':
+    a = build().parse_args(); raise SystemExit(a.func(a))

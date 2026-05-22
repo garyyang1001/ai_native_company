@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse, json, sys
+from pathlib import Path
+
+ROOT = Path('/Users/garyyang/clients/ohya')
+sys.path.insert(0, str(ROOT / 'lib'))
+import seo_os_db  # noqa
+
+
+def out(data, code=0):
+    print(json.dumps(data, ensure_ascii=False, indent=2, default=str)); return code
+
+
+def cmd_record(args):
+    seo_os_db.assert_not_production_unless_allowed()
+    row = seo_os_db.query_json(
+        """
+        INSERT INTO seo_os.decisions (
+          task_id, decision_maker_type, decision_maker_id, scope, slug,
+          decision, reason, source_message, applies_to_future, metadata
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        RETURNING id, task_id, created_at, decision_maker_type, decision_maker_id,
+                  scope, slug, decision, reason, source_message, applies_to_future, metadata
+        """,
+        [
+            args.task_id, args.decision_maker_type, args.decision_maker_id,
+            args.scope, args.slug, args.decision, args.reason, args.source_message,
+            args.applies_to_future, args.metadata,
+        ],
+    )[0]
+    if args.emit_event:
+        seo_os_db.query_json(
+            """
+            INSERT INTO seo_os.workflow_events (task_id, event_type, actor_type, actor_id, message, metadata)
+            VALUES (%s,'decision_recorded',%s,%s,%s,%s::jsonb)
+            RETURNING id
+            """,
+            [
+                args.task_id,
+                args.decision_maker_type,
+                args.decision_maker_id,
+                args.reason or args.source_message or f"decision={args.decision}",
+                json.dumps({'decision_id': str(row['id']), 'scope': args.scope, 'decision': args.decision}, ensure_ascii=False),
+            ],
+        )
+    return out({'ok': True, 'decision': row, 'event_emitted': bool(args.emit_event), 'secret_redacted': True})
+
+
+def cmd_list(args):
+    rows = seo_os_db.query_json(
+        """
+        SELECT id, task_id, created_at, decision_maker_type, decision_maker_id,
+               scope, slug, decision, reason, source_message, applies_to_future, metadata
+        FROM seo_os.decisions
+        WHERE (%s::uuid IS NULL OR task_id = %s::uuid)
+          AND (%s::text IS NULL OR slug = %s)
+          AND (%s::text IS NULL OR scope = %s)
+          AND (%s::text IS NULL OR decision = %s)
+          AND (%s::boolean IS NULL OR applies_to_future = %s::boolean)
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        [
+            args.task_id, args.task_id,
+            args.slug, args.slug,
+            args.scope, args.scope,
+            args.decision, args.decision,
+            args.applies_to_future, args.applies_to_future,
+            args.limit,
+        ],
+    )
+    return out({'ok': True, 'count': len(rows), 'decisions': rows, 'secret_redacted': True})
+
+
+def cmd_show(args):
+    rows = seo_os_db.query_json(
+        """
+        SELECT id, task_id, created_at, decision_maker_type, decision_maker_id,
+               scope, slug, decision, reason, source_message, applies_to_future, metadata
+        FROM seo_os.decisions
+        WHERE id = %s
+        """,
+        [args.id],
+    )
+    return out({'ok': bool(rows), 'decision': rows[0] if rows else None, 'secret_redacted': True}, 0 if rows else 1)
+
+
+def build():
+    p = argparse.ArgumentParser(description='SEO OS decision helper')
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    r = sub.add_parser('record')
+    r.add_argument('--task-id')
+    r.add_argument('--decision-maker-type', default='gary', choices=['gary', 'consultant', 'supervisor', 'agent', 'system'])
+    r.add_argument('--decision-maker-id')
+    r.add_argument('--scope', required=True, choices=['topic', 'article', 'workflow', 'client', 'offer', 'agent_output', 'publishing', 'internal_link', 'merge', 'schema', 'content_opportunity', 'cms_draft', 'preview', 'performance_feedback'])
+    r.add_argument('--slug')
+    r.add_argument('--decision', required=True, choices=['approve', 'reject', 'rewrite', 'merge', 'redirect', 'no_action', 'change_positioning', 'needs_human_review', 'archive', 'supersede', 'hold', 'refresh_existing_instead'])
+    r.add_argument('--reason')
+    r.add_argument('--source-message')
+    r.add_argument('--applies-to-future', action='store_true')
+    r.add_argument('--metadata', default='{}')
+    r.add_argument('--emit-event', action='store_true')
+    r.set_defaults(func=cmd_record)
+
+    l = sub.add_parser('list')
+    l.add_argument('--task-id')
+    l.add_argument('--slug')
+    l.add_argument('--scope')
+    l.add_argument('--decision')
+    l.add_argument('--applies-to-future', type=lambda v: v.lower() in ('1','true','yes','y'))
+    l.add_argument('--limit', type=int, default=20)
+    l.set_defaults(func=cmd_list)
+
+    s = sub.add_parser('show')
+    s.add_argument('id')
+    s.set_defaults(func=cmd_show)
+    return p
+
+
+if __name__ == '__main__':
+    a = build().parse_args(); raise SystemExit(a.func(a))

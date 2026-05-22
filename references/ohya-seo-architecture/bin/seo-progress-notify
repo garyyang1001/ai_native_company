@@ -1,0 +1,416 @@
+#!/Users/garyyang/clients/ohya/venv/bin/python
+"""seo-progress-notify — 每 X 分鐘看 DB 最近完成的 SEO task，主動 push Telegram 給 Gary.
+
+Closed-loop spec ref: §11 (notification layer, 2026-05-04 added)
+
+Usage:
+  seo-progress-notify                # default: 找 last 5 min done events 推送
+  seo-progress-notify --window 10    # 找 last 10 min
+  seo-progress-notify --dry-run      # 不實際送 Telegram，只 print
+
+Logic:
+  - SQL: 找 last X min status 變 done 的 task (排除 transient stages 太多訊息)
+  - 重點 milestone: write_done / link_fix_done / audit_done / cms_draft_done / video_uploaded
+  - outline_done 太常見不單獨推（一輪 batch 8 篇 outline 不要 spam）
+  - 整理成一條 Telegram 訊息發 chat_id 6005789080
+  - 用 task metadata 的 'notified_at' 標籤防重複（state file 在 /tmp）
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
+
+ROOT = Path("/Users/garyyang/clients/ohya")
+sys.path.insert(0, str(ROOT / "lib"))
+import seo_os_db  # noqa: E402
+
+ENV_FILE = ROOT / "profiles" / "coordinator" / ".env"
+STATE_FILE = Path("/tmp/seo-progress-notify-state.json")
+
+# Stages 推送哪些（過濾雜訊）
+NOTIFIABLE_TYPES = {
+    "write", "link_fix", "audit", "pre_publish_audit", "cms_draft", "publish",
+    "refresh", "video_produce", "video_replace",
+}
+SKIP_TYPES = {"outline"}  # 太常見
+
+STAGE_LABEL = {
+    "write": "📝 寫稿",
+    "link_fix": "🔗 補連結",
+    "audit": "✅ 稿件審核",
+    "pre_publish_audit": "✅ 上稿前審核",
+    "cms_draft": "📦 上 Payload draft",
+    "publish": "🚀 已 publish",
+    "refresh": "🛠 文章更新",
+    "video_produce": "🎬 影片產出",
+    "video_replace": "🎬 影片重做",
+}
+
+CHANNEL_TYPES = {"task_failed": "⚠️ 撞牆"}
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+
+def is_smoke_or_local_verifier_task(r: dict) -> bool:
+    metadata = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+    if metadata.get("smoke") or metadata.get("local_smoke_cleanup"):
+        return True
+    if metadata.get("generated_by") in {"verify-seo-autopilot-local-mvp", "verify-seo-autopilot-c1-c2"}:
+        return True
+    summary = (r.get("input_summary") or "").lower()
+    return "smoke" in summary or "contract lifecycle smoke" in summary or "local policy exception smoke" in summary
+
+
+def _metadata(r: dict) -> dict:
+    return r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+
+
+def is_superseded_failure(row: dict, candidate_rows: list[dict]) -> bool:
+    """Hide failed intermediate/stale tasks when the same slug already has a successful write.
+
+    Typical case:
+    - an older cms_draft/refresh handoff fails because policy/gate blocks it;
+    - coordinator retries via the approved production patch path and succeeds;
+    - a queued/stale cms_draft task later flips to failed.
+
+    Gary should see the final outcome, not both "draft failed" and "publish done" for
+    the same slug in one progress ping.
+    """
+    if row.get("status") != "failed":
+        return False
+    slug = row.get("slug")
+    if not slug:
+        return False
+
+    row_meta = _metadata(row)
+    policy_block = row_meta.get("policy_block") if isinstance(row_meta.get("policy_block"), dict) else {}
+    row_action = row_meta.get("action") or row_meta.get("approval_action") or policy_block.get("action")
+    row_scope = row_meta.get("requested_scope") or row_meta.get("scope")
+    row_post_id = row.get("payload_post_id") or row_meta.get("post_id") or policy_block.get("post_id")
+
+    successful_write_types = {"cms_draft", "refresh", "publish"}
+    stale_or_intermediate_types = {"cms_draft", "refresh", "publish"}
+
+    for candidate in candidate_rows:
+        if candidate.get("status") != "done" or candidate.get("slug") != slug:
+            continue
+        if str(candidate.get("id")) == str(row.get("id")):
+            continue
+        if candidate.get("type") not in successful_write_types:
+            continue
+        meta = _metadata(candidate)
+        candidate_action = meta.get("action") or meta.get("approval_action")
+        candidate_post_id = candidate.get("payload_post_id") or meta.get("post_id")
+        candidate_scope = meta.get("scope") or meta.get("requested_scope")
+        if meta.get("payload_written") is False:
+            continue
+
+        # Strong matches: same post/action/scope.
+        if row_post_id and candidate_post_id and str(row_post_id) == str(candidate_post_id):
+            return True
+        if row_action and candidate_action and row_action == candidate_action:
+            return True
+        if row_scope and candidate_scope and str(row_scope) in str(candidate_scope):
+            return True
+
+        # Same slug, write-like success, failed task is a stale/intermediate write handoff.
+        # This intentionally ignores timestamp direction: stale queued failures can be
+        # recorded *after* the successful fallback write.
+        if row.get("type") in stale_or_intermediate_types:
+            return True
+    return False
+
+
+def fetch_recent_done(window_min: int) -> list[dict]:
+    """Find tasks updated to status=done within window, with related artifacts."""
+    rows = seo_os_db.query_json(
+        """
+        SELECT t.id, t.type, t.slug, t.assigned_agent, t.status, t.failure_reason, t.updated_at,
+               t.payload_post_id, t.metadata, t.input_summary,
+               (SELECT message FROM seo_os.workflow_events
+                WHERE task_id=t.id AND event_type IN ('task_completed','task_failed','cms_draft_created','video_uploaded','draft_created','links_verified','pre_publish_audit_completed')
+                ORDER BY created_at DESC LIMIT 1) as last_message
+        FROM seo_os.tasks t
+        WHERE t.status IN ('done','failed')
+          AND t.updated_at > NOW() - (%s || ' minutes')::interval
+          AND t.type = ANY(%s)
+        ORDER BY t.updated_at DESC
+        """,
+        [str(window_min), list(NOTIFIABLE_TYPES)],
+    )
+    return rows
+
+
+def fetch_artifact_for(task_id: str, artifact_type: str, prefer_ext: str | None = None) -> dict | None:
+    """Find latest artifact of given type for a task. If prefer_ext given, prefer that file extension."""
+    if prefer_ext:
+        rows = seo_os_db.query_json(
+            "SELECT path, summary FROM seo_os.artifacts WHERE task_id=%s AND type=%s AND path LIKE %s ORDER BY created_at DESC LIMIT 1",
+            [task_id, artifact_type, f"%{prefer_ext}"])
+        if rows:
+            return rows[0]
+    rows = seo_os_db.query_json(
+        "SELECT path, summary FROM seo_os.artifacts WHERE task_id=%s AND type=%s ORDER BY created_at DESC LIMIT 1",
+        [task_id, artifact_type])
+    return rows[0] if rows else None
+
+
+def extract_word_count(md_path: str) -> int | None:
+    try:
+        text = Path(md_path).read_text()
+        # frontmatter parse
+        if text.startswith("---\n"):
+            fm_end = text.find("\n---\n", 4)
+            if fm_end > 0:
+                fm = text[4:fm_end]
+                for line in fm.splitlines():
+                    if line.startswith("word_count:"):
+                        v = line.split(":", 1)[1].strip().strip('"').strip("'")
+                        try:
+                            return int(v)
+                        except ValueError:
+                            pass
+        # rough body word count
+        body = text[text.find("\n---\n") + 5:] if "\n---\n" in text else text
+        # Chinese-friendly: count CJK chars + ASCII words
+        cjk = sum(1 for c in body if "一" <= c <= "鿿")
+        return cjk if cjk > 100 else None
+    except Exception:
+        return None
+
+
+def extract_audit_summary(json_path: str) -> dict | None:
+    try:
+        d = json.loads(Path(json_path).read_text())
+        return {
+            "blocking": d.get("blocking_failures_count", d.get("blocking", 0)),
+            "warnings": d.get("warnings_count", d.get("warnings", 0)),
+            "ready_for_cms_draft": d.get("ready_for_cms_draft"),
+        }
+    except Exception:
+        return None
+
+
+def extract_upload_url(json_path: str) -> dict | None:
+    try:
+        d = json.loads(Path(json_path).read_text())
+        return {
+            "video_id": d.get("video_id"),
+            "url": d.get("url"),
+            "privacy": d.get("privacy"),
+            "post_id": d.get("write_result", {}).get("post_id") if isinstance(d.get("write_result"), dict) else None,
+        }
+    except Exception:
+        return None
+
+
+def enrich_row(r: dict) -> str:
+    """Build a rich one-line message with metadata insight per task."""
+    label = STAGE_LABEL.get(r["type"], r["type"])
+    if r["status"] == "failed":
+        label = f"❌ {label} 失敗"
+        reason = (r.get("failure_reason") or r.get("last_message") or "")[:120]
+        metadata = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        failure = metadata.get("guarded_dispatch_failure") if isinstance(metadata.get("guarded_dispatch_failure"), dict) else {}
+        guardrail = failure.get("guardrail") if isinstance(failure.get("guardrail"), dict) else {}
+        if guardrail.get("failure_state") == "blocked_missing_agent_output":
+            reason = "agent 沒交出可驗證 artifact，已被 guardrail 擋下，未進下游"
+        elif guardrail.get("failure_state") == "blocked_audit_failed":
+            reason = "審核有 blocking 問題，已被 guardrail 擋下，未進 CMS"
+        return f"{label}　{r['slug']}\n　└ {reason}" if reason else f"{label}　{r['slug']}"
+
+    slug = r["slug"]
+    extras = []
+
+    # write done → 抓字數
+    if r["type"] == "write":
+        a = fetch_artifact_for(r["id"], "draft", prefer_ext=".md") or fetch_artifact_for(r["id"], "final_article", prefer_ext=".md")
+        if a and a.get("path"):
+            wc = extract_word_count(a["path"])
+            if wc:
+                extras.append(f"{wc} 字")
+
+    # link_fix done → 抓 link audit summary
+    if r["type"] == "link_fix":
+        a = fetch_artifact_for(r["id"], "link_audit")
+        if a:
+            extras.append("外部連結驗證完")
+
+    # audit done → 抓 blocking / warnings / ready_for_cms_draft
+    if r["type"] in ("pre_publish_audit", "audit"):
+        a = fetch_artifact_for(r["id"], "audit_report") or fetch_artifact_for(r["id"], "pre_publish_audit_report")
+        # try .json sibling
+        if a and a.get("path"):
+            json_path = a["path"].replace(".md", ".json")
+            summary = extract_audit_summary(json_path)
+            if summary:
+                blocking = summary.get("blocking", 0) or 0
+                warnings = summary.get("warnings", 0) or 0
+                ready = summary.get("ready_for_cms_draft")
+                extras.append(f"blocking={blocking} warnings={warnings}")
+                if ready:
+                    extras.append("✅ 可進 cms_draft")
+
+    # cms_draft / refresh done → 抓 post_id + URL
+    if r["type"] in ("cms_draft", "refresh"):
+        post = r.get("payload_post_id")
+        metadata = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+        if not post and metadata.get("post_id"):
+            post = metadata.get("post_id")
+        a = fetch_artifact_for(r["id"], "video_upload_record") or fetch_artifact_for(r["id"], "cms_draft_payload")
+        if a and a.get("path"):
+            info = extract_upload_url(a["path"])
+            if info:
+                if info.get("post_id"):
+                    post = info["post_id"]
+        if metadata.get("payload_written") is True:
+            extras.append("Payload 已寫入")
+        if post:
+            extras.append(f"post={post} ohya.co/blog/{slug}")
+
+    # video_produce / video_replace done → 抓 video_id
+    if r["type"] in ("video_produce", "video_replace"):
+        a = fetch_artifact_for(r["id"], "video_upload_record")
+        if a and a.get("path"):
+            info = extract_upload_url(a["path"])
+            if info and info.get("video_id"):
+                extras.append(f"youtu.be/{info['video_id']} ({info.get('privacy', 'private')})")
+
+    extra_str = "　".join(extras) if extras else ""
+    if extra_str:
+        return f"{label}　{slug}\n　└ {extra_str}"
+    return f"{label}　{slug}"
+
+
+def build_message(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    lines = [enrich_row(r) for r in rows]
+    status_word = "更新" if any(r.get("status") == "failed" for r in rows) else "完成"
+    header = f"⚙️ ohya 進度（最近 {len(lines)} 個任務{status_word}）\n"
+    return header + "\n" + "\n".join(lines)
+
+
+def failure_signature(r: dict) -> str | None:
+    """Stable de-dupe key for repeated retry-loop failures.
+
+    Task IDs change on each auto-created retry, so ID-only de-dupe still lets the
+    same guardrail failure spam Telegram every window. Successful milestones still
+    use task IDs; only failures get signature-level suppression.
+    """
+    if r.get("status") != "failed":
+        return None
+    metadata = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+    failure = metadata.get("guarded_dispatch_failure") if isinstance(metadata.get("guarded_dispatch_failure"), dict) else {}
+    guardrail = failure.get("guardrail") if isinstance(failure.get("guardrail"), dict) else {}
+    failed_guardrails = ",".join(sorted(guardrail.get("failed_guardrails") or []))
+    failure_state = guardrail.get("failure_state") or ""
+    reason = (r.get("failure_reason") or r.get("last_message") or "")[:80]
+    return "|".join([
+        str(r.get("slug") or ""),
+        str(r.get("type") or ""),
+        str(r.get("assigned_agent") or ""),
+        failure_state,
+        failed_guardrails,
+        reason,
+    ])
+
+
+def send_telegram(token: str, chat_id: str, text: str) -> dict:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    r = requests.post(
+        url,
+        json={
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def main():
+    p = argparse.ArgumentParser(prog="seo-progress-notify")
+    p.add_argument("--window", type=int, default=10, help="Minutes window to scan")
+    p.add_argument("--dry-run", action="store_true", help="Don't send Telegram, just print")
+    args = p.parse_args()
+
+    load_dotenv(str(ENV_FILE))
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")[0].strip()
+    if not token or not chat_id:
+        print(json.dumps({"ok": False, "error": "missing TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_USERS"}))
+        sys.exit(1)
+
+    state = load_state()
+    last_notified = state.get("last_notified_task_ids", [])
+    last_failure_signatures = state.get("last_notified_failure_signatures", [])
+
+    try:
+        rows = fetch_recent_done(args.window)
+    except Exception as e:
+        print(json.dumps({"ok": False, "noop": True, "error": "DB unavailable while fetching recent task updates", "error_type": type(e).__name__, "detail": str(e)[:300], "secret_redacted": True}, ensure_ascii=False, default=str))
+        sys.exit(0)
+    rows = [r for r in rows if not is_smoke_or_local_verifier_task(r)]
+    rows = [r for r in rows if not is_superseded_failure(r, rows)]
+    new_rows = []
+    for r in rows:
+        sig = failure_signature(r)
+        if str(r["id"]) in last_notified:
+            continue
+        if sig and sig in last_failure_signatures:
+            continue
+        new_rows.append(r)
+
+    if not new_rows:
+        print(json.dumps({"ok": True, "noop": True, "found": len(rows), "new": 0}, default=str))
+        sys.exit(0)
+
+    msg = build_message(new_rows)
+    if not msg:
+        print(json.dumps({"ok": True, "noop": True, "reason": "build_message empty"}, default=str))
+        sys.exit(0)
+
+    if args.dry_run:
+        print(json.dumps({"ok": True, "dry_run": True, "would_send": msg, "task_count": len(new_rows)}, ensure_ascii=False, default=str))
+        sys.exit(0)
+
+    try:
+        result = send_telegram(token, chat_id, msg)
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}, default=str))
+        sys.exit(1)
+
+    # Update state — add notified ids, keep only last 200
+    notified_ids = last_notified + [str(r["id"]) for r in new_rows]
+    state["last_notified_task_ids"] = notified_ids[-200:]
+    notified_failure_signatures = last_failure_signatures + [sig for r in new_rows if (sig := failure_signature(r))]
+    state["last_notified_failure_signatures"] = notified_failure_signatures[-200:]
+    state["last_run_at"] = datetime.now().isoformat()
+    save_state(state)
+
+    print(json.dumps({"ok": True, "sent": True, "task_count": len(new_rows), "telegram_message_id": result.get("result", {}).get("message_id")}, default=str))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,33 @@
+{
+  "client_name": "ohya",
+  "self_domains": [
+    "ohya.co"
+  ],
+  "deny_paths": [
+    "~/Desktop/",
+    "~/Documents/",
+    "~/Pictures/",
+    "~/Movies/"
+  ],
+  "allowed_read_roots": [
+    "~/clients/ohya/",
+    "~/workspace/ohya/",
+    "~/.credentials/",
+    "~/.hermes/",
+    "/tmp/",
+    "/var/folders/"
+  ],
+  "allowed_external": [
+    "docs.google.com",
+    "drive.google.com",
+    "sheets.google.com",
+    "google.com",
+    "chatgpt.com",
+    "api.telegram.org"
+  ],
+  "notes": [
+    "ohya.co 是 Next.js + Payload CMS，API 在 /api/posts",
+    "agent 應該走 bin/ohya-api 之類 helper（若有）或 bin/neo4j-query，不是 HTTP fetch 自家站",
+    "WP REST API 在此站不適用"
+  ]
+}

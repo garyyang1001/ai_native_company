@@ -1,0 +1,428 @@
+#!/usr/bin/env python3.11
+"""
+content-cannibalization — 偵測 好事發生數位 文章之間的關鍵字自相殘殺
+
+兩層偵測:
+  1. Neo4j entity/topic overlap — 文章共享太多主題 (結構層)
+  2. GSC keyword overlap — 兩篇文章搶同一組關鍵字 (實際 SERP 層)
+
+兩層交叉 = 高信心 cannibalization
+
+Usage:
+  content-cannibalization                    # 全掃 + 輸出報告
+  content-cannibalization --no-gdoc          # 跳過 Google Doc 推送
+  content-cannibalization --dry-run          # 只印摘要
+  content-cannibalization --output-dir DIR   # 覆寫輸出目錄
+
+Output:
+  {output_dir}/cannibalization-report.md     # 人看報告
+  {output_dir}/cannibalization-data.json     # 結構化資料
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import date, timedelta
+from pathlib import Path
+from urllib.parse import unquote
+
+try:
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+except ImportError:
+    print("ERROR: missing google libs.", file=sys.stderr)
+    sys.exit(1)
+
+BIN_DIR = Path(__file__).resolve().parent
+SITE_URL = "https://ohya.co/"
+TOKEN_FILE = os.path.expanduser("~/.credentials/gsc-token.json")
+SCOPES = [
+    "https://www.googleapis.com/auth/webmasters.readonly",
+    "https://www.googleapis.com/auth/drive.file",
+]
+
+# ---------- credentials (shared with gsc-query / content-priority) ----------
+
+def get_credentials():
+    if not os.path.exists(TOKEN_FILE):
+        print("ERROR: no credentials. run: gsc-query --auth", file=sys.stderr)
+        sys.exit(2)
+    creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        with open(TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+    return creds
+
+
+def normalize_url(url: str) -> str:
+    return unquote(url).rstrip("/")
+
+# ---------- Neo4j layer: entity/topic overlap ----------
+
+def neo4j_overlap(min_overlap: int = 6) -> list[dict]:
+    """Find article pairs sharing >= min_overlap entities/topics."""
+    cypher = f"""
+    MATCH (a:Article)-[:MENTIONS]->(shared)<-[:MENTIONS]-(b:Article)
+    WHERE a.scraped_at IS NOT NULL AND b.scraped_at IS NOT NULL
+      AND id(a) < id(b)
+      AND NOT a.url CONTAINS '/social-proof/'
+      AND NOT b.url CONTAINS '/social-proof/'
+    WITH a, b, count(DISTINCT shared) AS overlap,
+         collect(DISTINCT shared.name)[..8] AS shared_names
+    WHERE overlap >= {min_overlap}
+    RETURN a.url AS url_a, a.slug AS slug_a, a.title AS title_a,
+           b.url AS url_b, b.slug AS slug_b, b.title AS title_b,
+           overlap, shared_names
+    ORDER BY overlap DESC
+    """
+    neo4j_bin = BIN_DIR / "neo4j-query"
+    result = subprocess.run(
+        [str(neo4j_bin), cypher],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        print(f"ERROR: neo4j-query failed: {result.stderr[:200]}", file=sys.stderr)
+        return []
+
+    pairs = []
+    header_skipped = False
+    for line in result.stdout.strip().split("\n"):
+        if not header_skipped:
+            header_skipped = True
+            continue
+        if not line.strip():
+            continue
+        # Parse CSV-ish output
+        try:
+            parts = _parse_neo4j_line(line)
+            if len(parts) >= 8:
+                pairs.append({
+                    "url_a": parts[0].strip('"'),
+                    "slug_a": parts[1].strip('"'),
+                    "title_a": parts[2].strip('"'),
+                    "url_b": parts[3].strip('"'),
+                    "slug_b": parts[4].strip('"'),
+                    "title_b": parts[5].strip('"'),
+                    "overlap": int(parts[6]),
+                    "shared_names": parts[7].strip('"').strip("[]"),
+                })
+        except (ValueError, IndexError):
+            continue
+    return pairs
+
+
+def _parse_neo4j_line(line: str) -> list[str]:
+    """Parse a Neo4j CSV line handling quoted fields with commas."""
+    parts = []
+    current = []
+    in_quote = False
+    in_bracket = False
+    for ch in line:
+        if ch == '"' and not in_bracket:
+            in_quote = not in_quote
+            current.append(ch)
+        elif ch == '[':
+            in_bracket = True
+            current.append(ch)
+        elif ch == ']':
+            in_bracket = False
+            current.append(ch)
+        elif ch == ',' and not in_quote and not in_bracket:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+# ---------- GSC layer: keyword overlap ----------
+
+def gsc_page_keywords(service) -> dict[str, list[dict]]:
+    """Fetch all page × query combinations for last 28 days."""
+    end = date.today()
+    start = end - timedelta(days=28)
+    body = {
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "dimensions": ["page", "query"],
+        "rowLimit": 25000,
+        "orderBy": [{"field": "impressions", "descending": True}],
+    }
+    try:
+        resp = service.searchanalytics().query(siteUrl=SITE_URL, body=body).execute()
+    except HttpError as e:
+        print(f"ERROR: GSC API {e.resp.status}: {e}", file=sys.stderr)
+        return {}
+
+    per_page = defaultdict(list)
+    for r in resp.get("rows", []):
+        page = normalize_url(r["keys"][0])
+        query = r["keys"][1]
+        per_page[page].append({
+            "query": query,
+            "clicks": r.get("clicks", 0),
+            "impressions": r.get("impressions", 0),
+            "position": round(r.get("position", 0), 1),
+        })
+    return dict(per_page)
+
+
+def keyword_overlap(page_kws: dict, url_a: str, url_b: str) -> dict:
+    """Calculate keyword overlap between two pages."""
+    norm_a = normalize_url(url_a)
+    norm_b = normalize_url(url_b)
+    kws_a = {kw["query"] for kw in page_kws.get(norm_a, [])}
+    kws_b = {kw["query"] for kw in page_kws.get(norm_b, [])}
+
+    shared = kws_a & kws_b
+    if not shared:
+        return {"shared_keywords": [], "count": 0}
+
+    # Get details for shared keywords
+    details = []
+    kw_details_a = {kw["query"]: kw for kw in page_kws.get(norm_a, [])}
+    kw_details_b = {kw["query"]: kw for kw in page_kws.get(norm_b, [])}
+
+    for q in shared:
+        da = kw_details_a.get(q, {})
+        db = kw_details_b.get(q, {})
+        details.append({
+            "query": q,
+            "page_a_pos": da.get("position", 0),
+            "page_a_clicks": da.get("clicks", 0),
+            "page_b_pos": db.get("position", 0),
+            "page_b_clicks": db.get("clicks", 0),
+        })
+    details.sort(key=lambda x: x["page_a_clicks"] + x["page_b_clicks"], reverse=True)
+
+    return {"shared_keywords": details[:10], "count": len(shared)}
+
+# ---------- Scoring ----------
+
+def score_pair(neo4j_pair: dict, kw_data: dict) -> dict:
+    """Score cannibalization risk for a pair."""
+    entity_overlap = neo4j_pair["overlap"]
+    kw_count = kw_data["count"]
+
+    # Risk scoring:
+    # - entity overlap >= 10 AND keyword overlap >= 3 → HIGH
+    # - entity overlap >= 8 OR keyword overlap >= 5 → MEDIUM
+    # - else → LOW
+    if entity_overlap >= 10 and kw_count >= 3:
+        risk = "HIGH"
+    elif entity_overlap >= 8 or kw_count >= 5:
+        risk = "MEDIUM"
+    else:
+        risk = "LOW"
+
+    return {
+        **neo4j_pair,
+        "keyword_overlap": kw_data,
+        "risk": risk,
+    }
+
+# ---------- Report generation ----------
+
+def generate_report(scored_pairs: list[dict]) -> str:
+    high = [p for p in scored_pairs if p["risk"] == "HIGH"]
+    med = [p for p in scored_pairs if p["risk"] == "MEDIUM"]
+    low = [p for p in scored_pairs if p["risk"] == "LOW"]
+
+    lines = [
+        "---",
+        f"scan_date: {date.today().isoformat()}",
+        f"total_pairs: {len(scored_pairs)}",
+        f"high_risk: {len(high)}",
+        f"medium_risk: {len(med)}",
+        f"low_risk: {len(low)}",
+        "---",
+        "",
+        f"# Content Cannibalization 報告 — {date.today().isoformat()}",
+        "",
+        "## 摘要",
+        "",
+        f"掃描 402 篇文章，找到 **{len(scored_pairs)}** 組潛在自相殘殺的文章對。",
+        "",
+        f"- 🔴 高風險: {len(high)} 組（entity 重疊高 + GSC 關鍵字重複）",
+        f"- 🟡 中風險: {len(med)} 組",
+        f"- 🟢 低風險: {len(low)} 組",
+        "",
+        "**建議**: 高風險的應優先處理——合併、設 canonical、或重新定位其中一篇的目標關鍵字。",
+        "",
+        "---",
+        "",
+    ]
+
+    if high:
+        lines.append("## 🔴 高風險")
+        lines.append("")
+        for i, p in enumerate(high, 1):
+            lines.extend(_format_pair(i, p))
+        lines.append("---")
+        lines.append("")
+
+    if med:
+        lines.append("## 🟡 中風險")
+        lines.append("")
+        for i, p in enumerate(med, 1):
+            lines.extend(_format_pair(i, p))
+        lines.append("---")
+        lines.append("")
+
+    if low:
+        lines.append("## 🟢 低風險（前 10 組）")
+        lines.append("")
+        for i, p in enumerate(low[:10], 1):
+            lines.extend(_format_pair(i, p))
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "_報告產出: `bin/content-cannibalization`_",
+    ])
+
+    return "\n".join(lines)
+
+
+def _format_pair(i: int, p: dict) -> list[str]:
+    kw = p.get("keyword_overlap", {})
+    shared_kws = kw.get("shared_keywords", [])
+
+    lines = [
+        f"### {i}. `{p['slug_a']}` vs `{p['slug_b']}`",
+        "",
+        f"| | 文章 A | 文章 B |",
+        f"|---|---|---|",
+        f"| **標題** | {p.get('title_a', '')[:40]} | {p.get('title_b', '')[:40]} |",
+        f"| **Entity 重疊** | {p['overlap']} 個共享主題 ||",
+        f"| **關鍵字重疊** | {kw.get('count', 0)} 個共搶關鍵字 ||",
+        "",
+    ]
+
+    if p.get("shared_names"):
+        lines.append(f"**共享主題**: {p['shared_names']}")
+        lines.append("")
+
+    if shared_kws:
+        lines.append("**搶同一關鍵字**:")
+        lines.append("")
+        lines.append("| 關鍵字 | A 排名 | A clicks | B 排名 | B clicks |")
+        lines.append("|---|---|---|---|---|")
+        for sk in shared_kws[:5]:
+            lines.append(
+                f"| {sk['query']} | {sk['page_a_pos']} | {sk['page_a_clicks']} | "
+                f"{sk['page_b_pos']} | {sk['page_b_clicks']} |"
+            )
+        lines.append("")
+
+    # Recommendation
+    if p["risk"] == "HIGH":
+        lines.append("**建議**: 考慮合併這兩篇,或用 canonical 指定主文,避免 Google 分散排名。")
+    elif p["risk"] == "MEDIUM":
+        lines.append("**建議**: 重新定位其中一篇的目標關鍵字,拉開差異化。")
+    lines.append("")
+
+    return lines
+
+# ---------- Main ----------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="偵測 好事發生數位 文章之間的關鍵字自相殘殺",
+    )
+    parser.add_argument("--no-gdoc", action="store_true", help="跳過 Google Doc 推送")
+    parser.add_argument("--dry-run", action="store_true", help="只印摘要")
+    parser.add_argument("--output-dir",
+                        default=os.path.expanduser("~/workspace/ohya/cannibalization"),
+                        help="輸出目錄")
+    parser.add_argument("--min-overlap", type=int, default=6,
+                        help="Neo4j entity 最少重疊數 (default: 6)")
+    args = parser.parse_args()
+
+    print("Step 1: 查 Neo4j entity/topic overlap...", file=sys.stderr)
+    neo4j_pairs = neo4j_overlap(args.min_overlap)
+    print(f"  找到 {len(neo4j_pairs)} 組 entity 重疊 >= {args.min_overlap}", file=sys.stderr)
+
+    if args.dry_run:
+        print(f"\n=== DRY RUN ===")
+        print(f"Neo4j pairs: {len(neo4j_pairs)}")
+        for p in neo4j_pairs[:5]:
+            print(f"  {p['slug_a']} vs {p['slug_b']}: {p['overlap']} overlap")
+        return
+
+    print("Step 2: 查 GSC 28 天 page × query...", file=sys.stderr)
+    creds = get_credentials()
+    service = build("webmasters", "v3", credentials=creds, cache_discovery=False)
+    page_kws = gsc_page_keywords(service)
+    print(f"  取得 {len(page_kws)} 個 page 的關鍵字資料", file=sys.stderr)
+
+    print("Step 3: 交叉比對...", file=sys.stderr)
+    scored = []
+    for pair in neo4j_pairs:
+        kw_data = keyword_overlap(page_kws, pair["url_a"], pair["url_b"])
+        scored.append(score_pair(pair, kw_data))
+
+    # Sort by risk then overlap
+    risk_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    scored.sort(key=lambda x: (risk_order[x["risk"]], -x["overlap"]))
+
+    print(f"  HIGH: {sum(1 for s in scored if s['risk']=='HIGH')}", file=sys.stderr)
+    print(f"  MEDIUM: {sum(1 for s in scored if s['risk']=='MEDIUM')}", file=sys.stderr)
+    print(f"  LOW: {sum(1 for s in scored if s['risk']=='LOW')}", file=sys.stderr)
+
+    # Output
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    report = generate_report(scored)
+    (out / "cannibalization-report.md").write_text(report, encoding="utf-8")
+
+    (out / "cannibalization-data.json").write_text(
+        json.dumps(scored, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+    print(f"\n產出:", file=sys.stderr)
+    print(f"  {out / 'cannibalization-report.md'}", file=sys.stderr)
+    print(f"  {out / 'cannibalization-data.json'}", file=sys.stderr)
+
+    # Push to Google Doc
+    if not args.no_gdoc:
+        md_to_gdoc = BIN_DIR / "md-to-gdoc"
+        if md_to_gdoc.exists():
+            print("Step 4: 推 Google Doc...", file=sys.stderr)
+            result = subprocess.run(
+                [str(md_to_gdoc), str(out / "cannibalization-report.md"),
+                 "--title", f"Cannibalization 報告 {date.today().isoformat()}",
+                 "--json"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                try:
+                    doc_info = json.loads(result.stdout)
+                    print(f"  Google Doc: {doc_info.get('doc_url', 'OK')}", file=sys.stderr)
+                except json.JSONDecodeError:
+                    print(f"  Google Doc: {result.stdout.strip()}", file=sys.stderr)
+
+    # Final summary to stdout (JSON)
+    summary = {
+        "scan_date": date.today().isoformat(),
+        "total_pairs": len(scored),
+        "high": sum(1 for s in scored if s["risk"] == "HIGH"),
+        "medium": sum(1 for s in scored if s["risk"] == "MEDIUM"),
+        "low": sum(1 for s in scored if s["risk"] == "LOW"),
+        "output_dir": str(out),
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

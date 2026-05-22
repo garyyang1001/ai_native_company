@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse, json, sys
+from pathlib import Path
+
+ROOT = Path('/Users/garyyang/clients/ohya')
+sys.path.insert(0, str(ROOT / 'lib'))
+import seo_os_db  # noqa
+
+
+def out(data, code=0):
+    print(json.dumps(data, ensure_ascii=False, indent=2, default=str)); return code
+
+
+def ensure_write_safe():
+    seo_os_db.assert_not_production_unless_allowed()
+
+
+def cmd_create(args):
+    ensure_write_safe()
+    row = seo_os_db.query_json(
+        """
+        INSERT INTO seo_os.tasks (source, type, status, priority, slug, url, assigned_agent, parent_task_id, input_summary, next_action, owner_type, owner_id, metadata)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        RETURNING id, created_at, status, type, priority, slug, assigned_agent, parent_task_id, input_summary
+        """,
+        [args.source, args.type, args.status, args.priority, args.slug, args.url, args.agent, args.parent_task_id, args.summary, args.next_action, args.owner_type, args.owner_id, args.metadata],
+    )[0]
+    return out({'ok': True, 'task': row, 'secret_redacted': True})
+
+
+def cmd_list(args):
+    rows = seo_os_db.query_json(
+        """
+        SELECT id, created_at, status, priority, type, slug, assigned_agent, input_summary, failure_reason
+        FROM seo_os.tasks
+        WHERE (%s::text IS NULL OR status = %s)
+          AND (%s::text IS NULL OR slug = %s)
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        [args.status, args.status, args.slug, args.slug, args.limit],
+    )
+    return out({'ok': True, 'count': len(rows), 'tasks': rows, 'secret_redacted': True})
+
+
+def cmd_show(args):
+    rows = seo_os_db.query_json('SELECT * FROM seo_os.tasks WHERE id = %s', [args.id])
+    if not rows:
+        return out({'ok': False, 'message': 'task not found', 'id': args.id}, 1)
+    events = seo_os_db.query_json('SELECT id, event_type, actor_type, actor_id, message, created_at, metadata FROM seo_os.workflow_events WHERE task_id=%s ORDER BY created_at', [args.id])
+    artifacts = seo_os_db.query_json('SELECT id, type, path, google_doc_url, status, sha256, size_bytes, created_at FROM seo_os.artifacts WHERE task_id=%s ORDER BY created_at', [args.id])
+    decisions = seo_os_db.query_json(
+        '''
+        SELECT id, created_at, decision_maker_type, decision_maker_id, scope, slug,
+               decision, reason, source_message, applies_to_future, metadata
+        FROM seo_os.decisions
+        WHERE task_id=%s
+        ORDER BY created_at
+        ''',
+        [args.id],
+    )
+    approvals = seo_os_db.query_json(
+        '''
+        SELECT id, decision_id, created_at, decided_at, action, risk_level,
+               requested_by, required_approver_type, required_approver_id,
+               status, approval_message, metadata
+        FROM seo_os.approvals
+        WHERE task_id=%s
+        ORDER BY created_at
+        ''',
+        [args.id],
+    )
+    return out({
+        'ok': True,
+        'task': rows[0],
+        'events': events,
+        'artifacts': artifacts,
+        'decisions': decisions,
+        'approvals': approvals,
+        'secret_redacted': True,
+    })
+
+
+def cmd_update(args):
+    ensure_write_safe()
+    sets=[]; vals=[]
+    for col, val in [('status', args.status), ('priority', args.priority), ('next_action', args.next_action), ('failure_reason', args.failure_reason)]:
+        if val is not None:
+            sets.append(f'{col} = %s'); vals.append(val)
+    if not sets:
+        return out({'ok': False, 'message': 'nothing to update'}, 2)
+    vals.append(args.id)
+    row = seo_os_db.query_json(f"UPDATE seo_os.tasks SET {', '.join(sets)}, updated_at=now() WHERE id=%s RETURNING id, status, priority, next_action, failure_reason", vals)
+    return out({'ok': bool(row), 'task': row[0] if row else None, 'secret_redacted': True}, 0 if row else 1)
+
+
+def build():
+    p=argparse.ArgumentParser(description='SEO OS task helper')
+    sub=p.add_subparsers(dest='cmd', required=True)
+    c=sub.add_parser('create')
+    c.add_argument('--type', required=True)
+    c.add_argument('--summary', required=True)
+    c.add_argument('--source', default='manual')
+    c.add_argument('--status', default='pending')
+    c.add_argument('--priority', default='medium')
+    c.add_argument('--slug'); c.add_argument('--url'); c.add_argument('--agent', dest='agent'); c.add_argument('--parent-task-id')
+    c.add_argument('--next-action'); c.add_argument('--owner-type'); c.add_argument('--owner-id')
+    c.add_argument('--metadata', default='{}')
+    c.set_defaults(func=cmd_create)
+    l=sub.add_parser('list'); l.add_argument('--status'); l.add_argument('--slug'); l.add_argument('--limit', type=int, default=20); l.set_defaults(func=cmd_list)
+    s=sub.add_parser('show'); s.add_argument('id'); s.set_defaults(func=cmd_show)
+    u=sub.add_parser('update'); u.add_argument('id'); u.add_argument('--status'); u.add_argument('--priority'); u.add_argument('--next-action'); u.add_argument('--failure-reason'); u.set_defaults(func=cmd_update)
+    return p
+
+if __name__ == '__main__':
+    a=build().parse_args(); raise SystemExit(a.func(a))

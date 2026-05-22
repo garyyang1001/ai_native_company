@@ -1,0 +1,192 @@
+#!/Users/garyyang/clients/ohya/venv/bin/python
+"""seo-guardrail-scheduler — local scheduler entrypoint for SEO Growth OS guardrail loop.
+
+Safety:
+- default is --dry-run; no network / no DB writes beyond optional local guardrail DB recording when --execute is used.
+- never deploys, never pushes, never writes Payload, never runs production migration.
+- production-looking DB writes require seo_os_db policy env approval.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path('/Users/garyyang/clients/ohya')
+WORKSPACE = Path('/Users/garyyang/workspace/ohya')
+HELPER = ROOT / 'bin' / 'seo-guardrail'
+FIXTURES = ROOT / 'data' / 'seo-os' / 'guardrail-fixtures'
+REPORT_DIR = WORKSPACE / 'guardrail-results' / 'scheduler'
+sys.path.insert(0, str(ROOT / 'lib'))
+import seo_os_db  # noqa: E402
+
+
+def run(cmd: list[str], *, timeout: int = 120) -> dict:
+    cp = subprocess.run(cmd, cwd=str(ROOT), text=True, capture_output=True, timeout=timeout)
+    out = cp.stdout.strip()
+    parsed = None
+    if out:
+        try:
+            parsed = json.loads(out)
+        except Exception:
+            parsed = None
+    return {
+        'cmd': cmd,
+        'exit_code': cp.returncode,
+        'stdout_preview': out[:2000],
+        'stderr_preview': cp.stderr.strip()[:1200],
+        'json': parsed,
+    }
+
+
+def planned_commands(args) -> list[dict]:
+    limit = str(args.limit)
+    periods = args.periods
+    return [
+        {
+            'name': 'guardrail_rule_registry_health',
+            'purpose': '確認 seo-guardrail rule registry 可以載入',
+            'cmd': [str(HELPER), 'list-rules', '--json'],
+            'writes_db': False,
+            'network': False,
+        },
+        {
+            'name': 'feedback_schedule_guardrail_fixture',
+            'purpose': '用 fixture 驗證 feedback_schedule gate 仍可 pass 並可寫入 guardrail_results',
+            'cmd': [str(HELPER), 'check', '--stage', 'feedback-schedule', '--context', str(FIXTURES / 'feedback_schedule_pass.json'), '--json', '--write-log', '--persist-db'],
+            'writes_db': True,
+            'network': False,
+        },
+        {
+            'name': 'learning_loop_guardrail_fixture',
+            'purpose': '用 fixture 驗證 learning_loop gate 仍可 pass 並可寫入 guardrail_results',
+            'cmd': [str(HELPER), 'check', '--stage', 'learning-loop', '--context', str(FIXTURES / 'learning_loop_pass.json'), '--json', '--write-log', '--persist-db'],
+            'writes_db': True,
+            'network': False,
+        },
+        {
+            'name': 'performance_compare_summary',
+            'purpose': '讀 local SEO OS performance snapshot，產生健康分布摘要',
+            'cmd': [str(ROOT / 'bin' / 'seo-performance-compare'), 'summary', '--period', periods],
+            'writes_db': False,
+            'network': False,
+        },
+        {
+            'name': 'next_task_rule_plan',
+            'purpose': '根據 local DB 產 next task plan；dry-run 不 insert',
+            'cmd': [str(ROOT / 'bin' / 'seo-next-task-rule'), 'plan', '--top', limit, '--period', periods],
+            'writes_db': False,
+            'network': False,
+        },
+        {
+            'name': 'autopilot_queue_guarded_dry_run',
+            'purpose': '掃 local queue 並預覽 policy + pre_dispatch guardrail + agent command；不 claim task、不派真 agent',
+            'cmd': [str(ROOT / 'bin' / 'seo-queue-pickup'), 'dispatch', '--limit', limit, '--dry-run', '--timeout', str(args.timeout)],
+            'writes_db': False,
+            'network': False,
+        },
+    ]
+
+
+def guardrail_db_summary() -> dict:
+    try:
+        rows = seo_os_db.query_json(
+            """
+            SELECT stage, status, count(*)::int AS count
+            FROM seo_os.guardrail_results
+            WHERE checked_at > now() - interval '7 days'
+            GROUP BY stage, status
+            ORDER BY stage, status
+            """
+        )
+        failures = seo_os_db.query_json(
+            """
+            SELECT failure_state, count(*)::int AS count
+            FROM seo_os.guardrail_results
+            WHERE checked_at > now() - interval '7 days' AND failure_state IS NOT NULL
+            GROUP BY failure_state
+            ORDER BY count DESC, failure_state
+            LIMIT 20
+            """
+        )
+        return {'ok': True, 'last_7d_by_stage_status': rows, 'top_failures': failures}
+    except Exception as exc:
+        return {'ok': False, 'error_type': type(exc).__name__, 'error': str(exc), 'secret_redacted': True}
+
+
+def cmd_plan(args) -> int:
+    report = {
+        'ok': True,
+        'dry_run': True,
+        'local_only': True,
+        'production_side_effect': False,
+        'planned_at': datetime.now(timezone.utc).isoformat(),
+        'commands': planned_commands(args),
+        'guardrail_db_summary': guardrail_db_summary(),
+        'secret_redacted': True,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def cmd_run(args) -> int:
+    commands = planned_commands(args)
+    report = {
+        'ok': True,
+        'dry_run': not args.execute,
+        'local_only': True,
+        'production_side_effect': False,
+        'started_at': datetime.now(timezone.utc).isoformat(),
+        'commands': commands,
+        'runs': [],
+        'guardrail_db_summary_before': guardrail_db_summary(),
+        'secret_redacted': True,
+    }
+    if not args.execute:
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        return 0
+
+    for item in commands:
+        outcome = run(item['cmd'], timeout=args.timeout)
+        ok = outcome['exit_code'] == 0
+        if item['name'] == 'next_task_rule_plan':
+            # A plan can return no actionable rows; only nonzero is failure.
+            ok = outcome['exit_code'] == 0
+        report['runs'].append({'name': item['name'], 'ok': ok, **outcome})
+        if not ok:
+            report['ok'] = False
+            break
+    report['finished_at'] = datetime.now(timezone.utc).isoformat()
+    report['guardrail_db_summary_after'] = guardrail_db_summary()
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    path = REPORT_DIR / f"scheduler-run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str) + '\n')
+    report['report_path'] = str(path)
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    return 0 if report['ok'] else 1
+
+
+def build_parser():
+    p = argparse.ArgumentParser(description='SEO guardrail scheduler local entrypoint')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    for name, func in [('plan', cmd_plan), ('run', cmd_run)]:
+        s = sub.add_parser(name)
+        s.add_argument('--limit', type=int, default=30)
+        s.add_argument('--periods', default='90')
+        s.add_argument('--timeout', type=int, default=180)
+        if name == 'run':
+            s.add_argument('--execute', action='store_true', help='actually run local scheduler commands; default prints dry-run plan')
+        s.set_defaults(func=func)
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

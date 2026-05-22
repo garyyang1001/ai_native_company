@@ -1,0 +1,617 @@
+#!/usr/bin/env python3.11
+"""
+content-priority — 好事發生數位 全站 SEO 優先級掃描
+
+掃描所有 Neo4j Article nodes,交叉 GSC 28d/28-56d/90d 三個窗戶,分 4 個 bucket
+(decaying / stale / almost_there / zombie) + healthy / unranked,輸出
+priority-queue.json(給 coordinator chain 讀)+ priority-report.md(推 Google Doc)
+
+Usage:
+  content-priority                     # 全掃 + 推 Google Doc
+  content-priority --no-gdoc           # 跳過 Doc 推送
+  content-priority --dry-run           # 只印摘要,不寫檔
+  content-priority --output-dir DIR    # 覆寫輸出資料夾
+  content-priority --site URL          # 覆寫目標站點
+
+Output (非 dry-run):
+  {output_dir}/priority-queue.json
+  {output_dir}/priority-report.md
+
+Final stdout (JSON): {scan_date, total, bucket_counts, doc_url, output_dir}
+
+Requires:
+  - ~/.credentials/gsc-token.json (跟 gsc-query / md-to-gdoc 共用)
+  - bin/neo4j-query (docker cypher-shell wrapper)
+  - bin/md-to-gdoc (若沒加 --no-gdoc)
+  - Python 3.11 + google-api-python-client
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import unquote
+
+try:
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+except ImportError:
+    print(
+        "ERROR: missing google libs. run: python3.11 -m pip install "
+        "google-api-python-client google-auth-oauthlib",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+HOME = os.path.expanduser("~")
+BIN_DIR = f"{HOME}/clients/ohya/bin"
+MD_TO_GDOC = f"{BIN_DIR}/md-to-gdoc"
+NEO4J_QUERY = f"{BIN_DIR}/neo4j-query"
+TOKEN_FILE = f"{HOME}/.credentials/gsc-token.json"
+SCOPES = [
+    "https://www.googleapis.com/auth/webmasters.readonly",
+    "https://www.googleapis.com/auth/drive.file",
+]
+DEFAULT_SITE = "https://ohya.co"
+DEFAULT_OUTPUT_ROOT = f"{HOME}/workspace/ohya/priority-scans"
+
+DECAYING_DROP_PCT = 30
+DECAYING_MIN_IMPRESSIONS = 100
+STALE_DAYS = 365
+STALE_POSITION_DELTA = 2
+STALE_MIN_IMPRESSIONS = 20
+ALMOST_THERE_POS_MIN = 4
+ALMOST_THERE_POS_MAX = 10
+ALMOST_THERE_MIN_IMPRESSIONS = 50
+ZOMBIE_90D_IMPRESSIONS = 50
+
+CTR_BY_POSITION = {
+    1: 0.30, 2: 0.15, 3: 0.10, 4: 0.07, 5: 0.05,
+    6: 0.035, 7: 0.025, 8: 0.020, 9: 0.017, 10: 0.015,
+}
+
+
+def expected_ctr(position: float) -> float:
+    if position < 1:
+        return CTR_BY_POSITION[1]
+    if position >= 10:
+        return CTR_BY_POSITION[10]
+    lo = int(position)
+    hi = lo + 1
+    frac = position - lo
+    return CTR_BY_POSITION[lo] * (1 - frac) + CTR_BY_POSITION[hi] * frac
+
+
+def normalize_url(u: str) -> str:
+    """Normalize URL for cross-source join (Neo4j ↔ GSC).
+
+    Key transforms:
+    - http → https
+    - strip www. prefix
+    - percent-decode (GSC returns encoded CJK URLs, Neo4j stores raw CJK)
+    - strip trailing slash
+    """
+    if not u:
+        return ""
+    u = u.strip()
+    if u.startswith("http://"):
+        u = "https://" + u[len("http://"):]
+    if u.startswith("https://www."):
+        u = "https://" + u[len("https://www."):]
+    # Percent-decode so both sides of the join use the same form
+    try:
+        u = unquote(u)
+    except Exception:
+        pass
+    if u.endswith("/") and len(u) > len("https://"):
+        u = u.rstrip("/")
+    return u
+
+
+def get_gsc_service():
+    if not os.path.exists(TOKEN_FILE):
+        print(f"ERROR: {TOKEN_FILE} not found. run: gsc-query --auth", file=sys.stderr)
+        sys.exit(2)
+    creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(TOKEN_FILE, "w") as f:
+                f.write(creds.to_json())
+            os.chmod(TOKEN_FILE, 0o600)
+        else:
+            print("ERROR: credentials invalid. run: gsc-query --auth", file=sys.stderr)
+            sys.exit(3)
+    return build("webmasters", "v3", credentials=creds, cache_discovery=False)
+
+
+def gsc_bulk(service, site_url: str, start: date, end: date, dimensions):
+    body = {
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "dimensions": dimensions,
+        "rowLimit": 25000,
+        "orderBy": [{"field": "impressions", "descending": True}],
+    }
+    try:
+        resp = service.searchanalytics().query(siteUrl=site_url, body=body).execute()
+    except HttpError as e:
+        print(f"ERROR: GSC API {e.resp.status}: {e}", file=sys.stderr)
+        return []
+    return resp.get("rows", [])
+
+
+def aggregate_pages(rows):
+    out = {}
+    for r in rows:
+        page = normalize_url(r["keys"][0])
+        out[page] = {
+            "clicks": int(r.get("clicks", 0)),
+            "impressions": int(r.get("impressions", 0)),
+            "position": float(r.get("position", 0.0)),
+        }
+    return out
+
+
+def top_keyword_per_page(rows):
+    per_page = defaultdict(list)
+    for r in rows:
+        page = normalize_url(r["keys"][0])
+        kw = r["keys"][1]
+        per_page[page].append((kw, r.get("clicks", 0), r.get("impressions", 0)))
+    out = {}
+    for page, kws in per_page.items():
+        kws.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        out[page] = kws[0][0] if kws else ""
+    return out
+
+
+def _split_plain_row(line):
+    out = []
+    cur = []
+    in_quote = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == '"':
+            in_quote = not in_quote
+            cur.append(ch)
+        elif ch == "," and not in_quote:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    if cur:
+        out.append("".join(cur).strip())
+    return out
+
+
+def _unquote(s):
+    if s is None:
+        return ""
+    s = s.strip()
+    if s in ("NULL", "null", ""):
+        return ""
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
+def _to_int(s):
+    if s is None:
+        return None
+    s = s.strip() if isinstance(s, str) else s
+    if s in ("", "NULL", "null"):
+        return None
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_date(s):
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        try:
+            dt = datetime.strptime(s[:10], "%Y-%m-%d")
+            return dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+
+
+def fetch_neo4j_articles():
+    cypher = (
+        "MATCH (a:Article) "
+        "WHERE a.scraped_at IS NOT NULL "
+        "AND a.url IS NOT NULL "
+        "AND NOT a.url CONTAINS '/social-proof/' "
+        "RETURN a.slug AS slug, a.url AS url, "
+        "a.published_at AS published_at, "
+        "a.updated_at AS updated_at"
+    )
+    try:
+        r = subprocess.run(
+            [NEO4J_QUERY, cypher], capture_output=True, text=True, timeout=60
+        )
+    except FileNotFoundError:
+        print(f"ERROR: {NEO4J_QUERY} not found", file=sys.stderr)
+        return []
+    except subprocess.TimeoutExpired:
+        print("ERROR: neo4j-query timeout", file=sys.stderr)
+        return []
+    if r.returncode != 0:
+        print(f"ERROR: neo4j-query failed ({r.returncode}): {r.stderr.strip()}", file=sys.stderr)
+        return []
+
+    lines = [ln for ln in r.stdout.strip().split("\n") if ln.strip()]
+    if len(lines) < 2:
+        return []
+    header = [h.strip() for h in lines[0].split(",")]
+    articles = []
+    for line in lines[1:]:
+        parts = _split_plain_row(line)
+        if len(parts) < len(header):
+            continue
+        row = dict(zip(header, parts))
+        articles.append({
+            "slug": _unquote(row.get("slug")),
+            "url": _unquote(row.get("url")),
+            "published_at": _unquote(row.get("published_at")),
+            "updated_at": _unquote(row.get("updated_at")),
+        })
+    return articles
+
+
+def classify(article, gsc_cur, gsc_prev, gsc_90d, top_kw_cur):
+    url = normalize_url(article.get("url") or "")
+    if not url:
+        return "unranked", {"url": "", "slug": article.get("slug"), "reason": "no_url"}
+
+    cur = gsc_cur.get(url)
+    prev = gsc_prev.get(url)
+    d90 = gsc_90d.get(url)
+
+    if cur is None and d90 is None:
+        return "unranked", {
+            "url": url, "slug": article.get("slug"),
+            "clicks_28d": 0, "impressions_28d": 0, "impressions_90d": 0,
+            "top_keyword": "", "reason": "no_gsc_data",
+        }
+
+    clicks_28d = cur["clicks"] if cur else 0
+    impressions_28d = cur["impressions"] if cur else 0
+    position_28d = cur["position"] if cur else 0.0
+    clicks_prev = prev["clicks"] if prev else 0
+    position_prev = prev["position"] if prev else 0.0
+    impressions_90d = d90["impressions"] if d90 else 0
+    top_kw = top_kw_cur.get(url, "")
+
+    drop_pct = ((clicks_prev - clicks_28d) / clicks_prev * 100) if clicks_prev > 0 else 0.0
+    position_delta = (position_28d - position_prev) if (cur and prev) else 0.0
+    actual_ctr = (clicks_28d / impressions_28d) if impressions_28d > 0 else 0.0
+    exp_ctr = expected_ctr(position_28d) if position_28d > 0 else 0.0
+    ctr_gap = exp_ctr - actual_ctr
+
+    pub_dt = parse_date(article.get("published_at") or "")
+    days_old = (datetime.now(timezone.utc) - pub_dt).days if pub_dt else 0
+
+    slug = article.get("slug") or ""
+    if not slug:
+        # Fallback: last non-empty URL segment
+        parts = [p for p in url.rstrip("/").split("/") if p]
+        slug = parts[-1] if parts else url
+
+    metrics = {
+        "url": url,
+        "slug": slug,
+        "clicks_28d": clicks_28d,
+        "clicks_prev": clicks_prev,
+        "drop_pct": round(drop_pct, 1),
+        "position_28d": round(position_28d, 2),
+        "position_prev": round(position_prev, 2),
+        "position_delta": round(position_delta, 2),
+        "impressions_28d": impressions_28d,
+        "impressions_90d": impressions_90d,
+        "actual_ctr": round(actual_ctr, 4),
+        "expected_ctr": round(exp_ctr, 4),
+        "ctr_gap": round(ctr_gap, 4),
+        "top_keyword": top_kw,
+        "days_old": days_old,
+    }
+
+    # Priority order per spec: decaying > stale > almost_there > zombie
+    if (clicks_prev > 0
+            and drop_pct >= DECAYING_DROP_PCT
+            and impressions_28d >= DECAYING_MIN_IMPRESSIONS):
+        metrics["recommended_agent"] = "article-editor"
+        metrics["recommended_action"] = "full_audit_and_refresh"
+        metrics["status"] = "pending"
+        return "decaying", metrics
+
+    if (days_old >= STALE_DAYS
+            and position_delta >= STALE_POSITION_DELTA
+            and impressions_28d >= STALE_MIN_IMPRESSIONS):
+        metrics["recommended_agent"] = "article-editor"
+        metrics["recommended_action"] = "refresh_outdated_content"
+        metrics["status"] = "pending"
+        return "stale", metrics
+
+    if (ALMOST_THERE_POS_MIN <= position_28d <= ALMOST_THERE_POS_MAX
+            and ctr_gap > 0
+            and impressions_28d >= ALMOST_THERE_MIN_IMPRESSIONS):
+        metrics["recommended_agent"] = "manual"
+        metrics["recommended_action"] = "optimize_meta_description"
+        metrics["status"] = "pending"
+        return "almost_there", metrics
+
+    if impressions_90d < ZOMBIE_90D_IMPRESSIONS:
+        metrics["recommended_agent"] = "manual"
+        metrics["recommended_action"] = "prune_or_merge"
+        metrics["status"] = "pending"
+        return "zombie", metrics
+
+    return "healthy", metrics
+
+
+def build_queue(articles, gsc_cur, gsc_prev, gsc_90d, top_kw_cur, scan_date):
+    buckets = {"decaying": [], "almost_there": [], "stale": [], "zombie": []}
+    counts = {"decaying": 0, "almost_there": 0, "stale": 0, "zombie": 0,
+              "unranked": 0, "healthy": 0}
+
+    for art in articles:
+        bucket, m = classify(art, gsc_cur, gsc_prev, gsc_90d, top_kw_cur)
+        counts[bucket] = counts.get(bucket, 0) + 1
+        if bucket in buckets:
+            buckets[bucket].append(m)
+
+    for name, items in buckets.items():
+        items.sort(key=lambda x: x.get("impressions_28d", 0), reverse=True)
+        for i, it in enumerate(items, start=1):
+            it["priority_rank"] = i
+
+    return {
+        "scan_date": scan_date,
+        "scan_window": {"current": "28d", "previous": "28d-56d", "zombie": "90d"},
+        "total_articles": len(articles),
+        "bucket_counts": counts,
+        "buckets": buckets,
+    }
+
+
+def build_report(queue):
+    sd = queue["scan_date"]
+    total = queue["total_articles"]
+    bc = queue["bucket_counts"]
+    buckets = queue["buckets"]
+
+    lines = []
+    lines.append("---")
+    lines.append(f"scan_date: {sd}")
+    lines.append(f"total_articles: {total}")
+    lines.append("scan_window: current 28d vs previous 28-56d, zombie 90d")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# 全站 SEO 優先級掃描 — {sd}")
+    lines.append("")
+    lines.append("## 🚦 總體分布")
+    lines.append("")
+    lines.append("| Bucket | 數量 | 意義 | 建議行動 |")
+    lines.append("|---|---|---|---|")
+    lines.append(f"| 🔴 Decaying (要救) | {bc['decaying']} | 28d clicks 掉 ≥30% | article-editor 全面 audit |")
+    lines.append(f"| 🟡 Stale (要 refresh) | {bc['stale']} | 發布 > 1 年 + 排名下滑 ≥2 | article-editor refresh |")
+    lines.append(f"| 🟠 Almost there (要推) | {bc['almost_there']} | pos 4-10 + CTR 低於預期 | 改 meta description (手動) |")
+    lines.append(f"| ⚪ Zombie (要砍/合併) | {bc['zombie']} | 90d impressions < 50 | 人工判斷 prune/merge |")
+    lines.append(f"| ✅ Healthy | {bc['healthy']} | 正常 | 不動 |")
+    lines.append(f"| ❔ Unranked | {bc['unranked']} | 無 GSC 資料 | 檢查 indexing 狀態 |")
+    lines.append("")
+
+    def emit(title, emoji, key):
+        items = buckets.get(key, [])[:10]
+        lines.append(f"## {emoji} {title} (top 10)")
+        lines.append("")
+        if not items:
+            lines.append("_無項目_")
+            lines.append("")
+            return
+        if key == "decaying":
+            lines.append("| # | slug | clicks 28d | 掉 % | pos (prev→cur) | impressions | top keyword |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for it in items:
+                lines.append(
+                    f"| {it['priority_rank']} | `{it['slug']}` | {it['clicks_28d']} "
+                    f"| -{it['drop_pct']}% | {it['position_prev']}→{it['position_28d']} "
+                    f"| {it['impressions_28d']} | {it['top_keyword']} |"
+                )
+        elif key == "stale":
+            lines.append("| # | slug | 發布天數 | Δpos | clicks 28d | impressions | top keyword |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for it in items:
+                lines.append(
+                    f"| {it['priority_rank']} | `{it['slug']}` | {it['days_old']} 天 "
+                    f"| +{it['position_delta']} | {it['clicks_28d']} "
+                    f"| {it['impressions_28d']} | {it['top_keyword']} |"
+                )
+        elif key == "almost_there":
+            lines.append("| # | slug | position | actual CTR | expected CTR | impressions | top keyword |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for it in items:
+                lines.append(
+                    f"| {it['priority_rank']} | `{it['slug']}` | {it['position_28d']} "
+                    f"| {round(it['actual_ctr']*100, 2)}% "
+                    f"| {round(it['expected_ctr']*100, 2)}% "
+                    f"| {it['impressions_28d']} | {it['top_keyword']} |"
+                )
+        elif key == "zombie":
+            lines.append("| # | slug | 90d impressions | 28d impressions | position | top keyword |")
+            lines.append("|---|---|---|---|---|---|")
+            for it in items:
+                lines.append(
+                    f"| {it['priority_rank']} | `{it['slug']}` | {it['impressions_90d']} "
+                    f"| {it['impressions_28d']} | {it['position_28d'] or '—'} "
+                    f"| {it['top_keyword'] or '—'} |"
+                )
+        lines.append("")
+
+    emit("Decaying (要救)", "🔴", "decaying")
+    emit("Stale (要 refresh)", "🟡", "stale")
+    emit("Almost there (要推)", "🟠", "almost_there")
+    emit("Zombie (要砍/合併)", "⚪", "zombie")
+
+    lines.append("## 📋 建議執行順序")
+    lines.append("")
+    lines.append("1. **先 chain `decaying` top 3** 派給 article-editor(最高槓桿,避免流量繼續流失)")
+    lines.append("2. **接著處理 `stale` top 5**(舊文年份 refresh,article-editor → writer)")
+    lines.append("3. **`almost_there` 是手動改 meta description**,不自動派工(單點修改,LLM 介入 ROI 低)")
+    lines.append("4. **`zombie` 需要人工決定** prune / merge / redirect,不自動砍")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"_報告產出:`bin/content-priority` · 排程:每週一 09:00 (Phase 2)_")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def push_gdoc(md_path, scan_date):
+    title = f"【scan】全站優先級 — {scan_date}"
+    try:
+        r = subprocess.run(
+            [MD_TO_GDOC, md_path, "--title", title, "--json"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except FileNotFoundError:
+        return None, f"{MD_TO_GDOC} not found"
+    except subprocess.TimeoutExpired:
+        return None, "md-to-gdoc timeout"
+    if r.returncode != 0:
+        err = r.stderr.strip().split("\n")[-1] if r.stderr else f"exit {r.returncode}"
+        return None, err
+    try:
+        data = json.loads(r.stdout.strip())
+        return data.get("doc_url"), None
+    except json.JSONDecodeError as e:
+        return None, f"json parse: {e}"
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="content-priority — 好事發生數位 全站 SEO 優先級掃描",
+    )
+    ap.add_argument("--output-dir", help="Output directory (default: ~/workspace/ohya/priority-scans/{today}/)")
+    ap.add_argument("--site", default=DEFAULT_SITE, help="Site URL (default: https://ohya.co)")
+    ap.add_argument("--no-gdoc", action="store_true", help="Skip Google Doc push")
+    ap.add_argument("--dry-run", action="store_true", help="Print summary to stdout, no file write")
+    args = ap.parse_args()
+
+    today = date.today()
+    scan_date = today.isoformat()
+    out_dir = Path(args.output_dir) if args.output_dir else Path(DEFAULT_OUTPUT_ROOT) / scan_date
+
+    end = today
+    cur_start = end - timedelta(days=28)
+    prev_end = cur_start
+    prev_start = prev_end - timedelta(days=28)
+    d90_start = end - timedelta(days=90)
+
+    print(f"[content-priority] scan_date={scan_date}", file=sys.stderr)
+    print(f"[content-priority] fetching Neo4j articles ...", file=sys.stderr)
+    articles = fetch_neo4j_articles()
+    print(f"[content-priority] neo4j: {len(articles)} articles", file=sys.stderr)
+
+    service = get_gsc_service()
+    site_url_gsc = args.site.rstrip("/") + "/"
+
+    print(f"[content-priority] GSC current 28d [{cur_start}..{end}] ...", file=sys.stderr)
+    cur_pages = gsc_bulk(service, site_url_gsc, cur_start, end, ["page"])
+    cur_pq = gsc_bulk(service, site_url_gsc, cur_start, end, ["page", "query"])
+
+    print(f"[content-priority] GSC previous 28d [{prev_start}..{prev_end}] ...", file=sys.stderr)
+    prev_pages = gsc_bulk(service, site_url_gsc, prev_start, prev_end, ["page"])
+
+    print(f"[content-priority] GSC 90d (zombie check) [{d90_start}..{end}] ...", file=sys.stderr)
+    d90_pages = gsc_bulk(service, site_url_gsc, d90_start, end, ["page"])
+
+    gsc_cur = aggregate_pages(cur_pages)
+    gsc_prev = aggregate_pages(prev_pages)
+    gsc_90d = aggregate_pages(d90_pages)
+    top_kw_cur = top_keyword_per_page(cur_pq)
+
+    print(
+        f"[content-priority] gsc rows: cur={len(gsc_cur)} prev={len(gsc_prev)} "
+        f"90d={len(gsc_90d)} pq={len(cur_pq)}",
+        file=sys.stderr,
+    )
+
+    queue = build_queue(articles, gsc_cur, gsc_prev, gsc_90d, top_kw_cur, scan_date)
+    bc = queue["bucket_counts"]
+    print(
+        f"[content-priority] buckets: decaying={bc['decaying']} "
+        f"stale={bc['stale']} almost_there={bc['almost_there']} "
+        f"zombie={bc['zombie']} healthy={bc['healthy']} "
+        f"unranked={bc['unranked']}",
+        file=sys.stderr,
+    )
+
+    if args.dry_run:
+        print(json.dumps({
+            "scan_date": scan_date,
+            "total": queue["total_articles"],
+            "bucket_counts": bc,
+            "doc_url": None,
+            "dry_run": True,
+        }, ensure_ascii=False))
+        return 0
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / "priority-queue.json"
+    md_path = out_dir / "priority-report.md"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(queue, f, ensure_ascii=False, indent=2)
+    md_content = build_report(queue)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_content)
+
+    print(f"[content-priority] wrote {json_path}", file=sys.stderr)
+    print(f"[content-priority] wrote {md_path}", file=sys.stderr)
+
+    doc_url = None
+    if not args.no_gdoc:
+        print(f"[content-priority] pushing to Google Doc ...", file=sys.stderr)
+        doc_url, err = push_gdoc(str(md_path), scan_date)
+        if err:
+            with open(md_path, "a", encoding="utf-8") as f:
+                f.write(f"\n\n> Google Doc push 失敗: {err}\n")
+            print(f"[content-priority] gdoc push failed: {err}", file=sys.stderr)
+        else:
+            print(f"[content-priority] doc: {doc_url}", file=sys.stderr)
+
+    print(json.dumps({
+        "scan_date": scan_date,
+        "total": queue["total_articles"],
+        "bucket_counts": bc,
+        "doc_url": doc_url,
+        "output_dir": str(out_dir),
+    }, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

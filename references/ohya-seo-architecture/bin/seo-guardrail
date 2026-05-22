@@ -1,0 +1,839 @@
+#!/Users/garyyang/clients/ohya/venv/bin/python
+"""seo-guardrail — local-only guardrail evaluator MVP for SEO Growth OS.
+
+MVP boundary:
+- reads workflow context JSON from file/stdin
+- evaluates deterministic hard-block guardrails
+- emits JSON result
+- optionally writes local result artifact
+- does not call network, DB, Payload, git, deploy, or mutate production state
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+ROOT = Path('/Users/garyyang/clients/ohya')
+sys.path.insert(0, str(ROOT / 'lib'))
+
+CANONICAL_STAGES = [
+    "pre_dispatch",
+    "post_agent_run",
+    "pre_cms_write",
+    "post_cms_write",
+    "pre_final_report",
+    "feedback_schedule",
+    "learning_loop",
+]
+STAGE_ALIASES = {stage.replace("_", "-"): stage for stage in CANONICAL_STAGES} | {stage: stage for stage in CANONICAL_STAGES}
+
+ALLOWED_TASK_TYPES = [
+    "audit",
+    "query",
+    "research",
+    "outline",
+    "write",
+    "link_fix",
+    "article_refresh",
+    "new_article",
+    "refresh",
+    "pre_publish_audit",
+    "cms_draft",
+    "published_content_correction",
+    "publish",
+    "internal_link_fix",
+    "cannibalization_scan",
+    "cms_patch_plan",
+    "media_asset",
+    "video_production",
+    "video_produce",
+    "video_replace",
+    "feedback_snapshot",
+    "next_task_generation",
+    "learning_signal",
+    "performance_feedback",
+]
+
+OWNER_AGENT_MAP = {
+    "audit": ["article-editor"],
+    "query": ["seo-graph"],
+    "research": ["topic-researcher"],
+    "outline": ["outline-planner"],
+    "write": ["writer"],
+    "link_fix": ["link-finder"],
+    "article_refresh": ["writer"],
+    "refresh": ["article-editor", "writer"],
+    "pre_publish_audit": ["article-editor"],
+    "internal_link_fix": ["link-finder"],
+    "cannibalization_scan": ["article-editor", "seo-graph"],
+    "cms_patch_plan": ["article-editor", "cms-draft-executor"],
+    "media_asset": ["media-asset-generator"],
+    "new_article": ["topic-researcher", "outline-planner", "writer", "link-finder", "media-asset-generator", "article-editor", "cms-draft-executor"],
+    "cms_draft": ["cms-draft-executor"],
+    "published_content_correction": ["cms-draft-executor"],
+    "publish": ["cms-draft-executor"],
+    "video_production": ["video-producer"],
+    "video_produce": ["video-producer"],
+    "video_replace": ["video-producer"],
+    "feedback_snapshot": ["system", "seo-performance-snapshot"],
+    "next_task_generation": ["system", "seo-next-task-rule"],
+    "learning_signal": ["system", "coordinator", "seo-guardrail"],
+    "performance_feedback": ["system", "coordinator", "seo-performance-compare"],
+}
+
+DEV_INFRA_SIGNALS = [
+    "runtime", "env loading", "DB connection", "pipeline 維運", "orchestration",
+    "bug fix", "debug", "patch .py", "refactor", "migration", "schema",
+    "Neo4j sync", "constraints", "deploy", "CI", "CD", "production", "staging",
+    "Zeabur env", "Hermes profile config", "mcp_servers", "toolsets", "SOUL",
+    "runtime readiness", "helper", "guardrail", "DB", "資料庫", "部署", "遷移",
+]
+VIDEO_ALLOWLIST_RE = re.compile(r"(?i)(approve\s+video\s+/|重做\s*video\s+/|redo\s+video\s+/|video\s+feedback\s+/)")
+
+SECRET_PATTERNS = [
+    re.compile(r"(?i)(DATABASE_URI|POSTGRES_URL|POSTGRES_URI|PAYLOAD_SECRET|HERMES_CMS_DRAFT_SECRET|COOKIE|TOKEN|API[_-]?KEY|PASSWORD)\s*[:=]\s*\S+"),
+    re.compile(r"postgres(?:ql)?://[^\s]+", re.I),
+    re.compile(r"(?i)bearer\s+[a-z0-9._\-]{12,}"),
+]
+
+DEFAULT_RESULT_DIR = Path("/Users/garyyang/workspace/ohya/guardrail-results")
+REQUIRED_FEEDBACK_WINDOWS = [30, 60, 90, 180, 365]
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_iso() -> str:
+    return utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def normalize_stage(stage: str) -> str:
+    if stage not in STAGE_ALIASES:
+        raise ValueError(f"unknown stage: {stage}")
+    return STAGE_ALIASES[stage]
+
+
+def parse_time(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+def dotted_get(data: dict[str, Any], path: str, default: Any = None) -> Any:
+    current: Any = data
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return default
+        current = current[part]
+    return current
+
+
+def first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def stable_hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def file_sha256(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def has_secret(value: Any) -> bool:
+    if value is None:
+        return False
+    raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return any(pattern.search(raw) for pattern in SECRET_PATTERNS)
+
+
+def load_json_file(path: Path) -> Any:
+    return json.loads(path.read_text())
+
+
+def is_dev_infra_request(ctx: dict[str, Any]) -> bool:
+    explicit = dotted_get(ctx, "request.is_dev_infra")
+    if explicit is not None:
+        return bool(explicit)
+    text = first_present(
+        dotted_get(ctx, "source_request.text"),
+        dotted_get(ctx, "request.text"),
+        dotted_get(ctx, "task.user_request"),
+        "",
+    )
+    text = str(text)
+    if VIDEO_ALLOWLIST_RE.search(text):
+        return False
+    lowered = text.lower()
+    return any(signal.lower() in lowered for signal in DEV_INFRA_SIGNALS)
+
+
+@dataclass(frozen=True)
+class Rule:
+    guardrail_id: str
+    name: str
+    stage: str
+    applies_to: list[str]
+    severity: str
+    enforce_mode: str
+    condition_fn: str
+    failure_state: str
+    action_on_fail: list[str]
+    override_allowed: bool = False
+    override_requires: str = "none"
+    retry_policy: str = "none"
+    required_evidence: list[str] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = self.__dict__.copy()
+        data["required_evidence"] = self.required_evidence or []
+        return data
+
+
+RULES: list[Rule] = [
+    Rule("pre_dispatch_task_type_required", "Task type must be explicit and allowed", "pre_dispatch", ["*"], "blocking", "hard_block", "check_task_type_required", "blocked_ambiguous_task", ["stop_workflow", "ask_clarification"], False, "none", "none", ["task.task_type"]),
+    Rule("pre_dispatch_owner_agent_match", "Owner agent must match task type", "pre_dispatch", ["*"], "blocking", "hard_block", "check_owner_agent_match", "blocked_wrong_agent", ["stop_workflow", "reroute_to_correct_agent"], False, "none", "none", ["task.owner_agent"]),
+    Rule("pre_dispatch_block_dev_infra", "Dev/infra work must not be routed to content agents", "pre_dispatch", ["*"], "blocking", "hard_block", "check_dev_infra_not_routed_to_content_agent", "blocked_out_of_scope_dev_infra", ["stop_workflow", "handle_by_coordinator_dev_infra"], False, "none", "none", ["source_request.text"]),
+    Rule("post_agent_artifact_must_exist", "Agent output artifact must exist, be non-empty, and fresh", "post_agent_run", ["*"], "blocking", "hard_block", "check_agent_artifact_fresh", "blocked_missing_agent_output", ["stop_workflow", "retry_agent_or_report_failure"], False, "none", "once", ["agent_run.exit_code", "artifacts.expected_output", "task.started_at"]),
+    Rule("post_agent_artifact_type_contract", "Agent output artifact type must match the harness contract", "post_agent_run", ["*"], "blocking", "hard_block", "check_agent_artifact_type_contract", "blocked_artifact_type_mismatch", ["stop_workflow", "retry_agent_or_report_failure"], False, "none", "once", ["agent_run.artifact_contract.artifacts.type", "artifact_policy.expected_types"]),
+    Rule("post_agent_audit_critical_blocks_cms", "Audit critical blockers must be zero before CMS", "post_agent_run", ["pre_publish_audit", "patch_audit", "cms_draft", "published_content_correction", "publish"], "blocking", "hard_block", "check_audit_has_no_critical_blockers", "blocked_audit_failed", ["stop_cms_stage", "create_fix_task"], False, "none", "none", ["audit.critical_count"]),
+    Rule("pre_cms_write_requires_approval", "Production write action requires matching approval", "pre_cms_write", ["published_content_correction", "publish", "unpublish", "delete", "redirect", "canonical_change", "schema_injection"], "blocking", "hard_block", "check_approval_matches_task", "blocked_missing_approval", ["stop_workflow", "create_approval_request", "notify_gary"], False, "none", "none", ["approval.approval_id", "approval.status", "approval.action", "approval.risk_level"]),
+    Rule("pre_cms_patch_requires_exact_post_identity", "CMS patch/publish must target exact post_id and slug", "pre_cms_write", ["published_content_correction", "publish"], "blocking", "hard_block", "check_post_identity_matches", "blocked_post_identity_mismatch", ["stop_patch", "read_only_reconcile"], False, "none", "none", ["task.post_id", "task.expected_slug", "payload_identity.post_id", "payload_identity.slug"]),
+    Rule("pre_cms_patch_scope_required", "Patch changed fields must be within approved scope", "pre_cms_write", ["published_content_correction", "cms_draft_update"], "blocking", "hard_block", "check_patch_scope_allowed", "blocked_patch_scope_unknown", ["stop_patch", "request_scope_approval"], False, "none", "none", ["approval.allowed_fields", "approval.forbidden_fields", "patch.changed_fields"]),
+    Rule("post_cms_write_public_verification_required", "CMS write must be publicly verified before success", "post_cms_write", ["publish", "published_content_correction"], "blocking", "hard_block", "check_public_url_verified", "blocked_public_404", ["do_not_report_success", "do_not_mark_done"], False, "none", "once", ["verification.public_url", "verification.http_status", "verification.final_url", "verification.expected_url"]),
+    Rule("pre_final_report_done_requires_full_loop", "Done requires final report, verification/approval, 30/60/90/180/365 feedback, learning signal, and next task/no-action", "pre_final_report", ["*"], "blocking", "hard_block", "check_done_full_loop", "blocked_done_rule_failed", ["do_not_archive_done", "create_missing_step_task"], False, "none", "none", ["artifacts.final_report", "verification.http_status", "feedback.scheduled_30d", "feedback.scheduled_60d", "feedback.scheduled_90d", "feedback.scheduled_180d", "feedback.scheduled_365d", "feedback.next_task_generated"]),
+    Rule("feedback_schedule_required_multi_window", "Feedback schedule must include 30/60/90/180/365 windows with idempotency keys", "feedback_schedule", ["*"], "blocking", "hard_block", "check_feedback_schedule_complete", "blocked_feedback_schedule_missing", ["do_not_mark_done", "create_feedback_schedule"], False, "none", "once", ["feedback.windows", "feedback.idempotency_keys"]),
+    Rule("learning_loop_record_required", "Learning loop must record Gary correction, guardrail failure, agent failure, or no-learning-needed decision", "learning_loop", ["*"], "blocking", "hard_block", "check_learning_loop_recorded", "blocked_learning_record_missing", ["do_not_mark_done", "record_learning_signal"], False, "none", "none", ["learning.decision_id", "learning.workflow_event_id", "learning.no_learning_needed"]),
+]
+
+
+def task_type(ctx: dict[str, Any]) -> str | None:
+    return first_present(dotted_get(ctx, "task.task_type"), dotted_get(ctx, "task.type"))
+
+
+def task_action(ctx: dict[str, Any]) -> str | None:
+    return first_present(dotted_get(ctx, "action"), dotted_get(ctx, "task.action"), task_type(ctx))
+
+
+def task_id(ctx: dict[str, Any]) -> str:
+    return str(first_present(dotted_get(ctx, "task.task_id"), dotted_get(ctx, "task.id"), "local-task"))
+
+
+def applies(rule: Rule, ctx: dict[str, Any]) -> bool:
+    if "*" in rule.applies_to:
+        return True
+    action = task_action(ctx)
+    ttype = task_type(ctx)
+    audit_type = first_present(dotted_get(ctx, "audit.audit_type"), dotted_get(ctx, "task.audit_type"))
+    return any(item in {action, ttype, audit_type} for item in rule.applies_to)
+
+
+class Evaluator:
+    def __init__(self, stage: str, ctx: dict[str, Any], context_path: Path | None = None):
+        self.stage = normalize_stage(stage)
+        self.ctx = ctx
+        self.context_path = context_path
+        self.results: list[dict[str, Any]] = []
+
+    def _record_pass(self, rule: Rule, evidence: dict[str, Any] | None = None) -> None:
+        self.results.append({
+            "guardrail_id": rule.guardrail_id,
+            "status": "passed",
+            "severity": rule.severity,
+            "enforce_mode": rule.enforce_mode,
+            "evidence": evidence or {},
+        })
+
+    def _record_fail(self, rule: Rule, reason: str, *, failure_state: str | None = None, missing_evidence: Iterable[str] = (), evidence: dict[str, Any] | None = None) -> None:
+        self.results.append({
+            "guardrail_id": rule.guardrail_id,
+            "status": "failed",
+            "severity": rule.severity,
+            "enforce_mode": rule.enforce_mode,
+            "failure_state": failure_state or rule.failure_state,
+            "reason": reason,
+            "missing_evidence": list(missing_evidence),
+            "evidence": evidence or {},
+            "action_on_fail": rule.action_on_fail,
+        })
+
+    def _record_warning(self, rule: Rule, reason: str, *, missing_evidence: Iterable[str] = (), evidence: dict[str, Any] | None = None) -> None:
+        self.results.append({
+            "guardrail_id": rule.guardrail_id,
+            "status": "warning",
+            "severity": "warning",
+            "enforce_mode": "warn_only",
+            "failure_state": "warn_artifact_type_mismatch",
+            "reason": reason,
+            "missing_evidence": list(missing_evidence),
+            "evidence": evidence or {},
+            "action_on_fail": ["record_warning", "continue_workflow"],
+        })
+
+    def _paths_from_artifacts(self) -> list[Path]:
+        artifacts = self.ctx.get("artifacts") or {}
+        specs = self.ctx.get("expected_artifacts") or self.ctx.get("required_artifacts") or []
+        paths: list[Path] = []
+        if isinstance(artifacts.get("expected_output"), str):
+            paths.append(Path(artifacts["expected_output"]))
+        for key in ("input_artifact", "audit_json", "patch_plan", "final_report"):
+            if isinstance(artifacts.get(key), str) and key != "audit_json":
+                # audit_json is handled by audit rule if present; it can also be expected_output.
+                paths.append(Path(artifacts[key]))
+        if isinstance(specs, list):
+            for spec in specs:
+                if isinstance(spec, dict) and spec.get("path"):
+                    paths.append(Path(spec["path"]))
+                elif isinstance(spec, str):
+                    paths.append(Path(spec))
+        return paths
+
+    def _check_path_fresh(self, path: Path, started_at: datetime | None) -> tuple[bool, dict[str, Any], str, list[str]]:
+        evidence = {"path": str(path)}
+        missing: list[str] = []
+        if not str(path):
+            return False, evidence, "artifact path missing", ["artifact.path"]
+        if not path.exists():
+            return False, evidence, "artifact missing", ["artifact.exists"]
+        if not path.is_file():
+            return False, evidence, "artifact is not a file", ["artifact.file"]
+        size = path.stat().st_size
+        evidence["size_bytes"] = size
+        if size <= 0:
+            return False, evidence, "artifact empty", ["artifact.non_empty"]
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        evidence["mtime"] = mtime.isoformat().replace("+00:00", "Z")
+        evidence["sha256"] = file_sha256(path)
+        if started_at and mtime < started_at:
+            evidence["started_at"] = started_at.isoformat().replace("+00:00", "Z")
+            return False, evidence, "artifact mtime is older than task.started_at", ["artifact.fresh"]
+        return True, evidence, "", []
+
+    def check_task_type_required(self, rule: Rule) -> None:
+        ttype = task_type(self.ctx)
+        allowed = self.ctx.get("allowed_task_types") or ALLOWED_TASK_TYPES
+        if not ttype:
+            self._record_fail(rule, "task.task_type missing", missing_evidence=["task.task_type"])
+        elif ttype not in allowed:
+            self._record_fail(rule, "task.task_type is not in allowed task types", evidence={"task_type": ttype, "allowed_task_types": allowed})
+        else:
+            self._record_pass(rule, {"task_type": ttype})
+
+    def check_owner_agent_match(self, rule: Rule) -> None:
+        ttype = task_type(self.ctx)
+        owner = first_present(dotted_get(self.ctx, "task.owner_agent"), dotted_get(self.ctx, "task.assigned_agent"), dotted_get(self.ctx, "agent_run.agent"))
+        agent_map = self.ctx.get("agent_task_map") or OWNER_AGENT_MAP
+        allowed = agent_map.get(ttype, []) if ttype else []
+        if owner and (owner in allowed or "*" in allowed):
+            self._record_pass(rule, {"task_type": ttype, "owner_agent": owner, "allowed_agents": allowed})
+        else:
+            self._record_fail(rule, "owner_agent does not match task_type", missing_evidence=[] if owner else ["task.owner_agent"], evidence={"task_type": ttype, "owner_agent": owner, "allowed_agents": allowed})
+
+    def check_dev_infra_not_routed_to_content_agent(self, rule: Rule) -> None:
+        owner = first_present(dotted_get(self.ctx, "task.owner_agent"), dotted_get(self.ctx, "task.assigned_agent"))
+        content_agents = {agent for agents in OWNER_AGENT_MAP.values() for agent in agents if agent != "system"}
+        if is_dev_infra_request(self.ctx) and owner in content_agents:
+            self._record_fail(rule, "dev/infra task must be handled by coordinator dev/infra executor, not a content agent", evidence={"owner_agent": owner})
+        else:
+            self._record_pass(rule, {"dev_infra_request": is_dev_infra_request(self.ctx), "owner_agent": owner})
+
+    def check_agent_artifact_fresh(self, rule: Rule) -> None:
+        run = self.ctx.get("agent_run") or {}
+        if run.get("exit_code") != 0:
+            self._record_fail(rule, "agent_run.exit_code is not 0", failure_state="blocked_agent_failed", missing_evidence=["agent_run.exit_code"], evidence={"exit_code": run.get("exit_code")})
+            return
+        if has_secret({"stdout": run.get("stdout"), "stderr": run.get("stderr")}):
+            self._record_fail(rule, "secret-like string detected in agent stdout/stderr", failure_state="blocked_secret_leak_detected")
+            return
+        paths = self._paths_from_artifacts()
+        if not paths:
+            self._record_fail(rule, "no expected artifact path provided", missing_evidence=["artifacts.expected_output"])
+            return
+        started_at = parse_time(first_present(dotted_get(self.ctx, "task.started_at"), run.get("started_at")))
+        evidence_list: list[dict[str, Any]] = []
+        for path in paths:
+            ok, evidence, reason, missing = self._check_path_fresh(path, started_at)
+            evidence_list.append(evidence)
+            if not ok:
+                self._record_fail(rule, reason, missing_evidence=missing, evidence={"artifacts": evidence_list})
+                return
+        self._record_pass(rule, {"artifacts": evidence_list, "exit_code": 0})
+
+    def check_agent_artifact_type_contract(self, rule: Rule) -> None:
+        policy = self.ctx.get("artifact_policy") or {}
+        enforcement = policy.get("enforcement") or "none"
+        if enforcement == "none":
+            self._record_pass(rule, {"enforcement": enforcement, "reason": "no artifact type policy for this profile/task"})
+            return
+        evidence = {
+            "profile": policy.get("profile"),
+            "task_type": policy.get("task_type"),
+            "enforcement": enforcement,
+            "expected_types": policy.get("expected_types") or [],
+            "actual_types": policy.get("actual_types") or [],
+            "matched_types": policy.get("matched_types") or [],
+        }
+        if policy.get("ok") is True:
+            self._record_pass(rule, evidence)
+            return
+        missing = []
+        if not evidence["expected_types"]:
+            missing.append("artifact_policy.expected_types")
+        if not evidence["actual_types"]:
+            missing.append("agent_run.artifact_contract.artifacts.type")
+        reason = "artifact type does not match expected harness contract"
+        if enforcement == "warn":
+            self._record_warning(rule, reason, missing_evidence=missing, evidence=evidence)
+        else:
+            self._record_fail(rule, reason, failure_state="blocked_artifact_type_mismatch", missing_evidence=missing, evidence=evidence)
+
+    def check_audit_has_no_critical_blockers(self, rule: Rule) -> None:
+        audit = self.ctx.get("audit") or {}
+        audit_path = first_present(dotted_get(self.ctx, "artifacts.audit_json"), audit.get("path"))
+        if audit_path:
+            try:
+                loaded = load_json_file(Path(audit_path))
+                if isinstance(loaded, dict):
+                    audit = {**loaded, **audit}
+            except Exception as exc:
+                self._record_fail(rule, f"audit_json is not readable JSON: {exc}", missing_evidence=["artifacts.audit_json"], evidence={"audit_json": audit_path})
+                return
+        critical = first_present(audit.get("critical_count"), audit.get("critical"), audit.get("critical_blockers"), 0)
+        blockers = audit.get("blockers") or []
+        pass_flag = first_present(audit.get("pass_for_cms_patch"), audit.get("pass_for_cms_draft"), audit.get("passed"), True)
+        try:
+            critical_int = int(critical)
+        except (TypeError, ValueError):
+            critical_int = 999
+        if critical_int == 0 and not blockers and pass_flag is True:
+            self._record_pass(rule, {"critical_count": critical_int, "blockers": blockers, "pass_flag": pass_flag})
+        else:
+            self._record_fail(rule, "audit has critical blockers or pass flag is false", evidence={"critical_count": critical, "blockers": blockers, "pass_flag": pass_flag})
+
+    def check_approval_matches_task(self, rule: Rule) -> None:
+        approval = self.ctx.get("approval") or {}
+        action = task_action(self.ctx)
+        missing = []
+        if not approval.get("approval_id"):
+            missing.append("approval.approval_id")
+        if approval.get("status") != "approved":
+            missing.append("approval.status=approved")
+        if approval.get("action") != action:
+            missing.append("approval.action matches task.action")
+        if not approval.get("risk_level"):
+            missing.append("approval.risk_level")
+        if missing:
+            self._record_fail(rule, "approval missing, not approved, or action mismatch", failure_state="blocked_missing_approval" if "approval.status=approved" in missing or "approval.approval_id" in missing else "blocked_approval_action_mismatch", missing_evidence=missing, evidence={"approval_id": approval.get("approval_id"), "approval_status": approval.get("status"), "approval_action": approval.get("action"), "task_action": action, "risk_level": approval.get("risk_level")})
+        else:
+            self._record_pass(rule, {"approval_id": approval.get("approval_id"), "approval_status": approval.get("status"), "approval_action": approval.get("action"), "risk_level": approval.get("risk_level")})
+
+    def check_post_identity_matches(self, rule: Rule) -> None:
+        task = self.ctx.get("task") or {}
+        identity = self.ctx.get("payload_identity") or {}
+        task_post_id = first_present(task.get("post_id"), dotted_get(self.ctx, "post_id"))
+        expected_slug = first_present(task.get("expected_slug"), task.get("target_slug"), dotted_get(self.ctx, "expected_slug"))
+        payload_post_id = identity.get("post_id")
+        payload_slug = identity.get("slug")
+        if task_post_id is not None and expected_slug and str(task_post_id) == str(payload_post_id) and str(expected_slug) == str(payload_slug):
+            self._record_pass(rule, {"post_id": task_post_id, "slug": expected_slug})
+        else:
+            self._record_fail(rule, "post_id or slug mismatch between task and payload_identity", missing_evidence=[name for name, value in {"task.post_id": task_post_id, "task.expected_slug": expected_slug, "payload_identity.post_id": payload_post_id, "payload_identity.slug": payload_slug}.items() if value in (None, "")], evidence={"task_post_id": task_post_id, "expected_slug": expected_slug, "payload_post_id": payload_post_id, "payload_slug": payload_slug})
+
+    def check_patch_scope_allowed(self, rule: Rule) -> None:
+        approval = self.ctx.get("approval") or {}
+        patch = self.ctx.get("patch") or {}
+        allowed = set(approval.get("allowed_fields") or [])
+        forbidden = set(approval.get("forbidden_fields") or [])
+        changed = set(patch.get("changed_fields") or [])
+        non_targets = patch.get("non_target_posts_modified") or []
+        missing = []
+        if not allowed:
+            missing.append("approval.allowed_fields")
+        if not approval.get("forbidden_fields"):
+            missing.append("approval.forbidden_fields")
+        if not changed:
+            missing.append("patch.changed_fields")
+        forbidden_changed = sorted(changed & forbidden)
+        outside_allowed = sorted(changed - allowed) if allowed else sorted(changed)
+        if missing or forbidden_changed or outside_allowed or non_targets:
+            self._record_fail(rule, "patch scope is not fully covered by approval or modified non-target posts", missing_evidence=missing, evidence={"changed_fields": sorted(changed), "allowed_fields": sorted(allowed), "forbidden_fields": sorted(forbidden), "forbidden_changed": forbidden_changed, "outside_allowed": outside_allowed, "non_target_posts_modified": non_targets})
+        else:
+            self._record_pass(rule, {"changed_fields": sorted(changed), "allowed_fields": sorted(allowed), "forbidden_fields": sorted(forbidden), "non_target_posts_modified": []})
+
+    def check_public_url_verified(self, rule: Rule) -> None:
+        verification = self.ctx.get("verification") or self.ctx.get("public_verification") or {}
+        public_url = verification.get("public_url")
+        http_status = verification.get("http_status")
+        final_url = verification.get("final_url")
+        expected_url = verification.get("expected_url")
+        if public_url and http_status == 200 and final_url == expected_url:
+            self._record_pass(rule, {"public_url": public_url, "http_status": http_status, "final_url": final_url, "expected_url": expected_url})
+        else:
+            self._record_fail(rule, "public verification missing, non-200, or final_url mismatch", missing_evidence=[name for name, value in {"verification.public_url": public_url, "verification.http_status=200": http_status == 200, "verification.final_url": final_url, "verification.expected_url": expected_url}.items() if not value], evidence={"public_url": public_url, "http_status": http_status, "final_url": final_url, "expected_url": expected_url})
+
+
+    def _feedback_schedule_status(self) -> tuple[bool, dict[str, Any], list[str]]:
+        feedback = self.ctx.get("feedback") or {}
+        missing: list[str] = []
+        evidence: dict[str, Any] = {}
+        no_action = feedback.get("no_action_decision_exists") is True
+        if no_action:
+            evidence["no_action_decision_exists"] = True
+            evidence["no_action_reason"] = feedback.get("no_action_reason")
+            if not feedback.get("no_action_reason"):
+                missing.append("feedback.no_action_reason")
+            return not missing, evidence, missing
+
+        windows = feedback.get("windows")
+        if windows is None:
+            windows = []
+            for d in REQUIRED_FEEDBACK_WINDOWS:
+                if feedback.get(f"scheduled_{d}d") is True:
+                    windows.append(d)
+        try:
+            windows_int = sorted({int(w) for w in windows})
+        except Exception:
+            windows_int = []
+            missing.append("feedback.windows_valid")
+        evidence["windows"] = windows_int
+        missing_windows = [d for d in REQUIRED_FEEDBACK_WINDOWS if d not in windows_int]
+        missing.extend([f"feedback.scheduled_{d}d" for d in missing_windows])
+
+        keys = feedback.get("idempotency_keys") or {}
+        if isinstance(keys, list):
+            key_map = {int(item.get("window_days")): item.get("key") for item in keys if isinstance(item, dict) and item.get("window_days") is not None}
+        elif isinstance(keys, dict):
+            key_map = {}
+            for k, v in keys.items():
+                raw = str(k).replace("d", "")
+                try:
+                    key_map[int(raw)] = v
+                except ValueError:
+                    pass
+        else:
+            key_map = {}
+        missing_keys = [d for d in REQUIRED_FEEDBACK_WINDOWS if not key_map.get(d)]
+        missing.extend([f"feedback.idempotency_keys.{d}" for d in missing_keys])
+        evidence["idempotency_key_windows"] = sorted(key_map)
+
+        duplicates = feedback.get("duplicate_snapshot_tasks") or feedback.get("duplicate_tasks") or []
+        if duplicates:
+            missing.append("feedback.no_duplicate_snapshot_tasks")
+            evidence["duplicates"] = duplicates
+        return not missing, evidence, missing
+
+    def check_feedback_schedule_complete(self, rule: Rule) -> None:
+        ok, evidence, missing = self._feedback_schedule_status()
+        if ok:
+            self._record_pass(rule, evidence)
+        else:
+            failure_state = "blocked_feedback_schedule_duplicate" if any("duplicate" in m for m in missing) else "blocked_feedback_schedule_missing"
+            if any("windows_valid" in m for m in missing):
+                failure_state = "blocked_feedback_window_invalid"
+            self._record_fail(rule, "feedback schedule is missing required 30/60/90/180/365 windows, idempotency keys, or duplicate protection", failure_state=failure_state, missing_evidence=missing, evidence=evidence)
+
+    def _learning_status(self) -> tuple[bool, dict[str, Any], list[str]]:
+        learning = self.ctx.get("learning") or {}
+        missing: list[str] = []
+        evidence: dict[str, Any] = {}
+        no_learning = learning.get("no_learning_needed") is True
+        if no_learning:
+            evidence["no_learning_needed"] = True
+            evidence["no_learning_reason"] = learning.get("no_learning_reason")
+            if not learning.get("no_learning_reason"):
+                missing.append("learning.no_learning_reason")
+            return not missing, evidence, missing
+
+        has_record = any(learning.get(k) for k in ("decision_id", "workflow_event_id", "human_correction_id", "guardrail_result_id", "agent_evaluation_id"))
+        evidence["record_refs"] = {k: learning.get(k) for k in ("decision_id", "workflow_event_id", "human_correction_id", "guardrail_result_id", "agent_evaluation_id") if learning.get(k)}
+        if not has_record:
+            missing.append("learning.decision_or_event_record")
+
+        signal_type = learning.get("signal_type")
+        if not signal_type:
+            missing.append("learning.signal_type")
+        evidence["signal_type"] = signal_type
+
+        requires_rule = learning.get("requires_rule_candidate") is True
+        if requires_rule and not (learning.get("rule_candidate_id") or learning.get("rule_candidate_artifact")):
+            missing.append("learning.rule_candidate")
+        evidence["requires_rule_candidate"] = requires_rule
+        evidence["rule_candidate_id"] = learning.get("rule_candidate_id")
+        evidence["rule_candidate_artifact"] = learning.get("rule_candidate_artifact")
+        return not missing, evidence, missing
+
+    def check_learning_loop_recorded(self, rule: Rule) -> None:
+        ok, evidence, missing = self._learning_status()
+        if ok:
+            self._record_pass(rule, evidence)
+        else:
+            failure_state = "blocked_learning_rule_candidate_missing" if any("rule_candidate" in m for m in missing) else "blocked_learning_record_missing"
+            if any("signal_type" in m for m in missing):
+                failure_state = "blocked_learning_scope_unclear"
+            self._record_fail(rule, "learning loop signal is missing DB-first record, signal scope, or required rule candidate", failure_state=failure_state, missing_evidence=missing, evidence=evidence)
+
+    def check_done_full_loop(self, rule: Rule) -> None:
+        artifacts = self.ctx.get("artifacts") or {}
+        verification = self.ctx.get("verification") or self.ctx.get("public_verification") or {}
+        approval = self.ctx.get("approval") or {}
+        feedback = self.ctx.get("feedback") or {}
+        task = self.ctx.get("task") or {}
+        final_report = artifacts.get("final_report")
+        missing = []
+        evidence: dict[str, Any] = {}
+        if not final_report:
+            missing.append("artifacts.final_report")
+        else:
+            path = Path(str(final_report))
+            ok, path_ev, reason, path_missing = self._check_path_fresh(path, None)
+            evidence["final_report"] = path_ev
+            if not ok:
+                missing.extend(path_missing)
+                evidence["final_report_reason"] = reason
+        production_ok = verification.get("http_status") == 200 or task.get("production_write_required") is False
+        approval_ok = bool(approval.get("approval_id")) or task.get("approval_required") is False
+        feedback_ok, feedback_evidence, feedback_missing = self._feedback_schedule_status()
+        next_ok = feedback.get("next_task_generated") is True or feedback.get("marked_healthy") is True or feedback.get("no_action_decision_exists") is True
+        learning_ok = True
+        learning_evidence: dict[str, Any] = {"not_required": True}
+        learning_missing: list[str] = []
+        if (self.ctx.get("learning") or {}).get("required") is True or (self.ctx.get("learning") or {}).get("signal_type") or (self.ctx.get("learning") or {}).get("requires_rule_candidate") is True:
+            learning_ok, learning_evidence, learning_missing = self._learning_status()
+        checks = {
+            "production_result_verified_or_not_required": production_ok,
+            "approval_recorded_or_not_required": approval_ok,
+            "feedback_tracking_scheduled_or_no_action": feedback_ok,
+            "next_task_generated_or_marked_healthy_or_no_action": next_ok,
+            "learning_recorded_or_not_required": learning_ok,
+        }
+        missing.extend([name for name, ok in checks.items() if not ok])
+        missing.extend(feedback_missing)
+        missing.extend(learning_missing)
+        evidence.update(checks)
+        evidence["feedback"] = feedback_evidence
+        evidence["learning"] = learning_evidence
+        if missing:
+            self._record_fail(rule, "workflow is not complete enough to mark done", missing_evidence=missing, evidence=evidence)
+        else:
+            self._record_pass(rule, evidence)
+
+    def run(self) -> dict[str, Any]:
+        method_map: dict[str, Callable[[Rule], None]] = {
+            "check_task_type_required": self.check_task_type_required,
+            "check_owner_agent_match": self.check_owner_agent_match,
+            "check_dev_infra_not_routed_to_content_agent": self.check_dev_infra_not_routed_to_content_agent,
+            "check_agent_artifact_fresh": self.check_agent_artifact_fresh,
+            "check_agent_artifact_type_contract": self.check_agent_artifact_type_contract,
+            "check_audit_has_no_critical_blockers": self.check_audit_has_no_critical_blockers,
+            "check_approval_matches_task": self.check_approval_matches_task,
+            "check_post_identity_matches": self.check_post_identity_matches,
+            "check_patch_scope_allowed": self.check_patch_scope_allowed,
+            "check_public_url_verified": self.check_public_url_verified,
+            "check_done_full_loop": self.check_done_full_loop,
+            "check_feedback_schedule_complete": self.check_feedback_schedule_complete,
+            "check_learning_loop_recorded": self.check_learning_loop_recorded,
+        }
+        for rule in RULES:
+            if rule.stage == self.stage and applies(rule, self.ctx):
+                method_map[rule.condition_fn](rule)
+        failed = [r for r in self.results if r["status"] == "failed"]
+        warnings = [r for r in self.results if r["status"] == "warning"]
+        passed = [r for r in self.results if r["status"] == "passed"]
+        ok = not failed
+        first_failure = failed[0] if failed else None
+        result = {
+            "result_id": str(uuid.uuid4()),
+            "task_id": task_id(self.ctx),
+            "ok": ok,
+            "stage": self.stage,
+            "checked_at": now_iso(),
+            "checked_count": len(self.results),
+            "passed_count": len(passed),
+            "failed_count": len(failed),
+            "warning_count": len(warnings),
+            "failed_guardrails": [r["guardrail_id"] for r in failed],
+            "failure_state": first_failure.get("failure_state") if first_failure else None,
+            "results": self.results,
+            "next_allowed": ok,
+            "success_transition": f"{self.stage}_passed" if ok else None,
+            "recommended_next_action": first_failure.get("action_on_fail", [None])[0] if first_failure else None,
+            "production_side_effect": False,
+            "local_only": True,
+            "secret_redacted": True,
+            "context_sha256": stable_hash(self.ctx),
+            "exit_code": 0 if ok else 1,
+        }
+        if self.context_path:
+            result["context_path"] = str(self.context_path)
+        return result
+
+
+def load_context(path: str | None) -> tuple[dict[str, Any], Path | None]:
+    if path:
+        p = Path(path)
+        data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("context JSON root must be an object")
+        return data, p
+    data = json.load(sys.stdin)
+    if not isinstance(data, dict):
+        raise ValueError("context JSON root must be an object")
+    return data, None
+
+
+def write_result_log(result: dict[str, Any], output: str | None, write_log: bool) -> Path | None:
+    if output:
+        path = Path(output)
+    elif write_log:
+        safe_stage = result["stage"]
+        path = DEFAULT_RESULT_DIR / str(result.get("task_id") or "local-task") / f"{result['checked_at'].replace(':', '').replace('-', '')}-{safe_stage}.json"
+    else:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n")
+    return path
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    stage = normalize_stage(args.stage)
+    ctx, context_path = load_context(args.context)
+    if ctx.get("stage") and normalize_stage(str(ctx["stage"])) != stage:
+        # CLI stage is source of truth, but mismatch is useful evidence.
+        ctx = {**ctx, "_stage_mismatch_warning": {"context_stage": ctx.get("stage"), "cli_stage": stage}}
+    result = Evaluator(stage, ctx, context_path).run()
+    output_path = write_result_log(result, args.output, args.write_log)
+    if output_path:
+        result["result_path"] = str(output_path)
+        # Keep file and stdout identical after path is known.
+        output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n")
+    if args.persist_db:
+        try:
+            import seo_os_db  # noqa: WPS433 local import keeps non-DB mode dependency-light
+            db_record = seo_os_db.record_guardrail_result(
+                result,
+                context_path=str(context_path) if context_path else None,
+                result_path=str(output_path) if output_path else result.get("result_path"),
+                source="seo-guardrail",
+            )
+            result["db_record"] = db_record
+            # If a result artifact was written before DB persistence, update it with db_record.
+            if output_path:
+                output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str) + "\n")
+        except Exception as exc:
+            result["db_record"] = {"ok": False, "error_type": type(exc).__name__, "error": str(exc), "secret_redacted": True}
+            result["exit_code"] = 2
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return int(result["exit_code"])
+
+
+def cmd_list_rules(args: argparse.Namespace) -> int:
+    data = {
+        "rules": [rule.to_dict() for rule in RULES],
+        "stages": CANONICAL_STAGES,
+        "stage_aliases": STAGE_ALIASES,
+        "allowed_task_types": ALLOWED_TASK_TYPES,
+        "owner_agent_map": OWNER_AGENT_MAP,
+        "local_only": True,
+        "production_side_effect": False,
+    }
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_explain(args: argparse.Namespace) -> int:
+    matches = [rule.to_dict() for rule in RULES if rule.guardrail_id == args.rule]
+    if not matches:
+        print(json.dumps({"ok": False, "error": "unknown_rule", "rule": args.rule}, ensure_ascii=False, indent=2))
+        return 1
+    print(json.dumps({"ok": True, "rule": matches[0]}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_validate_context(args: argparse.Namespace) -> int:
+    try:
+        ctx, context_path = load_context(args.context)
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc), "local_only": True}, ensure_ascii=False, indent=2))
+        return 1
+    errors = []
+    if not isinstance(ctx.get("task", {}), dict):
+        errors.append("task must be object when present")
+    if ctx.get("stage"):
+        try:
+            normalize_stage(str(ctx["stage"]))
+        except ValueError as exc:
+            errors.append(str(exc))
+    result = {"ok": not errors, "errors": errors, "context_path": str(context_path) if context_path else None, "context_sha256": stable_hash(ctx), "local_only": True}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if not errors else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Local-only SEO Growth OS guardrail evaluator MVP")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    check = sub.add_parser("check", help="evaluate guardrails for one stage")
+    check.add_argument("--stage", required=True, choices=sorted(STAGE_ALIASES), help="stage name; underscore and hyphen aliases both accepted")
+    check.add_argument("--context", help="workflow context JSON path; stdin if omitted")
+    check.add_argument("--json", action="store_true", help="accepted for compatibility; output is always JSON")
+    check.add_argument("--output", help="optional local path to write result JSON")
+    check.add_argument("--write-log", action="store_true", help="write local result artifact under /Users/garyyang/workspace/ohya/guardrail-results/<task_id>/")
+    check.add_argument("--persist-db", action="store_true", help="persist result + per-rule checks into seo_os.guardrail_results; production-looking DB requires SEO_OS_ALLOW_PRODUCTION=I_UNDERSTAND")
+    check.set_defaults(func=cmd_check)
+
+    list_rules = sub.add_parser("list-rules", help="print built-in MVP rule registry")
+    list_rules.add_argument("--json", action="store_true", help="accepted for compatibility; output is always JSON")
+    list_rules.set_defaults(func=cmd_list_rules)
+
+    explain = sub.add_parser("explain", help="explain one rule")
+    explain.add_argument("--rule", required=True)
+    explain.add_argument("--json", action="store_true", help="accepted for compatibility; output is always JSON")
+    explain.set_defaults(func=cmd_explain)
+
+    validate = sub.add_parser("validate-context", help="validate context JSON is parseable and minimally shaped")
+    validate.add_argument("--context", help="workflow context JSON path; stdin if omitted")
+    validate.add_argument("--json", action="store_true", help="accepted for compatibility; output is always JSON")
+    validate.set_defaults(func=cmd_validate_context)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return args.func(args)
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc), "local_only": True, "production_side_effect": False}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -25,6 +25,7 @@
 - [今日工作總結](docs/2026-05-22-work-summary.md)
 - [Hermes agent-first 架構研究](docs/hermes-agent-first-architecture.md)
 - [研究來源](docs/research-sources.md)
+- [OHYA SEO 架構參考快照](references/ohya-seo-architecture/SNAPSHOT.md)
 - [Closed Loop Kernel prototype](PROTOTYPE.md)
 - [原始架構入口](ai_native_closed_loop_architecture.md)
 - [逐字稿](X_JsIHUfUjc-transcript.txt)
@@ -50,4 +51,3 @@ http://127.0.0.1:8765/events
 - Hermes auth、token、logs、profile DB、kanban DB 不進 repo。
 - PostgreSQL adapter 目前是 DDL renderer，尚未做 live integration。
 - Company Brain 還是架構方向，下一步才會接真 agent traces。
-
