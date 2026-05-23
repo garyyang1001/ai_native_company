@@ -1,7 +1,9 @@
-# Gary
+# AI Native Company
 
-Gary is a working repository for turning an AI-native company operating model
-into a small, durable, and verifiable local system.
+中文名稱：AI 原生公司
+
+AI Native Company is a working repository for turning an AI-native company
+operating model into a small, durable, and verifiable local system.
 
 The goal is not to build a generic SEO agent, a large company brain, or a
 collection of disconnected automations. The goal is to define a company kernel

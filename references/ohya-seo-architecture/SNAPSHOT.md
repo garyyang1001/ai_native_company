@@ -5,7 +5,7 @@ Redacted on: 2026-05-23
 This reference is intentionally reduced to a public-safe architecture note.
 The original executable snapshot was removed from this public repository because
 it contained local paths, tool names, credential filenames, and operational
-details that are not needed for the Gary company kernel.
+details that are not needed for the AI Native Company kernel.
 
 ## Public-Safe Reference
 
