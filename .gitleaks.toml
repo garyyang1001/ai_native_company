@@ -1,0 +1,48 @@
+title = "AI Native Company public repository secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "google-api-key"
+description = "Google API key"
+regex = '''AIza[0-9A-Za-z_-]{35}'''
+keywords = ["AIza"]
+
+[[rules]]
+id = "slack-webhook"
+description = "Slack incoming webhook URL"
+regex = '''https://hooks\.slack\.com/services/[0-9A-Za-z/_-]{20,}'''
+keywords = ["hooks.slack.com/services"]
+
+[[rules]]
+id = "private-key"
+description = "Private key material"
+regex = '''-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----'''
+keywords = ["PRIVATE KEY"]
+
+[[rules]]
+id = "generic-secret-assignment"
+description = "Generic high-entropy credential assigned to a secret-like key"
+regex = '''(?i)(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|refresh[_-]?token|secret|password|passwd|credential)\s*[:=]\s*["']?[0-9A-Za-z_+/=-]{32,}["']?'''
+keywords = [
+  "api_key",
+  "apikey",
+  "access_token",
+  "auth_token",
+  "client_secret",
+  "private_key",
+  "refresh_token",
+  "secret",
+  "password",
+  "credential",
+]
+
+[allowlist]
+description = "Repository fixtures and public reference notes that do not contain live secrets"
+paths = [
+  '''^references/ohya-seo-architecture/SNAPSHOT\.md$''',
+]
+regexes = [
+  '''AIzaSyDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUM''',
+]

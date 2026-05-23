@@ -44,6 +44,15 @@ For the next contract layer, use:
 - Prefer small contracts that can later be implemented and tested over broad company-brain essays.
 - Keep facts, assumptions, and future plans separate.
 
+## Branch And Commit Workflow
+
+- Keep `main` clean, readable, and handoff-ready.
+- For small documentation-only changes, direct commits to `main` are acceptable after diff review.
+- For formal architecture documents, prototype changes, code changes, or multi-agent work, create a short-lived branch first.
+- Do the work, review `git diff`, run relevant checks, then commit on the branch.
+- Merge back to `main` only after Codex review confirms the branch is coherent and tests or document consistency checks pass.
+- Antigravity should not commit or merge unless Gary explicitly asks for that.
+
 ## Codex And Antigravity Workflow
 
 - Codex is the controller, planner, reviewer, and committer.

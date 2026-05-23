@@ -1,54 +1,135 @@
-# Gary
+# AI Native Company
 
-這個 repo 的目標是把「AI 原生公司」從概念推進成可跑、可驗證、可逐步接上真 agent 工作流的本地系統。
+中文名稱：AI 原生公司
 
-目前方向不是先做一顆巨大的公司大腦，而是先讓真實 agent 工作，然後把它們留下的任務、過程、錯誤、成果與審批紀錄收回同一個 closed-loop kernel。大腦是從 agent 的工作痕跡長出來，不是先畫完整再要求 agent 配合。
+AI Native Company is a working repository for turning an AI-native company
+operating model into a small, durable, and verifiable local system.
 
-## 目前主線
+The goal is not to build a generic SEO agent, a large company brain, or a
+collection of disconnected automations. The goal is to define a company kernel
+where real agents can do work, leave structured records, and make their inputs,
+outputs, sources, artifacts, failures, reviews, approvals, and cleanup state
+available for later inspection.
 
-1. Closed Loop Kernel v0
-   - 本地 SQLite prototype，模擬 PostgreSQL 版本的 append-only lifecycle、failure、candidate、replay、approval、apply 流程。
-   - 本地 HTML UI：`/events`、`/events/:id`、`/improvements`、`/approvals`。
-   - 測試覆蓋核心資料模型、approval route、view rendering、PostgreSQL DDL renderer、Python sandbox。
+## Core Direction
 
-2. Agent-first 架構
-   - 先以乾淨 Hermes Telegram agent `skimm3r918_bot` 當入口候選。
-   - 不急著讓 agent 產出，先研究主入口 agent + 多個 profile worker 是否可行。
-   - 初步判斷：可行，但 durable 多 agent 工作應該走 Hermes Kanban / profile worker，而不是只靠短命的 `delegate_task`。
+This repository starts from a simple principle:
 
-3. Company Brain
-   - 不是聊天記憶。
-   - 是從 agent sessions、kanban tasks、workspace artifacts、failures、replays、approvals 匯入而成的查詢、回放、審核、學習層。
+> Raw data is not company memory.
 
-## 重要文件
+An AI-native company needs every meaningful data input and output to be
+readable, recordable, reviewable, memory-candidate eligible, and cleanable.
+That does not mean every raw log, draft, export, or transcript becomes memory.
+It means agent work must leave records that can be verified, deduplicated,
+scoped, approved, retained, or removed.
 
-- [今日工作總結](docs/2026-05-22-work-summary.md)
-- [Hermes agent-first 架構研究](docs/hermes-agent-first-architecture.md)
-- [Company Data Contract v0](docs/company-data-contract-v0.md)
-- [研究來源](docs/research-sources.md)
-- [OHYA SEO 架構參考快照](references/ohya-seo-architecture/SNAPSHOT.md)
-- [Closed Loop Kernel prototype](PROTOTYPE.md)
-- [原始架構入口](ai_native_closed_loop_architecture.md)
-- [逐字稿](X_JsIHUfUjc-transcript.txt)
+The current kernel is organized around four concerns:
 
-## 本地驗證
+- **Company data contracts**: common record shapes for tasks, source references,
+  artifacts, output envelopes, failures, verification reports, memory
+  candidates, and profile update candidates.
+- **Agent profile registry**: a machine-readable registry of permanent and
+  dynamic profiles, including what they can read, write, remember, and clean up.
+- **Closed loop kernel prototype**: a local Python prototype for append-only
+  lifecycle events, failures, candidates, sandbox replay, approval, and apply
+  flows.
+- **Public repository guardrails**: secret scanning, branch protection, and
+  local output-envelope checks that reduce the chance of publishing credentials
+  or operational details.
+
+## Current Status
+
+The repository currently includes:
+
+- A Python closed-loop kernel prototype under `closed_loop_kernel/`
+- Unit tests for the kernel, HTTP views, sandbox, PostgreSQL schema rendering,
+  and agent profile registry
+- A company data contract v0
+- An agent profile registry v0
+- A redacted public reference note for the previous OHYA SEO architecture
+- Gitleaks configuration and a GitHub Actions security scan workflow
+
+This is still a local prototype and contract layer. It is not a production
+agent runtime, not a production database integration, and not a production
+publishing system.
+
+## Repository Map
+
+- `closed_loop_kernel/` - Python prototype for lifecycle events, approvals,
+  sandbox replay, profile registry validation, and local HTTP views
+- `data/agent-profile-registry-v0.json` - machine-readable profile registry seed
+- `docs/company-data-contract-v0.md` - source contract for company data records
+- `docs/agent-profile-registry-v0.md` - profile registry contract and governance
+- `docs/antigravity-supervision-workflow.md` - Codex/Antigravity supervision
+  workflow
+- `spec/` - closed-loop kernel specifications and acceptance criteria
+- `tests/` - unit tests for the current prototype and contracts
+- `references/ohya-seo-architecture/SNAPSHOT.md` - redacted public-safe
+  architecture pattern note
+- `.gitleaks.toml` - local and CI secret scanning configuration
+- `.github/workflows/security-scan.yml` - GitHub Actions Gitleaks workflow
+
+## Local Verification
+
+Run the unit test suite:
 
 ```bash
 python3 -m unittest discover -s tests
+```
+
+Run the local demo:
+
+```bash
 python3 -m closed_loop_kernel.demo
+```
+
+Run the local HTTP prototype:
+
+```bash
 python3 -m closed_loop_kernel.http_app
 ```
 
-開啟本地 UI：
+Then open:
 
 ```text
 http://127.0.0.1:8765/events
 ```
 
-## 邊界
+## Security Guardrails
 
-- 目前 prototype 不碰 production DB。
-- 目前沒有讓 `skimm3r918_bot` 開始做正式任務。
-- Hermes auth、token、logs、profile DB、kanban DB 不進 repo。
-- PostgreSQL adapter 目前是 DDL renderer，尚未做 live integration。
-- Company Brain 還是架構方向，下一步才會接真 agent traces。
+This repository is intended to be public-safe. Current guardrails include:
+
+- Gitleaks configuration in `.gitleaks.toml`
+- GitHub Actions secret scanning on push and pull request
+- GitHub native secret scanning and push protection
+- Protected `main` branch with pull-request review required
+- Local credential-leak detection inside `validate_output_envelope`
+
+The local output-envelope guardrail scans agent payloads and machine records for
+common credential patterns before accepting an output envelope. It intentionally
+ignores known metadata fields such as content hashes and timestamps.
+
+## Boundaries
+
+- Do not commit credentials, auth files, runtime logs, production databases, or
+  local runtime state.
+- Do not treat raw exports, transcripts, logs, or generated artifacts as company
+  memory.
+- Do not let one profile execute, review, approve, and apply its own work.
+- Do not restore private executable reference snapshots into this public
+  repository.
+- Do not copy client-specific paths, tokens, platform details, or deployment
+  assumptions into public architecture documents.
+
+## Design Principle
+
+The durable unit of work is not a chat response. It is a reviewable record:
+
+```text
+task -> source evidence -> agent output envelope -> artifact -> verification
+     -> review -> approval -> memory candidate -> cleanup or retention
+```
+
+That loop is the company kernel. Agents can change, tools can change, and
+department applications can be added later, but the record contract should stay
+small, explicit, and auditable.
