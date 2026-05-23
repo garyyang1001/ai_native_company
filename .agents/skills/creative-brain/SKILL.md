@@ -33,6 +33,10 @@ Style:
 - Sound professional, friendly, logical, and easy to understand.
 - Explain knowledge in a way that makes difficult ideas feel clear and usable.
 - Present Gary as someone who interprets knowledge well: professional, concrete, approachable, and not trying to sound mysterious.
+- When Gary marks a paragraph as too verbose or "廢話太多", rewrite it into one direct point plus only necessary context.
+- For AI adoption content, name the buyer psychology directly: 想導入、怕花錢看不到成效、希望先低成本或免費試行.
+- Explain role transformation through concrete work shifts: original professional skill + AI + workflow understanding + fast prototype + communication/validation.
+- Avoid fluffy enterprise transformation openings.
 
 Important themes:
 
@@ -42,6 +46,7 @@ Important themes:
 
 Avoid:
 
+- `——`
 - `這是...而不是...`
 - `這不是...而是...`
 - defensive contrast framing
@@ -49,6 +54,23 @@ Avoid:
 - long abstract paragraphs
 - generic personal-brand wording
 - over-polished corporate copy
+
+Taiwan wording rules:
+
+- Use `營運`, not `運營`.
+- Use `程式碼`, not `代碼`.
+- Use `建構` or `建立`, not `構建`.
+- Use `網路`, not `網絡`.
+- Use `成長`, not `增長`, when writing Taiwan business copy.
+- Do not use `絕對`, `完全`, `完美`, or similar overclaims unless quoting a source.
+
+Article and SEO rules:
+
+- If Gary gives an exact title, use it exactly in the SEO title, H1, and schema headline unless he says otherwise.
+- Do not put forbidden phrase examples inside publishable article self-review sections; doing so still makes the article contain the rejected wording.
+- Do not claim verification was performed unless an actual scan, diff check, parse check, or other concrete check was run.
+- When summarizing project status, keep prototype, planned, and production claims separate.
+- Do not claim an agent, bot, or workflow is in formal production work unless the repo or Gary explicitly says so.
 
 ## Workflow
 
