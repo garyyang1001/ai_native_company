@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
 from urllib.parse import unquote, urlparse
 
 from .demo import SAFE_PATCH
 from .engine import KernelEngine
-from .store import KernelStore
+from .store import RESET_CONFIRMATION, KernelStore
 from .views import render_approvals_view, render_event_detail_view, render_events_view, render_improvements_view
 
 
@@ -18,33 +19,38 @@ class HttpResponse:
 
 
 def build_demo_store() -> KernelStore:
-    store = KernelStore.in_memory()
-    store.initialize()
-    engine = KernelEngine(store)
+    store = KernelStore.from_url(_database_url())
+    try:
+        _reset_demo_database(store)
+        store.initialize()
+        engine = KernelEngine(store)
 
-    artifact_id = engine.create_artifact(
-        "skills.compute_score",
-        "python",
-        "def compute_score(base, bonus):\n    return base + bonus\n",
-    )
-    attempt_id = engine.start_attempt({"skill": "compute_score", "base": 10, "bonus": None})
-    engine.finish_attempt(
-        attempt_id,
-        "failed",
-        {"skill": "compute_score", "base": 10, "bonus": None},
-        error_message="TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'",
-    )
-    failure_id = store.scalar("SELECT id FROM failures WHERE attempt_id = ?", [attempt_id])
-    candidate_id = engine.propose_improvement(
-        failure_id,
-        artifact_id,
-        "code_patch",
-        SAFE_PATCH,
-        {"expected_result": 10},
-        {"restore_artifact_id": artifact_id},
-    )
-    engine.replay_code_candidate(candidate_id, function_name="compute_score", args=[10, None])
-    return store
+        artifact_id = engine.create_artifact(
+            "skills.compute_score",
+            "python",
+            "def compute_score(base, bonus):\n    return base + bonus\n",
+        )
+        attempt_id = engine.start_attempt({"skill": "compute_score", "base": 10, "bonus": None})
+        engine.finish_attempt(
+            attempt_id,
+            "failed",
+            {"skill": "compute_score", "base": 10, "bonus": None},
+            error_message="TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'",
+        )
+        failure_id = store.scalar("SELECT id FROM failures WHERE attempt_id = ?", [attempt_id])
+        candidate_id = engine.propose_improvement(
+            failure_id,
+            artifact_id,
+            "code_patch",
+            SAFE_PATCH,
+            {"expected_result": 10},
+            {"restore_artifact_id": artifact_id},
+        )
+        engine.replay_code_candidate(candidate_id, function_name="compute_score", args=[10, None])
+        return store
+    except Exception:
+        store.close()
+        raise
 
 
 def route_request(store: KernelStore, path: str) -> HttpResponse:
@@ -106,7 +112,21 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
             return
 
     server = ThreadingHTTPServer((host, port), Handler)
+    server.kernel_store = store
     return server
+
+
+def _database_url() -> str:
+    url = os.environ.get("KERNEL_DATABASE_URL")
+    if not url:
+        raise RuntimeError("KERNEL_DATABASE_URL is required; kernel runtime is PostgreSQL-only")
+    return url
+
+
+def _reset_demo_database(store: KernelStore) -> None:
+    if os.environ.get("KERNEL_ALLOW_DESTRUCTIVE_RESET") != "1":
+        raise RuntimeError("KERNEL_ALLOW_DESTRUCTIVE_RESET=1 is required to reset the PostgreSQL demo database")
+    store.reset_for_test(confirm=RESET_CONFIRMATION)
 
 
 def _html(body: str) -> HttpResponse:

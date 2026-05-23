@@ -3,13 +3,14 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from closed_loop_kernel import KernelEngine, KernelStore, SecurityError
+from closed_loop_kernel import KernelEngine, SecurityError
+from tests.postgres_test_utils import build_postgres_store
 
 
 class ClosedLoopKernelTests(unittest.TestCase):
     def setUp(self):
-        self.store = KernelStore.in_memory()
-        self.store.initialize()
+        self.store = build_postgres_store()
+        self.addCleanup(self.store.close)
         self.engine = KernelEngine(self.store)
 
     def test_failed_attempt_is_single_insert_and_append_only(self):
@@ -78,7 +79,7 @@ class ClosedLoopKernelTests(unittest.TestCase):
         new_artifact_id = self.engine.apply_candidate(candidate_id)
 
         active = self.store.fetch_one(
-            "SELECT * FROM artifacts WHERE name = ? AND is_active = 1",
+            "SELECT * FROM artifacts WHERE name = ? AND is_active = TRUE",
             ["skills.compute_score"],
         )
         self.assertEqual(active["id"], new_artifact_id)
@@ -106,7 +107,7 @@ class ClosedLoopKernelTests(unittest.TestCase):
 
         self.assertEqual(self.store.scalar("SELECT status FROM improvement_candidates WHERE id = ?", [candidate_id]), "draft")
         self.assertEqual(
-            self.store.scalar("SELECT content FROM artifacts WHERE name = ? AND is_active = 1", ["prompts.search"]),
+            self.store.scalar("SELECT content FROM artifacts WHERE name = ? AND is_active = TRUE", ["prompts.search"]),
             "concurrent-v2",
         )
 
@@ -134,8 +135,8 @@ class ClosedLoopKernelTests(unittest.TestCase):
 
 class SandboxLintTests(unittest.TestCase):
     def test_sql_and_python_lints_block_known_unsafe_patches(self):
-        store = KernelStore.in_memory()
-        store.initialize()
+        store = build_postgres_store()
+        self.addCleanup(store.close)
         engine = KernelEngine(store)
 
         with self.assertRaisesRegex(SecurityError, "SQL Lint Blocked"):
@@ -145,8 +146,8 @@ class SandboxLintTests(unittest.TestCase):
             engine.validate_python_patch("import os\nos.system('rm -rf /')")
 
     def test_sql_and_python_lints_allow_minimal_safe_patches(self):
-        store = KernelStore.in_memory()
-        store.initialize()
+        store = build_postgres_store()
+        self.addCleanup(store.close)
         engine = KernelEngine(store)
 
         engine.validate_sql_patch("CREATE INDEX idx_documents_title ON documents(title);")

@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from .store import KernelStore
+from .store import KernelStore, json_param
 
 
 class SecurityError(Exception):
@@ -125,7 +125,7 @@ class KernelEngine:
         self.store.execute(
             """
             INSERT INTO artifacts (id, name, artifact_type, content, content_hash, version, is_active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, ?, ?, ?, TRUE, ?)
             """,
             [artifact_id, name, artifact_type, content, _hash(content), version, _now()],
         )
@@ -286,7 +286,7 @@ class KernelEngine:
             raise Exception("successful replay required before apply")
 
         active = self.store.fetch_one(
-            "SELECT * FROM artifacts WHERE name = ? AND is_active = 1",
+            "SELECT * FROM artifacts WHERE name = ? AND is_active = TRUE",
             [candidate["target_artifact_name"]],
         )
         if not active or active["content_hash"] != candidate["base_artifact_hash"]:
@@ -296,13 +296,13 @@ class KernelEngine:
         new_artifact_id = self.generate_id()
         with self.store.transaction() as conn:
             conn.execute(
-                "UPDATE artifacts SET is_active = 0 WHERE name = ? AND is_active = 1",
+                "UPDATE artifacts SET is_active = FALSE WHERE name = ? AND is_active = TRUE",
                 [candidate["target_artifact_name"]],
             )
             conn.execute(
                 """
                 INSERT INTO artifacts (id, name, artifact_type, content, content_hash, version, is_active, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                VALUES (?, ?, ?, ?, ?, ?, TRUE, ?)
                 """,
                 [
                     new_artifact_id,
@@ -320,15 +320,15 @@ class KernelEngine:
         return new_artifact_id
 
     def force_replace_active_artifact_for_test(self, name: str, artifact_type: str, content: str) -> str:
-        active = self.store.fetch_one("SELECT * FROM artifacts WHERE name = ? AND is_active = 1", [name])
+        active = self.store.fetch_one("SELECT * FROM artifacts WHERE name = ? AND is_active = TRUE", [name])
         next_version = (active["version"] if active else 0) + 1
         artifact_id = self.generate_id()
         with self.store.transaction() as conn:
-            conn.execute("UPDATE artifacts SET is_active = 0 WHERE name = ? AND is_active = 1", [name])
+            conn.execute("UPDATE artifacts SET is_active = FALSE WHERE name = ? AND is_active = TRUE", [name])
             conn.execute(
                 """
                 INSERT INTO artifacts (id, name, artifact_type, content, content_hash, version, is_active, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                VALUES (?, ?, ?, ?, ?, ?, TRUE, ?)
                 """,
                 [artifact_id, name, artifact_type, content, _hash(content), next_version, _now()],
             )
@@ -385,8 +385,8 @@ def _now(value: datetime | None = None) -> str:
     return (value or datetime.now(timezone.utc)).isoformat()
 
 
-def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+def _json(value: Any):
+    return json_param(value)
 
 
 def _hash(content: str) -> str:

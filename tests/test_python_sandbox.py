@@ -1,6 +1,7 @@
 import unittest
 
-from closed_loop_kernel import KernelEngine, KernelStore, SecurityError
+from closed_loop_kernel import KernelEngine, SecurityError
+from tests.postgres_test_utils import build_postgres_store
 from closed_loop_kernel.sandbox import PythonSandbox
 
 
@@ -30,8 +31,8 @@ class PythonSandboxTests(unittest.TestCase):
             )
 
     def test_engine_replays_code_candidate_and_marks_it_sandbox_verified(self):
-        store = KernelStore.in_memory()
-        store.initialize()
+        store = build_postgres_store()
+        self.addCleanup(store.close)
         engine = KernelEngine(store)
         artifact_id = engine.create_artifact(
             "skills.compute_score",

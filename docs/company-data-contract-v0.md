@@ -1,6 +1,6 @@
 # Company Data Contract v0
 
-本文件定義 Gary / 好事發生處 AI 原生公司框架的第一層資料契約。
+本文件定義 Gary / 好事發生數位 AI 原生公司框架的第一層資料契約。
 
 這份契約的目的不是先設計很多 agent，而是先規定：任何 agent 只要替公司工作，就必須留下可讀、可審核、可驗證、可清洗、可接手的資料。
 
@@ -290,6 +290,7 @@ review_report
 sandbox_verification_report
 memory_promotion_note
 profile_update_proposal
+outcome_report
 ```
 
 ## 9. Failure Detection Contract
@@ -668,10 +669,10 @@ youtube-transcript-agent
   output_type: youtube_transcript_summary
 
 seo-content-strategist
-  output_type: seo_content_strategy
+  output_type: seo_content_strategy / content_brief
 
 content-producer
-  output_type: content_brief / content_draft / social_post_draft
+  output_type: content_draft / social_post_draft
 
 reviewer
   output_type: review_report

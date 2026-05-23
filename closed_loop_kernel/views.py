@@ -255,21 +255,25 @@ def _short_id(value: str | None) -> str:
     return (value or "unknown")[:8]
 
 
-def _loads(value: str | None) -> dict:
+def _loads(value) -> dict:
     if not value:
         return {}
+    if isinstance(value, dict):
+        return value
     try:
         parsed = json.loads(value)
-    except json.JSONDecodeError:
+    except (TypeError, json.JSONDecodeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _format_time(value: str) -> str:
+def _format_time(value) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
     try:
         parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return value
+    except (TypeError, ValueError):
+        return str(value)
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
 

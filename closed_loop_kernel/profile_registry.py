@@ -85,8 +85,8 @@ def _contains_potential_credential(value: str) -> bool:
     return any(pattern.search(value) for pattern in SECRET_PATTERNS) or _looks_like_high_entropy_secret(value)
 
 
-def _iter_scannable_strings(value, parent_key: str | None = None):
-    if parent_key in SECRET_SCAN_IGNORED_KEYS:
+def _iter_scannable_strings(value, parent_key: str | None = None, depth: int = 0):
+    if depth == 1 and parent_key in SECRET_SCAN_IGNORED_KEYS:
         return
 
     if isinstance(value, str):
@@ -95,12 +95,12 @@ def _iter_scannable_strings(value, parent_key: str | None = None):
 
     if isinstance(value, dict):
         for key, child_value in value.items():
-            yield from _iter_scannable_strings(child_value, str(key))
+            yield from _iter_scannable_strings(child_value, str(key), depth + 1)
         return
 
     if isinstance(value, list):
         for child_value in value:
-            yield from _iter_scannable_strings(child_value, parent_key)
+            yield from _iter_scannable_strings(child_value, parent_key, depth)
 
 
 class ProfileRegistryError(Exception):

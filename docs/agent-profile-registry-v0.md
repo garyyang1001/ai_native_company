@@ -56,7 +56,10 @@ permanence_level: "string (permanent | dynamic)"
 department: "string (所屬部門)"
 description: "string (職責描述)"
 
-# 執行邊界與安全控制
+# =========================================================================
+# [未來/v1 設計意圖與延伸合約層]
+# (以下三個區塊在 v0 核心驗證器中暫不強制執行，亦不在 v0 JSON 註冊表種子中出現)
+# =========================================================================
 security_policy:
   privilege_level: "string (low | medium | high)"
   allowed_tools: ["string (允許調用的工具 Schema 名稱)"]
@@ -64,7 +67,6 @@ security_policy:
   working_directory_template: "string (限制的檔案存取根目錄，如 workspace/{task_id}/)"
   sandbox_policy: "string (AST 限制級別或資料庫專屬低權限角色)"
 
-# 治理與審查閘門
 governance_rules:
   requires_peer_review: boolean
   peer_reviewer_profiles: ["string (合法的審核者 Profile ID)"]
@@ -72,12 +74,13 @@ governance_rules:
   verification_types: ["string (如 schema_contract_check)"]
   requires_human_approval: boolean
 
-# 系統自癒與更新限制
 update_policy:
   requires_sandbox_regression: boolean
   allowed_update_proposers: ["string (有權提出此 Profile 更新案的 Profile)"]
 
-# 資料流原則欄位 (Data Flow Policy Fields)
+# =========================================================================
+# [v0 資料流原則欄位 (Data Flow Policy - v0 核心校驗強制欄位)]
+# =========================================================================
 data_flow_policy:
   readable_inputs: ["string (此 Profile 可讀取的 Source Type 或 Record Type)"]
   writable_outputs: ["string (此 Profile 可產出的 Artifact Type 或 Envelope Type)"]
@@ -95,6 +98,10 @@ data_flow_policy:
     source_refs: "array (輸入證據來源定位，必須指向 Source Reference)"
     artifact_refs: "array (輸出產物路徑與定位，必須指向 Artifact Record)"
     content_hash: "string (產物與程式碼之 SHA-256 雜湊值)"
+    created_at: "string (任務或產出時間戳記)"
+    sensitivity: "string (資料敏感度等級)"
+    retention_policy: "string (資料保存與保留策略)"
+    machine_record: "object (機器可讀之關鍵決策/證據中繼紀錄)"
   sensitivity_level: "string (public | internal | confidential | restricted)"
   retention_policy: "string (資料保存期限策略)"
   cleanup_lifecycle_state: "string (active | warm | cold | archived | deleted)"
@@ -163,7 +170,14 @@ data_flow_policy:
 
 動態輔助角色並非公司內核的長期守門人。這些角色代表的是**無狀態、拋棄式、單次執行的特定技能（Stateless Skills）**。它們在執行期由 `growth-coordinator` 或 `seo-content-strategist` 透過 `delegate_task` 工具調用，執行完畢即行釋放。
 
-動態輔助角色**不擁有獨立的狀態資料庫或獨立的 `SOUL.md` 變更歷史**。其指令完全繼承自主調用者的 Tools 與 Skills 定義，其產出也必須直接包裝在主調用者的 `Agent Output Envelope` 中交付，避免系統狀態失控與註冊表臃腫。
+> **關於註冊表種子 (JSON Registry) 之設計邊界說明：**
+> 為了實現嚴格的執行安全，**動態輔助角色仍會被條列並登記於本中央 JSON 註冊表中**。這使得系統能在執行期，針對動態角色的 `readable_inputs` 與 `writable_outputs` 進行靜態 Linting 與合規檢驗，確保其輸入/輸出不越界。
+>
+> 然而，與常駐系統角色 (Permanent Profiles) 相比，動態輔助角色具備以下嚴格邊界限制：
+> 1. **無持久狀態**：不擁有獨立、持久的狀態目錄或狀態資料庫 (`state.db`)。
+> 2. **無獨立靈魂**：不具備獨立、受版本控管的 `SOUL.md` 指令與生命週期，其指令完全繼承自主調用者的 Tools 與 Skills 定義。
+> 3. **無自我決策與審批權**：不具備獨立的審批權限，且其產出也必須直接包裝在主調用者的 `Agent Output Envelope` 中交付，避免系統狀態失控與註冊表臃腫。
+> 4. **無全域記憶權限**：不允許直接推選、申請或變更公司全域記憶 (`promoted_memory_allowed: false`)。
 
 ### 5.1 `social-listener` (社群聆聽工具)
 *   **定位**：短期 API 抓取工具。抓取特定社群論壇有關關鍵字的討論，輸出必須包成 Source Reference 與 Machine Record，抓取完畢即釋放。
@@ -261,6 +275,24 @@ data_flow_policy:
 - **Memorable**：重要資料可以被提名為 `Memory Candidate`；但 candidate 不是 memory，必須經整理、去重、審查與批准後才可升級。
 - **Cleanable**：每一筆資料都必須有 lifecycle state 與 retention policy，能被標記為 `active`、`warm`、`cold`、`archived` 或 `deleted`。
 
+### 8.2 輸出封包機密憑證與金鑰掃描 (Secret/Credential Scanning)
+
+為了杜絕敏感金鑰、API Tokens 或私鑰明文外洩至 Append-Only 系統日誌或 Company Brain 中，v0 核心驗證器在載入與核對任何 Agent 產出的 `Agent Output Envelope` 時，強制執行**機密憑證與金鑰掃描 (Secret/Credential Scanning) 靜態檢驗**。
+
+1. **正則表達式匹配 (Pattern Regex Check)**：
+   核心驗證器會針對輸出的所有字串欄位進行敏感特徵過濾，特徵包含但不限於：
+   * Google API Keys (`AIzaSy...`)
+   * OpenAI API Keys (`sk-proj-...` / `sk-...`)
+   * GitHub Access Tokens (`ghp_...` / `github_pat_...`)
+   * Slack OAuth Tokens / Webhooks
+   * 私鑰標頭 (RSA/OPENSSH/EC/DSA Private Key Headers)
+2. **高熵隨機字串校驗 (Shannon Entropy Check)**：
+   針對長度 $\geq 32$ 字元且疑似隨機雜湊的字串，驗證器會執行 Shannon 熵估算（安全閥值為 $\geq 4.2$）。若熵值高於閥值，將判定為潛在的隨機私鑰或 Token 洩漏並強制阻斷。
+3. **白名單豁免欄位 (Scan Exemptions)**：
+   為了避免安全機制誤判，以下特定 metadata / 指紋雜湊欄位被列為白名單，不計入金鑰靜態掃描範圍：
+   * `content_hash` (輸出產物的 SHA-256 指紋)
+   * 明確列名的時間戳記欄位：`created_at`, `updated_at`, `reviewed_at`, `verified_at`, `approved_at`
+
 ---
 
 ## 9. 保存策略與清洗生命週期 (Retention & Cleanup)
@@ -302,3 +334,8 @@ data_flow_policy:
     v0 階段僅註冊單一 permanent profile `reviewer` 負責所有事實核對與品質審查。不針對技術與文案作進一步的 Reviewer 角色細分。
 3.  **審核通道預設**：
     v0 階段的所有人機協同審批（Human Approvals）**完全在本地 HTTP UI `/approvals` 介面中進行**。外部訊息平台按鈕或 callback 簽署批准的機制，列為未來版本開發項目。
+4.  **未決合約與資料分類學問題 (Unresolved Contract & Taxonomy Questions)**：
+    v0 階段在 JSON 註冊表種子與 `docs/company-data-contract-v0.md` 之間存在以下未決的分類邊界問題，目前在 v0 中作為「特例」暫行容忍，留待未來 v1 版本收斂：
+    *   **Source Type 與 Writable Output 混淆**：`research-analyst` 的輸出被標記為 `web_research`。然而在資料合約中，`web_research` 屬於 Source Type (原始來源)，並非標準的 Artifact Type (產物)。這在未來應被收斂至如 `web_research_report` 或 `research_summary`。
+    *   **非標準產物輸出**：`growth-coordinator` 的輸出包含 `task_record` 與 `route_status_summary`。這兩個類型在 canonical Artifact Types (合約第 8 節) 中並未被條列。
+    我們選擇僅對 `company-data-contract-v0.md` 做必要的對齊性修補，不擅自發明新型態；其餘未決分類邊界在此清晰記錄，留待 v1 收斂。

@@ -34,7 +34,7 @@ Entry points
 
 - `AIAgent` 是共用核心。
 - CLI、Telegram gateway、cron、ACP 都會建立或驅動同一種 agent loop。
-- session 存在 SQLite + FTS5。
+- session 會落在可持久化、可查詢的 profile state。
 - profile-aware path 由 `HERMES_HOME` 控制。
 - tools 透過 registry / toolsets 管理。
 - gateway 是長時間常駐入口。
@@ -103,7 +103,7 @@ brain-curator       -> summarize traces into company memory
 
 Hermes Kanban 比較接近我們要的「AI 公司工作流」。
 
-官方設計裡，每個 task 是 SQLite 裡的一列，每個 handoff/comment 都是可讀寫的 durable row。dispatcher 會定期掃任務，依 assignee profile 產生 worker。
+官方設計裡，每個 task 是 durable queue 裡的一筆可查詢記錄，每個 handoff/comment 都是可讀寫的 durable row。dispatcher 會定期掃任務，依 assignee profile 產生 worker。
 
 這個設計很符合：
 
@@ -230,4 +230,3 @@ Company Brain = long-term query / learning / operating memory layer
    - 是否可批准進入 memory
 
 這樣可以驗證 agent-first 架構，而不急著把 agent 放出去做大事。
-

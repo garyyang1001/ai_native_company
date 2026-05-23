@@ -1,13 +1,19 @@
+import os
 import unittest
 import threading
 from urllib.request import urlopen
 
 from closed_loop_kernel.http_app import build_demo_store, route_post, route_request, serve
+from tests.env_utils import enable_destructive_reset_for_test
 
 
 class HttpAppTests(unittest.TestCase):
     def setUp(self):
+        if not os.environ.get("KERNEL_DATABASE_URL"):
+            raise unittest.SkipTest("KERNEL_DATABASE_URL is required for PostgreSQL integration tests")
+        enable_destructive_reset_for_test(self)
         self.store = build_demo_store()
+        self.addCleanup(self.store.close)
 
     def test_routes_render_the_four_specified_views(self):
         for path, expected in [
@@ -83,6 +89,7 @@ class HttpAppTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+            server.kernel_store.close()
             thread.join(timeout=2)
 
 
