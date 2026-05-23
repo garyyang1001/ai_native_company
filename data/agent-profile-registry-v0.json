@@ -294,7 +294,7 @@
       "description": "依據 Brief 與關鍵字覆蓋策略生成文章草稿與社交媒體貼文草稿",
       "data_flow_policy": {
         "readable_inputs": ["content_brief"],
-        "writable_outputs": ["content_brief", "content_draft", "social_post_draft"],
+        "writable_outputs": ["content_draft", "social_post_draft"],
         "record_required": true,
         "machine_record_required": true,
         "source_refs_required": true,

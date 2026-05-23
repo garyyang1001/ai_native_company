@@ -1,13 +1,14 @@
 import unittest
 
-from closed_loop_kernel import KernelEngine, KernelStore
+from closed_loop_kernel import KernelEngine
 from closed_loop_kernel.views import render_approvals_view, render_event_detail_view, render_events_view, render_improvements_view
+from tests.postgres_test_utils import build_postgres_store
 
 
 class ViewTests(unittest.TestCase):
     def setUp(self):
-        self.store = KernelStore.in_memory()
-        self.store.initialize()
+        self.store = build_postgres_store()
+        self.addCleanup(self.store.close)
         self.engine = KernelEngine(self.store)
 
     def test_events_view_lists_lifecycle_and_failure_without_overwriting_history(self):

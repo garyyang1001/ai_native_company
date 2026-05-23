@@ -1,10 +1,15 @@
+import os
 import unittest
 
 from closed_loop_kernel.demo import run_demo
+from tests.env_utils import enable_destructive_reset_for_test
 
 
 class DemoTests(unittest.TestCase):
     def test_run_demo_returns_closed_loop_summary(self):
+        if not os.environ.get("KERNEL_DATABASE_URL"):
+            self.skipTest("KERNEL_DATABASE_URL is required for PostgreSQL integration tests")
+        enable_destructive_reset_for_test(self)
         summary = run_demo()
 
         self.assertEqual(summary["failed_attempt_status"], "failed")

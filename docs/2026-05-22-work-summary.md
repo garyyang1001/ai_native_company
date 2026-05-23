@@ -40,7 +40,7 @@ attempt started
 
 ### 2. 資料模型
 
-目前 prototype 用 SQLite 模擬 PostgreSQL 行為：
+原 2026-05-22 prototype 曾以本地檔案式資料庫模擬 PostgreSQL 行為；目前已正式以 PostgreSQL 作為 source of truth：
 
 - append-only lifecycle
 - attempts / failures / candidates / replays / approvals / artifacts
@@ -48,7 +48,7 @@ attempt started
 - 防止 update/delete 的 trigger
 - orphan lifecycle reconciliation
 
-另有 PostgreSQL DDL renderer，輸出對應 schema、FK、append-only trigger 與 orphan view。
+PostgreSQL DDL renderer 輸出對應 schema、FK、append-only trigger 與 orphan view；runtime store 應直接連線 PostgreSQL。
 
 ### 3. Sandbox / replay
 
@@ -197,4 +197,3 @@ agent-first
    - workspace artifacts
    - approval / failure / replay events
 5. 再做第一個小任務，而不是直接讓 agent 接大任務。
-

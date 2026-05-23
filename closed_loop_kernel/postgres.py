@@ -17,7 +17,8 @@ APPEND_ONLY_TABLES = [
 
 def _append_only_triggers() -> str:
     return "\n\n".join(
-        f"""CREATE TRIGGER trg_protect_{table}
+        f"""DROP TRIGGER IF EXISTS trg_protect_{table} ON {table};
+CREATE TRIGGER trg_protect_{table}
 BEFORE UPDATE OR DELETE ON {table}
 FOR EACH ROW EXECUTE FUNCTION prevent_mutation();"""
         for table in APPEND_ONLY_TABLES

@@ -1,58 +1,79 @@
 from __future__ import annotations
 
-import sqlite3
+import json
+import re
 import threading
+import uuid
 from contextlib import contextmanager
-from pathlib import Path
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Iterable
+
+from .postgres import render_postgres_schema
+
+RESET_CONFIRMATION = "drop-public-schema"
 
 
 class KernelStore:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn):
         self.conn = conn
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
         self._lock = threading.RLock()
 
     @classmethod
-    def in_memory(cls) -> "KernelStore":
-        return cls(sqlite3.connect(":memory:", check_same_thread=False))
-
-    @classmethod
-    def from_path(cls, path: str | Path) -> "KernelStore":
-        return cls(sqlite3.connect(str(path), check_same_thread=False))
+    def from_url(cls, url: str) -> "KernelStore":
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("KernelStore requires the optional 'psycopg' package") from exc
+        return cls(psycopg.connect(url, row_factory=dict_row))
 
     def initialize(self) -> None:
         with self._lock:
-            self.conn.executescript(SCHEMA_SQL)
+            self.conn.execute(render_postgres_schema())
             self.conn.commit()
+
+    def reset_for_test(self, *, confirm: str = "") -> None:
+        if confirm != RESET_CONFIRMATION:
+            raise RuntimeError("reset_for_test requires explicit destructive reset confirmation")
+        with self._lock:
+            self.conn.execute("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;")
+            self.conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self.conn.close()
 
     def execute(self, sql: str, params: Iterable[Any] | None = None) -> None:
         with self._lock:
-            self.conn.execute(sql, tuple(params or ()))
+            self.conn.execute(_postgres_sql(sql), _postgres_params(params))
             self.conn.commit()
 
     def fetch_all(self, sql: str, params: Iterable[Any] | None = None) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self.conn.execute(sql, tuple(params or ())).fetchall()
-        return [dict(row) for row in rows]
+            rows = self.conn.execute(_postgres_sql(sql), _postgres_params(params)).fetchall()
+        return [_normalize_row(row) for row in rows]
 
     def fetch_one(self, sql: str, params: Iterable[Any] | None = None) -> dict[str, Any] | None:
         with self._lock:
-            row = self.conn.execute(sql, tuple(params or ())).fetchone()
-        return dict(row) if row else None
+            row = self.conn.execute(_postgres_sql(sql), _postgres_params(params)).fetchone()
+        return _normalize_row(row) if row else None
 
     def scalar(self, sql: str, params: Iterable[Any] | None = None) -> Any:
         with self._lock:
-            row = self.conn.execute(sql, tuple(params or ())).fetchone()
-        return row[0] if row else None
+            row = self.conn.execute(_postgres_sql(sql), _postgres_params(params)).fetchone()
+        if not row:
+            return None
+        if isinstance(row, dict):
+            return _normalize_value(next(iter(row.values())))
+        return _normalize_value(row[0])
 
     @contextmanager
     def transaction(self):
         with self._lock:
+            tx = _PostgresTransaction(self.conn)
             try:
-                self.conn.execute("BEGIN")
-                yield self.conn
+                yield tx
             except Exception:
                 self.conn.rollback()
                 raise
@@ -60,187 +81,86 @@ class KernelStore:
                 self.conn.commit()
 
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS events (
-    id TEXT PRIMARY KEY,
-    event_type TEXT NOT NULL,
-    payload TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL
-);
+class _PostgresTransaction:
+    def __init__(self, conn):
+        self.conn = conn
 
-CREATE TABLE IF NOT EXISTS artifacts (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    artifact_type TEXT NOT NULL,
-    content TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    UNIQUE(name, version)
-);
+    def execute(self, sql: str, params: Iterable[Any] | None = None):
+        return self.conn.execute(_postgres_sql(sql), _postgres_params(params))
 
-CREATE TABLE IF NOT EXISTS policy_gates (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    rule_definition TEXT NOT NULL,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS attempt_lifecycle_events (
-    id TEXT PRIMARY KEY,
-    attempt_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('started', 'running', 'finished')),
-    metadata TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL
-);
+def _postgres_sql(sql: str) -> str:
+    translated = _to_psycopg_placeholders(sql)
+    translated = re.sub(r"\bis_active\s*=\s*1\b", "is_active = TRUE", translated)
+    translated = re.sub(r"\bis_active\s*=\s*0\b", "is_active = FALSE", translated)
+    return translated
 
-CREATE TABLE IF NOT EXISTS attempts (
-    id TEXT PRIMARY KEY,
-    event_id TEXT REFERENCES events(id),
-    status TEXT NOT NULL CHECK (status IN ('success', 'failed')),
-    input TEXT NOT NULL,
-    output TEXT,
-    error_message TEXT,
-    created_at TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS decisions (
-    id TEXT PRIMARY KEY,
-    attempt_id TEXT NOT NULL REFERENCES attempts(id),
-    gate_id TEXT REFERENCES policy_gates(id),
-    decision_maker TEXT NOT NULL,
-    action_taken TEXT NOT NULL CHECK (action_taken IN ('allowed', 'blocked', 'approval_requested')),
-    reason TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
+def _postgres_params(params: Iterable[Any] | None) -> tuple[Any, ...]:
+    return tuple(_postgres_param(param) for param in (params or ()))
 
-CREATE TABLE IF NOT EXISTS tool_calls (
-    id TEXT PRIMARY KEY,
-    attempt_id TEXT NOT NULL REFERENCES attempts(id),
-    tool_name TEXT NOT NULL,
-    arguments TEXT NOT NULL,
-    result TEXT,
-    status TEXT NOT NULL CHECK (status IN ('success', 'failed')),
-    error_message TEXT,
-    created_at TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS failures (
-    id TEXT PRIMARY KEY,
-    attempt_id TEXT NOT NULL REFERENCES attempts(id),
-    failure_type TEXT NOT NULL,
-    context TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('open', 'analyzing', 'proposed', 'resolved', 'ignored')),
-    created_at TEXT NOT NULL
-);
+def _postgres_param(param: Any) -> Any:
+    if isinstance(param, JsonParam):
+        parsed = json.loads(param.value)
+        try:
+            from psycopg.types.json import Json
+        except ModuleNotFoundError:
+            return parsed
+        return Json(parsed)
+    if not isinstance(param, str):
+        return param
+    return param
 
-CREATE TABLE IF NOT EXISTS improvement_candidates (
-    id TEXT PRIMARY KEY,
-    failure_id TEXT NOT NULL REFERENCES failures(id),
-    target_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
-    target_artifact_name TEXT NOT NULL,
-    target_artifact_type TEXT NOT NULL,
-    target_artifact_version INTEGER NOT NULL,
-    base_artifact_hash TEXT NOT NULL,
-    patch_type TEXT NOT NULL,
-    proposed_content TEXT NOT NULL,
-    validation_assertions TEXT NOT NULL,
-    rollback_plan TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('draft', 'sandbox_verified', 'approved', 'rejected', 'applied')),
-    created_at TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS replays (
-    id TEXT PRIMARY KEY,
-    candidate_id TEXT NOT NULL REFERENCES improvement_candidates(id),
-    status TEXT NOT NULL CHECK (status IN ('success', 'failed')),
-    validation_results TEXT NOT NULL,
-    sandbox_schema TEXT,
-    sandbox_env TEXT,
-    error_message TEXT,
-    created_at TEXT NOT NULL
-);
+def _normalize_row(row) -> dict[str, Any]:
+    return {key: _normalize_value(value) for key, value in dict(row).items()}
 
-CREATE TABLE IF NOT EXISTS approvals (
-    id TEXT PRIMARY KEY,
-    candidate_id TEXT NOT NULL REFERENCES improvement_candidates(id),
-    approved_by TEXT NOT NULL,
-    decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
-    comments TEXT,
-    created_at TEXT NOT NULL
-);
 
-CREATE TRIGGER IF NOT EXISTS trg_events_no_update
-BEFORE UPDATE ON events
-BEGIN
-    SELECT RAISE(ABORT, 'events is append-only');
-END;
+def _normalize_value(value: Any) -> Any:
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
 
-CREATE TRIGGER IF NOT EXISTS trg_events_no_delete
-BEFORE DELETE ON events
-BEGIN
-    SELECT RAISE(ABORT, 'events is append-only');
-END;
 
-CREATE TRIGGER IF NOT EXISTS trg_attempt_lifecycle_no_update
-BEFORE UPDATE ON attempt_lifecycle_events
-BEGIN
-    SELECT RAISE(ABORT, 'attempt_lifecycle_events is append-only');
-END;
+def _to_psycopg_placeholders(sql: str) -> str:
+    result = []
+    in_single_quote = False
+    in_double_quote = False
+    escape_next = False
 
-CREATE TRIGGER IF NOT EXISTS trg_attempt_lifecycle_no_delete
-BEFORE DELETE ON attempt_lifecycle_events
-BEGIN
-    SELECT RAISE(ABORT, 'attempt_lifecycle_events is append-only');
-END;
+    for char in sql:
+        if escape_next:
+            result.append(char)
+            escape_next = False
+            continue
+        if char == "\\":
+            result.append(char)
+            escape_next = True
+            continue
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            result.append(char)
+            continue
+        if char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            result.append(char)
+            continue
+        if char == "?" and not in_single_quote and not in_double_quote:
+            result.append("%s")
+            continue
+        result.append(char)
+    return "".join(result)
 
-CREATE TRIGGER IF NOT EXISTS trg_attempts_no_update
-BEFORE UPDATE ON attempts
-BEGIN
-    SELECT RAISE(ABORT, 'attempts is append-only');
-END;
 
-CREATE TRIGGER IF NOT EXISTS trg_attempts_no_delete
-BEFORE DELETE ON attempts
-BEGIN
-    SELECT RAISE(ABORT, 'attempts is append-only');
-END;
+@dataclass(frozen=True)
+class JsonParam:
+    value: str
 
-CREATE TRIGGER IF NOT EXISTS trg_tool_calls_no_update
-BEFORE UPDATE ON tool_calls
-BEGIN
-    SELECT RAISE(ABORT, 'tool_calls is append-only');
-END;
 
-CREATE TRIGGER IF NOT EXISTS trg_tool_calls_no_delete
-BEFORE DELETE ON tool_calls
-BEGIN
-    SELECT RAISE(ABORT, 'tool_calls is append-only');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_decisions_no_update
-BEFORE UPDATE ON decisions
-BEGIN
-    SELECT RAISE(ABORT, 'decisions is append-only');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_decisions_no_delete
-BEFORE DELETE ON decisions
-BEGIN
-    SELECT RAISE(ABORT, 'decisions is append-only');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_approvals_no_update
-BEFORE UPDATE ON approvals
-BEGIN
-    SELECT RAISE(ABORT, 'approvals is append-only');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_approvals_no_delete
-BEFORE DELETE ON approvals
-BEGIN
-    SELECT RAISE(ABORT, 'approvals is append-only');
-END;
-"""
+def json_param(value: Any) -> JsonParam:
+    return JsonParam(json.dumps(value, ensure_ascii=False, sort_keys=True))
