@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from pathlib import Path
 
 
@@ -32,6 +34,73 @@ REQUIRED_ENVELOPE_FIELDS = [
     "retention_policy",
     "machine_record",
 ]
+
+SECRET_SCAN_IGNORED_KEYS = {
+    "content_hash",
+    "created_at",
+    "updated_at",
+    "reviewed_at",
+    "verified_at",
+    "approved_at",
+}
+
+SECRET_PATTERNS = [
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"sk-proj-[0-9A-Za-z_-]{20,}"),
+    re.compile(r"sk-[0-9A-Za-z_-]{20,}"),
+    re.compile(r"ghp_[0-9A-Za-z_]{20,}"),
+    re.compile(r"github_pat_[0-9A-Za-z_]{20,}"),
+    re.compile(r"xox[baprs]-[0-9A-Za-z-]{20,}"),
+    re.compile(r"https://hooks\.slack\.com/services/[0-9A-Za-z/_-]{20,}"),
+    re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"),
+]
+
+HIGH_ENTROPY_CANDIDATE = re.compile(r"\b[0-9A-Za-z_+/=-]{32,}\b")
+HEX_HASH_VALUE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{32,128}$")
+
+
+def _shannon_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    length = len(value)
+    return -sum((value.count(char) / length) * math.log2(value.count(char) / length) for char in set(value))
+
+
+def _looks_like_high_entropy_secret(value: str) -> bool:
+    normalized = value.strip()
+    if HEX_HASH_VALUE.fullmatch(normalized):
+        return False
+    for candidate in HIGH_ENTROPY_CANDIDATE.findall(value):
+        compact = candidate.strip("=")
+        if len(compact) < 32:
+            continue
+        if HEX_HASH_VALUE.fullmatch(compact):
+            continue
+        if _shannon_entropy(compact) >= 4.2:
+            return True
+    return False
+
+
+def _contains_potential_credential(value: str) -> bool:
+    return any(pattern.search(value) for pattern in SECRET_PATTERNS) or _looks_like_high_entropy_secret(value)
+
+
+def _iter_scannable_strings(value, parent_key: str | None = None):
+    if parent_key in SECRET_SCAN_IGNORED_KEYS:
+        return
+
+    if isinstance(value, str):
+        yield value
+        return
+
+    if isinstance(value, dict):
+        for key, child_value in value.items():
+            yield from _iter_scannable_strings(child_value, str(key))
+        return
+
+    if isinstance(value, list):
+        for child_value in value:
+            yield from _iter_scannable_strings(child_value, parent_key)
 
 
 class ProfileRegistryError(Exception):
@@ -106,6 +175,10 @@ class AgentProfileRegistry:
 
     def validate_output_envelope(self, profile_id: str, envelope: dict) -> None:
         """Validates a given agent output envelope structure against profile policies."""
+        for value in _iter_scannable_strings(envelope):
+            if _contains_potential_credential(value):
+                raise ProfileRegistryError("potential credential leak detected in output envelope")
+
         env_profile_id = envelope.get("profile_id")
         if env_profile_id != profile_id:
             raise ProfileRegistryError(

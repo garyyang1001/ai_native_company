@@ -1,39 +1,44 @@
 # OHYA SEO Architecture Snapshot
 
-Copied on: 2026-05-22
+Redacted on: 2026-05-23
 
-Source:
+This reference is intentionally reduced to a public-safe architecture note.
+The original executable snapshot was removed from this public repository because
+it contained local paths, tool names, credential filenames, and operational
+details that are not needed for the Gary company kernel.
 
-```text
-/Volumes/Hermes System/HermesArchive/HermesRuntime/clients/ohya
-```
+## Public-Safe Reference
 
-This folder is a reference snapshot of OHYA's SEO agent architecture. It is here so the Gary repo can study and adapt the pattern for an AI-native SEO department.
+This file records only the reusable pattern:
 
-It is not a data migration and it is not meant to be executed directly.
+- A department coordinator assigns bounded work to profile-specific agents.
+- Profile agents produce durable task records, source references, artifact
+  references, and reviewable machine records.
+- Human approval gates sit before publishing, production writes, account changes,
+  or profile updates.
+- Generated artifacts and operational logs are not company memory by default.
+  They become memory candidates only after review, deduplication, scope
+  assignment, and cleanup eligibility checks.
+- Local paths, credential filenames, platform secrets, runtime databases, and
+  client-specific implementation details do not belong in a public reference.
 
-## Included
+## Removed From Git Tracking
 
-- Root agent instructions: `AGENT.md`, `SOUL.md`, `CLAUDE.md`, `README.md`
-- SEO swarm roster: `docs/swarm-roster.md`
-- Kanban workflow templates:
-  - `kanban/templates/new-article-swarm.template.md`
-  - `kanban/templates/audit-swarm.template.md`
-- SEO OS schema migrations: `data/seo-os/migrations/`
-- Shared helper code: `lib/`
-- SEO command scripts: `bin/`
-- Profile definitions only: `profiles/*/SOUL.md`
+The public repo no longer tracks the previous executable snapshot contents:
 
-## Excluded
-
-- Runtime sessions, logs, caches, profile homes, and memories
-- Kanban database files and generated task data
-- Credentials, auth files, tokens, and environment files
-- Generated SEO reports, article outputs, media assets, and backups
-- Virtual environments, package caches, and repository checkouts
+- command scripts
+- profile SOUL files
+- schema migrations
+- workflow templates
+- helper libraries
+- local runbooks
+- environment variable names
+- credential file paths
+- runtime database references
 
 ## Notes For Adaptation
 
-- OHYA-specific names, paths, WordPress details, and environment variable names remain in the copied files as reference material.
-- Before using this for Gary or 好事發生處, adapt the profiles, paths, policies, and database ownership model.
-- The useful pattern is the department shape: one coordinator, multiple profile workers, Kanban tasks, audit events, approval gates, and durable artifacts.
+- Use this only as a pattern note.
+- Do not restore client-specific files into this public repository.
+- If a richer reference is needed, keep it in a private workspace and publish only
+  redacted contracts or diagrams.

@@ -197,6 +197,29 @@ class AgentProfileRegistryTests(unittest.TestCase):
                 }
             )
 
+    def test_output_envelope_blocks_potential_credential_leaks(self):
+        registry = AgentProfileRegistry.from_path(REGISTRY_PATH)
+
+        with self.assertRaisesRegex(ProfileRegistryError, "potential credential leak detected"):
+            registry.validate_output_envelope(
+                "gsc-analyst",
+                {
+                    "task_id": "task_1",
+                    "run_id": "run_1",
+                    "profile_id": "gsc-analyst",
+                    "output_type": "gsc_opportunity_report",
+                    "source_refs": ["src_1"],
+                    "artifact_refs": ["artifact_1"],
+                    "content_hash": "sha256:abc",
+                    "created_at": "2026-05-23T00:00:00+08:00",
+                    "sensitivity": "internal",
+                    "retention_policy": "artifact_long_term",
+                    "machine_record": {
+                        "summary": "Potential leak: AIzaSyDUMMYDUMMYDUMMYDUMMYDUMMYDUMMYDUM"
+                    },
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
