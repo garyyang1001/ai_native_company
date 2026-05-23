@@ -216,24 +216,22 @@ class AgentProfileRegistry:
         """Validates separation of duties and profile role assignment isolation constraint rules."""
         operation = isolation.get("operation")
         if operation == "profile_update":
-            executor = isolation.get("executor_profile")
-            maintainer = isolation.get("maintainer_profile")
-            verifier = isolation.get("verifier_profile")
-            reviewer = isolation.get("reviewer_profile")
+            required_roles = [
+                "executor_profile",
+                "maintainer_profile",
+                "verifier_profile",
+                "reviewer_profile",
+            ]
+            missing_roles = [role_name for role_name in required_roles if not isolation.get(role_name)]
+            if missing_roles:
+                raise ProfileRegistryError(f"profile_update missing required role: {missing_roles[0]}")
 
-            if executor == reviewer:
+            if isolation["executor_profile"] == isolation["reviewer_profile"]:
                 raise ProfileRegistryError("self-review is not allowed: executor cannot review their own work")
 
-            roles = []
-            if maintainer:
-                roles.append(("maintainer_profile", maintainer))
-            if verifier:
-                roles.append(("verifier_profile", verifier))
-            if reviewer:
-                roles.append(("reviewer_profile", reviewer))
-
             seen_profiles = {}
-            for role_name, p_id in roles:
+            for role_name in required_roles:
+                p_id = isolation[role_name]
                 if p_id in seen_profiles:
                     raise ProfileRegistryError(
                         f"Duplicate assignment: '{p_id}' is assigned to both '{seen_profiles[p_id]}' and '{role_name}'"

@@ -197,6 +197,31 @@ class AgentProfileRegistryTests(unittest.TestCase):
                 }
             )
 
+        with self.assertRaisesRegex(ProfileRegistryError, "missing required role"):
+            registry.validate_role_isolation(
+                {
+                    "operation": "profile_update",
+                    "executor_profile": "gsc-analyst",
+                    "maintainer_profile": "profile-maintainer",
+                    "reviewer_profile": "reviewer",
+                    "approver": "human_dri:gary",
+                    "applier": "kernel-engine",
+                }
+            )
+
+        with self.assertRaisesRegex(ProfileRegistryError, "gsc-analyst"):
+            registry.validate_role_isolation(
+                {
+                    "operation": "profile_update",
+                    "executor_profile": "gsc-analyst",
+                    "maintainer_profile": "gsc-analyst",
+                    "verifier_profile": "sandbox-verifier",
+                    "reviewer_profile": "reviewer",
+                    "approver": "human_dri:gary",
+                    "applier": "kernel-engine",
+                }
+            )
+
     def test_output_envelope_blocks_potential_credential_leaks(self):
         registry = AgentProfileRegistry.from_path(REGISTRY_PATH)
 
