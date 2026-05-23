@@ -6,8 +6,8 @@
 
 ## 1. 核心狀態摘要 (Status Summary)
 
-*   **目前整體狀態**：`interactive-prototype-started` (本地 SQLite prototype、Python subprocess sandbox、PostgreSQL DDL renderer、HTTP UI 與 approve/reject action 第一批測試已通過；非正式生產部署級)
-*   **最近一次修改時間**：2026-05-22T16:04:57+08:00
+*   **目前整體狀態**：`postgres-prototype-landed` (PostgreSQL-backed KernelStore、Python subprocess sandbox、HTTP UI 與 approve/reject action 第一批測試已通過；非正式生產部署級)
+*   **最近一次修改時間**：2026-05-24T00:00:00+08:00
 *   **剩餘 Open Issues**：
     *   **Blocker/High**: 0
     *   **Deferred Medium/Low (已知風險)**: 3 (詳見 tracking/open-issues.md)
@@ -31,7 +31,7 @@
 | **研究自檢** | [research-findings.md](notes/research-findings.md) | 5 個真實、具體的外部技術來源與啟發 | `Reviewed` |
 | **研究自檢** | [self-review.md](notes/self-review.md) | 務實自檢、剔除自嗨詞、詳列 3 大殘留風險 | `Reviewed` |
 | **本地 prototype** | [PROTOTYPE.md](PROTOTYPE.md) | 本地可跑 prototype 範圍、命令與邊界 | `In Progress` |
-| **本地 prototype** | [closed_loop_kernel/](closed_loop_kernel/) | SQLite adapter 與核心 engine 初版 | `In Progress` |
+| **本地 prototype** | [closed_loop_kernel/](closed_loop_kernel/) | PostgreSQL store 與核心 engine 初版 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/postgres.py](closed_loop_kernel/postgres.py) | PostgreSQL DDL renderer 初版 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/sandbox.py](closed_loop_kernel/sandbox.py) | Python subprocess sandbox 初版 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/views.py](closed_loop_kernel/views.py) | 4 個最小 HTML views renderer 初版 | `In Progress` |
