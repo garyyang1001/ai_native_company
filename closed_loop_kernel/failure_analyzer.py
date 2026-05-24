@@ -201,6 +201,8 @@ class FailureAnalyzer:
         傳 run_sandbox=False 可以只提 candidate 不跑 sandbox（單元測試 / 不想動 sandbox 時用）。
         回傳：{processed, skipped, candidates, sandbox_passed, sandbox_failed}
         """
+        # 條件：failure 是 open，且沒有「仍活著」的 candidate（rejected / applied 不算活著）。
+        # 被 reject 的舊 candidate 仍留在表內供稽核，但不擋新 candidate 產生。
         rows = self.store.fetch_all(
             """
             SELECT f.id, f.attempt_id, f.failure_type, f.context, f.detected_by_agent_id,
@@ -209,7 +211,9 @@ class FailureAnalyzer:
             LEFT JOIN attempts a ON a.id = f.attempt_id
             WHERE f.status = 'open'
               AND NOT EXISTS (
-                  SELECT 1 FROM improvement_candidates c WHERE c.failure_id = f.id
+                  SELECT 1 FROM improvement_candidates c
+                  WHERE c.failure_id = f.id
+                    AND c.status NOT IN ('rejected', 'applied')
               )
             ORDER BY f.created_at ASC
             """
@@ -294,7 +298,9 @@ class FailureAnalyzer:
         patch_type = template["patch_type"]  # 依 spec/code-is-law-v0.md 第 4 節，主力是 code_patch
         ctx = _parse_json(failure["context"])
         error_excerpt = (ctx.get("error") or failure.get("error_message") or "(no error message)")[:300]
-        proposed_content = template["patch_template"].format(error=error_excerpt)
+        # 用 .replace 而不是 .format：template 內含 Python code dict literal（如 {'post_id': ...}），
+        # .format 會把它當成 placeholder 並 KeyError。
+        proposed_content = template["patch_template"].replace("{error}", error_excerpt)
         validation_assertions = {
             "summary": template["summary"],
             "source_failure_type": failure_type,

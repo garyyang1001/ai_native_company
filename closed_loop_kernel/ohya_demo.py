@@ -18,11 +18,14 @@ import sqlite3
 import time
 from pathlib import Path
 
+import uuid
+
+from .engine import KernelEngine
 from .event_reporter import EventReporter
 from .failure_analyzer import FailureAnalyzer
 from .ohya_approval_bot import OhyaApprovalBot, load_env, DEFAULT_ENV_PATH
 from .ohya_seed import seed_ohya
-from .store import KernelStore
+from .store import KernelStore, json_param
 
 
 DEMO_TASK_ID = "demo-ohya-cms-draft-failure-001"
@@ -84,6 +87,52 @@ def seed_demo_failure_into_kanban(kanban_db_path: str) -> dict:
         return {"task_id": DEMO_TASK_ID, "task_run_id": None, "seeded": False}
     finally:
         conn.close()
+
+
+def reject_candidate_with_meta_failure(
+    store: KernelStore,
+    candidate_id: str,
+    rejector: str,
+    reason: str,
+    meta_failure_payload: dict | None = None,
+) -> dict:
+    """
+    把一個錯誤方向的 candidate 拒掉，並寫一筆 meta_failure event 到 ohya_kernel
+    記錄「為什麼拒絕」+「kernel 自己的設計判斷錯誤」。
+
+    這實踐了 Gary 2026-05-24 的指示：「每一步都紀錄」— kernel 設計者自己的錯誤
+    判斷也是 kernel 運行中發生的事件，必須進稽核軌跡。
+    """
+    engine = KernelEngine(store)
+    candidate_before = store.fetch_one(
+        "SELECT id, patch_type, target_artifact_name, failure_id, status FROM improvement_candidates WHERE id = ?",
+        [candidate_id],
+    )
+    if not candidate_before:
+        raise ValueError(f"candidate not found: {candidate_id}")
+
+    approval_id = engine.reject_candidate(candidate_id, rejector, reason)
+
+    # 寫 meta_failure event：把這次「kernel 設計者的判斷錯誤」收進稽核軌跡
+    meta_payload = {
+        "candidate_id": candidate_id,
+        "approval_id": approval_id,
+        "rejector": rejector,
+        "reason": reason,
+        "candidate_snapshot": {
+            "patch_type": candidate_before["patch_type"],
+            "target_artifact_name": candidate_before["target_artifact_name"],
+            "failure_id": candidate_before["failure_id"],
+            "status_before_reject": candidate_before["status"],
+        },
+    }
+    if meta_failure_payload:
+        meta_payload["details"] = meta_failure_payload
+    store.execute(
+        "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, NOW())",
+        [str(uuid.uuid4()), "meta_failure", json_param(meta_payload)],
+    )
+    return {"approval_id": approval_id, "candidate_status_after": "rejected", "failure_reopened": True}
 
 
 def run_demo(
