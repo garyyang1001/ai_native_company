@@ -366,8 +366,9 @@ class KernelEngine:
 
     def validate_sql_patch(self, sql: str) -> None:
         normalized = re.sub(r"\s+", " ", sql.strip().lower())
-        if "public." in normalized or "truncate" in normalized or re.search(r"\bdrop\s+table\b", normalized):
-            raise SecurityError("SQL Lint Blocked: Forbidden keyword or public schema reference")
+        for pattern, reason in _SQL_LINT_FORBIDDEN_PATTERNS:
+            if re.search(pattern, normalized):
+                raise SecurityError(f"SQL Lint Blocked: {reason}")
 
     def validate_python_patch(self, source: str) -> None:
         from .sandbox import validate_python_source
@@ -397,3 +398,24 @@ def _failure_type(error_message: str | None) -> str:
     if not error_message:
         return "unknown"
     return error_message.split(":", 1)[0].strip() or "unknown"
+
+
+# SQL static lint 黑名單。每一條對應一個明確的 escape 風險。
+# 候選 SQL 是要在 sandbox_temp_xxxx schema、由 sandbox_runner 角色執行的；
+# 凡是能切回高權限、跨 schema 寫 production、或讀寫宿主檔案系統的語句都要在這裡擋下來。
+_SQL_LINT_FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
+    (r"\bpublic\.", "public schema references are not allowed in candidate SQL"),
+    (r"\btruncate\b", "TRUNCATE is not allowed in sandbox"),
+    (r"\bdrop\s+table\b", "DROP TABLE is not allowed in sandbox"),
+    (r"\bdrop\s+(?:schema|database)\b", "DROP SCHEMA/DATABASE is not allowed in sandbox"),
+    (r"\balter\s+system\b", "ALTER SYSTEM is not allowed in sandbox"),
+    (r"\breset\s+role\b", "RESET ROLE could escape sandbox role"),
+    (r"\bset\s+role\b", "SET ROLE could escape sandbox role"),
+    (r"\b(?:reset|set)\s+session\s+authorization\b", "SESSION AUTHORIZATION could escape sandbox role"),
+    (r"\bsecurity\s+definer\b", "SECURITY DEFINER functions could elevate privileges"),
+    (r"\b(?:create|alter|drop)\s+(?:role|user|group)\b", "ROLE/USER/GROUP management is not allowed in sandbox"),
+    (r"\bgrant\s+", "GRANT is not allowed in sandbox"),
+    (r"\brevoke\s+", "REVOKE is not allowed in sandbox"),
+    (r"(?:\A|;\s*)copy\b", "COPY statement could read/write host files"),
+    (r"\bpg_read_file\b|\bpg_read_binary_file\b|\bpg_ls_dir\b|\blo_import\b|\blo_export\b", "filesystem/largeobject functions are forbidden"),
+]
