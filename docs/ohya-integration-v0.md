@@ -3,7 +3,7 @@
 **對應路線**：`docs/hermes-integration-assessment-v0.md` 推薦的路線 A
 **目標客戶**：OHYA / 好事發生數位（Gary 確認兩者同一法人）
 **選此客戶理由**：是自家事業，做壞了不傷客戶；HermesRuntime 規模最大、事件最多樣
-**狀態**：階段 0-2 已完成；階段 3 進行中
+**狀態**：階段 0-2 已完成；階段 3 改為 profile-level slice，第一個驗證對象為 `cms-draft-executor`
 
 ---
 
@@ -129,6 +129,23 @@ result = reporter.sync()
 # result = {"events_imported": 7, "attempts_imported": 3, "failures_opened": 1, "last_event_id": 42}
 ```
 
+### 階段 3.1：OHYA 髒資料切片策略（2026-05-25）
+
+OHYA 資料量大且 kanban.db 已知有破損頁面，第一輪不再嘗試吃完整 OHYA。改成只接一個 profile：
+
+```python
+reporter = EventReporter(
+    kanban_db_path="/Volumes/Hermes System/HermesArchive/HermesRuntime/clients/ohya/kanban.db",
+    kernel_url="postgresql:///ohya_kernel",
+    tenant_default="ohya",
+    profile_filter="cms-draft-executor",
+)
+```
+
+白話意思：只把 `cms-draft-executor` 的任務執行紀錄匯入 kernel。其他 profile、壞 JSON、缺欄位、未完成 run、不支援 outcome，都會進 `skipped_rows`，不寫成正式 attempts。
+
+細節文件：[OHYA cms-draft-executor Slice v0](ohya-cms-draft-executor-slice-v0.md)。
+
 ### 主要職責
 
 1. **建立 kernel store 連線** — 用 KernelStore（已驗證會處理 commit / 不洩漏 idle TX）
@@ -142,7 +159,7 @@ result = reporter.sync()
 ### 容錯設計
 
 - kanban.db 整個讀不到（檔案不存在 / lock / 損毀 嚴重）→ EventReporter raise `KanbanUnavailable`，呼叫端決定要不要重試
-- 單筆 row 解析失敗 → log warning、跳過、繼續下一筆
+- 單筆 row 解析失敗 → 寫入 `skipped_rows` 與 `skipped_by_reason`、跳過、繼續下一筆
 - ohya_kernel 寫入失敗 → 整批 rollback、不更新 checkpoint（下次重試）
 - 重複 sync → 用 `task_events.id` 在 ohya_kernel `events.payload.kanban_event_id` 去重
 

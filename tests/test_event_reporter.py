@@ -205,6 +205,108 @@ class EventReporterTests(unittest.TestCase):
         self.assertEqual(ctx["tenant"], "ohya")
         self.assertEqual(ctx["kanban_task_id"], "task-4")
 
+    def test_profile_filter_imports_only_cms_draft_executor_slice(self):
+        reporter = EventReporter(
+            kanban_db_path=str(self.kanban_path),
+            kernel_url=os.environ["KERNEL_DATABASE_URL"],
+            tenant_default="ohya",
+            profile_filter="cms-draft-executor",
+        )
+
+        result = reporter.sync()
+
+        self.assertEqual(result.source_profile, "cms-draft-executor")
+        self.assertEqual(result.events_imported, 2)
+        self.assertEqual(result.attempts_imported, 1)
+        self.assertEqual(result.failures_opened, 0)
+        self.assertEqual(result.last_event_id, 5)
+        self.assertEqual(result.last_run_id, 3)
+        self.assertGreaterEqual(result.skipped_by_reason["profile_mismatch"], 1)
+
+        attempts = self.store.fetch_all("SELECT input FROM attempts")
+        self.assertEqual(len(attempts), 1)
+        payload = json.loads(attempts[0]["input"]) if isinstance(attempts[0]["input"], str) else attempts[0]["input"]
+        self.assertEqual(payload["profile"], "cms-draft-executor")
+        self.assertEqual(payload["kanban_task_id"], "task-1")
+
+        event_payloads = self.store.fetch_all(
+            "SELECT payload FROM events WHERE event_type LIKE ? ORDER BY created_at",
+            ["ohya_kanban_%"],
+        )
+        for event in event_payloads:
+            payload = json.loads(event["payload"]) if isinstance(event["payload"], str) else event["payload"]
+            self.assertEqual(payload["source_profile"], "cms-draft-executor")
+
+    def test_profile_slice_skips_bad_json_without_importing_dirty_attempt(self):
+        conn = sqlite3.connect(str(self.kanban_path))
+        cur = conn.cursor()
+        now = int(time.time())
+        cur.execute(
+            "INSERT INTO tasks (id, title, assignee, status, created_at, tenant) VALUES (?, ?, ?, ?, ?, ?)",
+            ("task-bad-json", "Bad JSON task", "cms-draft-executor", "done", now - 20, "ohya-test"),
+        )
+        cur.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at, error, summary, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("task-bad-json", "cms-draft-executor", "done", "completed", now - 19, now - 18, None, "dirty", "{bad-json"),
+        )
+        run_id = cur.lastrowid
+        cur.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("task-bad-json", run_id, "claimed", "{bad-json", now - 19),
+        )
+        conn.commit()
+        conn.close()
+
+        reporter = EventReporter(
+            kanban_db_path=str(self.kanban_path),
+            kernel_url=os.environ["KERNEL_DATABASE_URL"],
+            tenant_default="ohya",
+            profile_filter="cms-draft-executor",
+        )
+
+        result = reporter.sync()
+
+        self.assertEqual(result.skipped_by_reason["bad_json"], 2)
+        attempt_count = self.store.scalar("SELECT COUNT(*) FROM attempts")
+        self.assertEqual(attempt_count, 1)
+
+    def test_profile_slice_skips_incomplete_and_unsupported_runs(self):
+        conn = sqlite3.connect(str(self.kanban_path))
+        cur = conn.cursor()
+        now = int(time.time())
+        cur.executemany(
+            "INSERT INTO tasks (id, title, assignee, status, created_at, tenant) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("task-running", "Still running", "cms-draft-executor", "running", now - 30, "ohya-test"),
+                ("task-released", "Released task", "cms-draft-executor", "released", now - 20, "ohya-test"),
+            ],
+        )
+        cur.executemany(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at, error, summary, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("task-running", "cms-draft-executor", "running", None, now - 29, None, None, None, None),
+                ("task-released", "cms-draft-executor", "released", "released", now - 19, now - 18, None, None, None),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        reporter = EventReporter(
+            kanban_db_path=str(self.kanban_path),
+            kernel_url=os.environ["KERNEL_DATABASE_URL"],
+            tenant_default="ohya",
+            profile_filter="cms-draft-executor",
+        )
+
+        result = reporter.sync()
+
+        self.assertEqual(result.skipped_by_reason["missing_required_field"], 1)
+        self.assertEqual(result.skipped_by_reason["unsupported_outcome"], 1)
+        attempt_count = self.store.scalar("SELECT COUNT(*) FROM attempts")
+        self.assertEqual(attempt_count, 1)
+
     def test_missing_kanban_db_raises_unavailable(self):
         bad_reporter = EventReporter(
             kanban_db_path="/nonexistent/path/kanban.db",

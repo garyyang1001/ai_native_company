@@ -35,7 +35,9 @@ DEMO_TASK_PROFILE = "cms-draft-executor"
 
 def seed_demo_failure_into_kanban(kanban_db_path: str) -> dict:
     """
-    在修好的 kanban.db 塞一筆模擬失敗（cms-draft-executor crash on Zeabur timeout）。
+    在隔離 fixture kanban.db 塞一筆模擬失敗（cms-draft-executor crash on Zeabur timeout）。
+
+    這個 helper 只給測試 fixture / snapshot 用；不要指向 HermesRuntime live kanban.db。
     Idempotent：用固定 task_id 防重複。
     回傳寫入的 task_id / task_run_id。
     """
@@ -140,13 +142,21 @@ def run_demo(
     chat_id: int | None = None,
     env_path: Path = DEFAULT_ENV_PATH,
     skip_telegram: bool = False,
+    seed_fixture: bool = False,
 ) -> dict:
     kernel_url = _database_url()
     result: dict = {"steps": []}
 
-    # Step 1：塞 demo failure 到 kanban.db
-    seed_result = seed_demo_failure_into_kanban(kanban_db_path)
-    result["steps"].append({"step": "seed_demo_failure_into_kanban", "result": seed_result})
+    # Step 1：預設不寫入傳入的 kanban.db，避免污染 HermesRuntime live state。
+    if seed_fixture:
+        seed_result = seed_demo_failure_into_kanban(kanban_db_path)
+        result["steps"].append({"step": "seed_demo_failure_into_fixture_kanban", "result": seed_result})
+    else:
+        result["steps"].append({
+            "step": "seed_demo_failure_into_kanban",
+            "skipped": True,
+            "reason": "default read-only mode; pass --seed-fixture only for an isolated fixture DB",
+        })
 
     # Step 2：seed OHYA team + agents (idempotent)
     store = KernelStore.from_url(kernel_url)
@@ -155,16 +165,23 @@ def run_demo(
         result["steps"].append({"step": "seed_ohya_team_and_agents", "team_id": seed_meta["team_id"], "agent_count": len(seed_meta["agents"])})
 
         # Step 3：EventReporter sync from kanban → ohya_kernel
-        reporter = EventReporter(kanban_db_path=kanban_db_path, kernel_url=kernel_url, tenant_default="ohya")
+        reporter = EventReporter(
+            kanban_db_path=kanban_db_path,
+            kernel_url=kernel_url,
+            tenant_default="ohya",
+            profile_filter=DEMO_TASK_PROFILE,
+        )
         sync_result = reporter.sync()
         result["steps"].append({
             "step": "event_reporter_sync",
+            "source_profile": sync_result.source_profile,
             "events_imported": sync_result.events_imported,
             "attempts_imported": sync_result.attempts_imported,
             "failures_opened": sync_result.failures_opened,
             "last_event_id": sync_result.last_event_id,
             "last_run_id": sync_result.last_run_id,
             "skipped_rows": len(sync_result.skipped_rows),
+            "skipped_by_reason": sync_result.skipped_by_reason,
         })
 
         # Step 4：FailureAnalyzer 把 open failures 轉成 candidates
@@ -209,6 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("--chat-id", type=int, default=None, help="Gary's Telegram chat_id")
     parser.add_argument("--env", default=str(DEFAULT_ENV_PATH))
     parser.add_argument("--skip-telegram", action="store_true", help="run pipeline without pushing to Telegram")
+    parser.add_argument("--seed-fixture", action="store_true", help="write demo failure only into an isolated fixture DB")
     args = parser.parse_args()
 
     result = run_demo(
@@ -216,5 +234,6 @@ if __name__ == "__main__":
         chat_id=args.chat_id,
         env_path=Path(args.env),
         skip_telegram=args.skip_telegram,
+        seed_fixture=args.seed_fixture,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

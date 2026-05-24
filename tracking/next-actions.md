@@ -14,9 +14,10 @@
     *   ~~`KernelEngine.replay_sql_candidate` 串接 SqlSandbox，並把 Scenario 1 轉成可重跑 script。~~ **(已完成 2026-05-24)** `closed_loop_kernel/engine.py` 新增 `replay_sql_candidate`；`closed_loop_kernel/sql_demo.py` 跑完整閉環（fail → propose → sandbox replay → approve → apply → retry success）並有對應測試。
     *   ~~demo/http_app 目前每次啟動都會 `DROP SCHEMA public CASCADE`；後續要設計可重啟保留狀態的 demo 流程。~~ **(已完成 2026-05-24)** `http_app` 拆成 `serve`（預設、不 reset）/ `seed` / `seed-and-serve` 三個 subcommand；新增 `open_store()` 與 `seed_demo_store()`；順手修了 `KernelStore` 讀方法不 commit 造成連線停在 "idle in transaction" 的 pre-existing bug。
     *   ~~`views.py` / `http_app.py` 目前只認得 `code_patch`；要把 `sql_patch` 在 `/improvements` 與 `/approvals` 頁面以可讀方式呈現（含 sandbox_schema、replay rows 摘要）。~~ **(已完成 2026-05-24)** `_patch_label` 加 `sql_patch → "SQL 修正"`；`/improvements` 表格新增「沙盒 schema」欄；`/approvals` 卡片顯示 patch_type 標籤、隔離 schema、replay row count 與第一筆樣本 JSON。
+    *   **OHYA production slice 改用 `cms-draft-executor`**：不碰 Daguantech 客戶資料；第一輪只接 OHYA 的單一 profile，`EventReporter(profile_filter="cms-draft-executor")` 會把其他 profile、壞 JSON、缺欄位、未完成 run、不支援 outcome 全部放進 `skipped_rows`，避免髒資料污染 kernel。
     *   產線階段升級：把 SqlSandbox 從 `SET LOCAL ROLE` 改成獨立 `psycopg.connect(user=sandbox_runner)` 物理連線（需設定 trust auth 或 password）。
 *   **是否需要 Gary 決策**：**原型代碼編寫不需再進行架構面重大決策。但只要涉及生產環境資料庫異動、真實代碼檔案部署、launchd 系統服務配置、或外部通訊/通知發送（如 Slack/Email 等），仍必須經過 Gary 明確審批授權（Explicit Approval）後方可執行。**
-*   **是否可以進入實作**：已進入本地 prototype 實作，Phase 1-3 與 Scenario 1/2 端到端 demo 均已落地；下一步聚焦 demo/http_app 可重啟、UI 加上 `sql_patch` 顯示路徑，與 production-grade sandbox_runner 物理連線升級（後者需 Gary 在配 trust auth / password 時參與）。
+*   **是否可以進入實作**：已進入本地 prototype 實作，Phase 1-5 與 OHYA `cms-draft-executor` profile slice 均已落地在程式層；下一步聚焦用隔離 snapshot 跑 OHYA slice，而不是直接寫 live kanban.db。
 
 ---
 

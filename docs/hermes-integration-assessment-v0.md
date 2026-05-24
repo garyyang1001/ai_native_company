@@ -394,20 +394,23 @@ flowchart TB
 
 ## 7. 落地路線
 
-### 路線 A：先接一個客戶試水（1-2 週）
+### 路線 A：先接一個可控自家 profile 試水（1-2 週）
 
-**選 Daguantech** 當第一個試點。理由：
-- 真客戶、有 Kinsta WordPress（外部系統可監控）
-- 有 8 agents 已運營（會持續產生事件）
-- 有 GSC tools / Telegram bot（容易掛 webhook）
-- AGENTS.md 文件齊全，交接順暢
+**2026-05-25 更新**：不拿 Daguantech 當第一個試點，因為那是客戶資料。第一輪改用 OHYA 自家資料，但只抓 `cms-draft-executor` 這一個 profile，避免整個 OHYA 髒資料直接污染 kernel。
+
+選 OHYA `cms-draft-executor` 的理由：
+- 是自家事業 / 關係資料，風險比客戶資料低
+- 這個 profile 會碰 CMS draft 發布，容易驗證「失敗 → 修正 → sandbox → Gary 批准」
+- OHYA 資料很髒，剛好可以驗證 dirty-row 隔離策略
+- 範圍只限單一 profile，不一次吃下整個 OHYA
 
 具體步驟：
-1. 開一個新的 PostgreSQL DB `customer_daguantech`
+1. 使用既有 PostgreSQL DB `ohya_kernel`
 2. 跑 `closed_loop_kernel.store.initialize()` 建 11 張表
-3. 在 `Daguantech/hermes-client/` 加一個 `event_reporter.py`，把 kanban.db 的事件轉送到 customer_daguantech 的 Gary kernel
-4. 跑一個閉環 demo：「文章發布失敗（從 WP REST API 偵測） → 自動分析 → 改 schema → 試跑 → 你批准 → 部署」
-5. 你看完批准 UI 後決定要不要推下一個客戶
+3. 用 `EventReporter(profile_filter="cms-draft-executor")` 只匯入這個 profile 的 kanban 事件
+4. 把其他 profile、壞 JSON、缺欄位、未完成 run、不支援 outcome 全部放進 `skipped_rows`
+5. 跑一個閉環 demo：「CMS draft 發布失敗 → failure → candidate → sandbox replay → 你批准 → apply」
+6. 你看完批准 UI 後決定要不要擴到下一個 OHYA profile
 
 **這條路線不動 HermesRuntime 主體**，風險最小。
 
@@ -476,7 +479,7 @@ agent #1 報告：
 2. 同步把這份評估文件 commit 到 `Gary/docs/` 並更新 `tracking/status.md` 受追蹤清單
 
 **中期（1-2 週）**：
-3. 跑路線 A — 接 Daguantech 試水
+3. 跑路線 A — 接 OHYA `cms-draft-executor` profile slice 試水
 4. 把整合過程中發現的 Gary kernel schema 不足之處補上
 
 **長期（1-3 個月，由 A 的結果決定）**：
