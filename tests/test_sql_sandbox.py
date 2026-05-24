@@ -2,7 +2,8 @@ import os
 import threading
 import unittest
 
-from closed_loop_kernel import SqlSandbox
+from closed_loop_kernel import KernelEngine, SecurityError, SqlSandbox
+from tests.postgres_test_utils import build_postgres_store
 
 
 def _skip_unless_postgres_available():
@@ -131,6 +132,121 @@ class SqlSandboxTests(unittest.TestCase):
                 )
                 leftover = [row[0] for row in cur.fetchall()]
         self.assertEqual(leftover, [], f"these schemas leaked: {leftover!r}")
+
+
+class ReplaySqlCandidateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        _skip_unless_postgres_available()
+        cls.admin_url = os.environ["KERNEL_DATABASE_URL"]
+        cls.sandbox = SqlSandbox(cls.admin_url, runner_role="sandbox_runner_test")
+        cls.sandbox.ensure_role()
+
+    def setUp(self):
+        # 每個 test 都跑 reset_for_test 確保 kernel 資料表乾淨；
+        # 注意：reset 會 DROP SCHEMA public，所以 sandbox_runner 之前對 public 的 REVOKE 也跟著沒了，
+        # 必須重跑 ensure_role 把權限狀態裝回來。
+        self.store = build_postgres_store()
+        self.addCleanup(self.store.close)
+        self.engine = KernelEngine(self.store)
+        self.sandbox.ensure_role()
+
+    def _seed_candidate(self, proposed_sql: str, validation_assertions: dict) -> str:
+        artifact_id = self.engine.create_artifact(
+            "text_to_sql.prompts.documents",
+            "sql",
+            "-- placeholder original SQL",
+        )
+        failure_id = self.engine.create_failure_for_test("relation_does_not_exist")
+        return self.engine.propose_improvement(
+            failure_id,
+            artifact_id,
+            "sql_patch",
+            proposed_sql,
+            validation_assertions,
+            {"restore_artifact_id": artifact_id},
+        )
+
+    def test_replay_sql_candidate_marks_sandbox_verified_on_success(self):
+        candidate_id = self._seed_candidate(
+            "SELECT id, name FROM local_docs ORDER BY id",
+            validation_assertions={"expected_row_count": 2, "expected_result": [[1, "alice"], [2, "bob"]]},
+        )
+
+        replay_id = self.engine.replay_sql_candidate(
+            candidate_id,
+            self.sandbox,
+            setup_sql="CREATE TABLE local_docs (id int, name text); INSERT INTO local_docs VALUES (1, 'alice'), (2, 'bob');",
+        )
+
+        replay = self.store.fetch_one("SELECT * FROM replays WHERE id = ?", [replay_id])
+        self.assertEqual(replay["status"], "success", replay.get("error_message"))
+        self.assertTrue(replay["sandbox_schema"].startswith("sandbox_temp_"))
+        self.assertEqual(
+            self.store.scalar("SELECT status FROM improvement_candidates WHERE id = ?", [candidate_id]),
+            "sandbox_verified",
+        )
+
+    def test_replay_sql_candidate_records_failure_when_assertion_violated(self):
+        candidate_id = self._seed_candidate(
+            "SELECT id FROM local_docs",
+            validation_assertions={"expected_row_count": 5},  # 但 setup 只塞 2 列
+        )
+
+        replay_id = self.engine.replay_sql_candidate(
+            candidate_id,
+            self.sandbox,
+            setup_sql="CREATE TABLE local_docs (id int); INSERT INTO local_docs VALUES (1), (2);",
+        )
+
+        replay = self.store.fetch_one("SELECT * FROM replays WHERE id = ?", [replay_id])
+        self.assertEqual(replay["status"], "failed")
+        self.assertIn("expected_row_count=5", replay["error_message"])
+        self.assertEqual(
+            self.store.scalar("SELECT status FROM improvement_candidates WHERE id = ?", [candidate_id]),
+            "draft",
+        )
+
+    def test_replay_sql_candidate_records_failure_when_replay_sql_errors(self):
+        candidate_id = self._seed_candidate(
+            "SELECT * FROM nonexistent_table",
+            validation_assertions={},
+        )
+
+        replay_id = self.engine.replay_sql_candidate(candidate_id, self.sandbox)
+
+        replay = self.store.fetch_one("SELECT * FROM replays WHERE id = ?", [replay_id])
+        self.assertEqual(replay["status"], "failed")
+        self.assertIn("does not exist", (replay["error_message"] or "").lower())
+        self.assertEqual(
+            self.store.scalar("SELECT status FROM improvement_candidates WHERE id = ?", [candidate_id]),
+            "draft",
+        )
+
+    def test_replay_sql_candidate_rejects_lint_violating_proposed_content(self):
+        candidate_id = self._seed_candidate(
+            "DROP TABLE public.attempts",
+            validation_assertions={},
+        )
+
+        with self.assertRaisesRegex(SecurityError, "SQL Lint Blocked"):
+            self.engine.replay_sql_candidate(candidate_id, self.sandbox)
+
+    def test_replay_sql_candidate_rejects_wrong_patch_type(self):
+        # 故意建立一個 code_patch candidate，再呼叫 sql replay 應該拒絕
+        artifact_id = self.engine.create_artifact("skill.foo", "python", "def foo():\n    return 1\n")
+        failure_id = self.engine.create_failure_for_test("AssertionError")
+        candidate_id = self.engine.propose_improvement(
+            failure_id,
+            artifact_id,
+            "code_patch",
+            "def foo():\n    return 2\n",
+            {},
+            {"restore_artifact_id": artifact_id},
+        )
+
+        with self.assertRaisesRegex(ValueError, "only supports sql_patch"):
+            self.engine.replay_sql_candidate(candidate_id, self.sandbox)
 
 
 if __name__ == "__main__":

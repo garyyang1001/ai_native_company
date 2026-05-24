@@ -200,6 +200,95 @@ class KernelEngine:
             self.store.execute("UPDATE improvement_candidates SET status = 'draft' WHERE id = ?", [candidate_id])
         return replay_id
 
+    def replay_sql_candidate(
+        self,
+        candidate_id: str,
+        sandbox: "Any",
+        setup_sql: str | None = None,
+    ) -> str:
+        """
+        在 SqlSandbox 內 replay 一個 `sql_patch` candidate。
+
+        流程：
+          1. 讀 candidate，確認 patch_type 為 `sql_patch`；
+          2. 對 proposed_content 過 SQL static lint 黑名單；
+          3. 開臨時 schema；可選地以 admin 身份跑 setup_sql（seed/CREATE 表用）；
+          4. 以 sandbox_runner 身份跑 proposed_content；
+          5. 比對 validation_assertions（expected_row_count / expected_result）；
+          6. 寫入 replays 並更新 candidate 狀態（成功 → sandbox_verified，失敗 → draft）。
+
+        參數 `sandbox` 接受任何符合 SqlSandbox 介面（`temp_schema()` context manager
+        + `run_as_runner(sql, schema)` method）的物件，以利測試替身。
+        """
+        candidate = self.store.fetch_one("SELECT * FROM improvement_candidates WHERE id = ?", [candidate_id])
+        if not candidate:
+            raise ValueError(f"candidate not found: {candidate_id}")
+        if candidate["patch_type"] != "sql_patch":
+            raise ValueError("replay_sql_candidate only supports sql_patch candidates")
+
+        # 只 lint 候選提供的 proposed_content；setup_sql 是引擎內部呼叫者傳入的
+        # 信任輸入（例如為了在 temp schema 內建測試表 + 種 seed data），可能合法
+        # 引用 public.* 以複製生產表結構，不適用 candidate lint。
+        self.validate_sql_patch(candidate["proposed_content"])
+
+        assertions = json.loads(candidate["validation_assertions"])
+
+        with sandbox.temp_schema() as schema:
+            if setup_sql:
+                setup_result = sandbox.run_as_runner(setup_sql, schema=schema)
+                if setup_result.status != "success":
+                    return self.record_replay(
+                        candidate_id,
+                        "failed",
+                        {
+                            "phase": "setup",
+                            "setup_sql": setup_sql,
+                            "schema": schema,
+                            "error": setup_result.error_message,
+                        },
+                        sandbox_schema=schema,
+                        sandbox_env={"sandbox_type": "sql-temp-schema"},
+                        error_message=setup_result.error_message,
+                    )
+
+            replay_result = sandbox.run_as_runner(candidate["proposed_content"], schema=schema)
+            rows = [list(row) if isinstance(row, tuple) else row for row in replay_result.rows]
+            validation_results = {
+                "phase": "replay",
+                "schema": schema,
+                "row_count": len(rows),
+                "rows": rows,
+            }
+
+            if replay_result.status != "success":
+                return self.record_replay(
+                    candidate_id,
+                    "failed",
+                    {**validation_results, "error": replay_result.error_message},
+                    sandbox_schema=schema,
+                    sandbox_env={"sandbox_type": "sql-temp-schema"},
+                    error_message=replay_result.error_message,
+                )
+
+            assertion_error = _check_sql_assertions(assertions, rows)
+            if assertion_error:
+                return self.record_replay(
+                    candidate_id,
+                    "failed",
+                    {**validation_results, "assertion_error": assertion_error},
+                    sandbox_schema=schema,
+                    sandbox_env={"sandbox_type": "sql-temp-schema"},
+                    error_message=assertion_error,
+                )
+
+            return self.record_replay(
+                candidate_id,
+                "success",
+                validation_results,
+                sandbox_schema=schema,
+                sandbox_env={"sandbox_type": "sql-temp-schema"},
+            )
+
     def replay_code_candidate(self, candidate_id: str, function_name: str, args: list[Any] | None = None) -> str:
         from .sandbox import PythonSandbox
 
@@ -398,6 +487,28 @@ def _failure_type(error_message: str | None) -> str:
     if not error_message:
         return "unknown"
     return error_message.split(":", 1)[0].strip() or "unknown"
+
+
+def _check_sql_assertions(assertions: dict[str, Any], rows: list[Any]) -> str | None:
+    """
+    驗證 SQL replay 結果是否符合 candidate.validation_assertions。
+    回傳 error message（不通過時）或 None（通過時）。
+    支援的 assertion key：
+      - expected_row_count: int
+      - expected_result: list[list[Any]]  完全匹配 rows
+    其餘 key 暫略過（forward-compat）。
+    """
+    if "expected_row_count" in assertions:
+        expected = assertions["expected_row_count"]
+        if len(rows) != expected:
+            return f"validation assertion failed: expected_row_count={expected}, got {len(rows)}"
+    if "expected_result" in assertions:
+        expected = assertions["expected_result"]
+        # 把 expected 內 tuple 化以便寬鬆比對（DB 回的是 tuple，rows 已 list 化）
+        normalized_expected = [list(row) for row in expected]
+        if rows != normalized_expected:
+            return f"validation assertion failed: expected_result={normalized_expected!r}, got {rows!r}"
+    return None
 
 
 # SQL static lint 黑名單。每一條對應一個明確的 escape 風險。
