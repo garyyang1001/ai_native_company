@@ -469,3 +469,37 @@
         *   `python3 -m closed_loop_kernel.sql_demo` 跑完 → `python3 -m closed_loop_kernel.http_app --port 8767`（serve 模式不 reset）→ `curl /improvements` 顯示 `SQL 修正` + `sandbox_temp_2565351890f4` 完整字串；`curl /events` 顯示 `已套用` / `批准` 等系統事件。 (結果：**PASS**)
 
 *   **第十五輪結論**：**PASS**。Phase 4 兩個剩餘子項中的 (b) 已收斂；UI 完整反映 SQL self-healing 跑完後的隔離證據。剩餘待辦只剩 (c)：把 `SqlSandbox` 從 `SET LOCAL ROLE` 升級為獨立物理連線（需 Gary 在配 trust auth / password 時參與）。
+
+---
+
+## 16. 第十六輪驗證檢驗 (Round 16 Verification - ISSUE-002 並行 apply Race Condition 修正)
+
+*   **驗證時間**：2026-05-24T17:00:00+08:00
+*   **檢驗人**：Claude (Opus 4.7) under Gary 自主開發授權
+*   **檢查項目與實體證據**：
+
+    本輪處理 `tracking/open-issues.md` 之 ISSUE-002。原本 `apply_candidate` 把 race condition 檢查放在 transaction 外，兩條獨立連線可能同時通過 hash 比對再各自寫入 v2，造成靜默覆蓋或雙 active row。
+
+    1.  **`apply_candidate` 重構**：
+        *   *實作檔案*：`closed_loop_kernel/engine.py`。
+        *   *變動*：
+            - 把 active artifact 的查詢搬進 `with self.store.transaction()`，使用 `SELECT ... FOR UPDATE` 取得 row-level lock；
+            - hash 比對也放進 transaction；不一致就 raise 內部 `_RaceCondition` sentinel；
+            - except 子句 rollback transaction、並在外面把 candidate 退回 `draft`；
+            - 同步順手用 `WHERE id = ?` 替代原本的 `WHERE name = ? AND is_active = TRUE` UPDATE 條件（更精確、避免在罕見情況下命中錯的列）。
+        *   *Spec 對齊*：`spec/event-flow-v0.md §4` 明文列出 `SELECT content_hash ... FOR UPDATE` 的序列：與此實作完全一致。 (結果：**PASS**)
+
+    2.  **並發測試**：
+        *   *測試檔案*：`tests/test_closed_loop_kernel.py::ClosedLoopKernelTests::test_concurrent_apply_against_same_artifact_serializes_via_row_lock`。
+        *   *方法*：建一個 v1 artifact + 兩個 candidate（base hash 都對到 v1）；兩個 thread 各開獨立 `KernelStore` 連線、用 `threading.Barrier` 同步進 apply。
+        *   *斷言*：兩個結果剛好一個 success / 一個 error；error 訊息含 `Race condition`；輸家 candidate 狀態為 `draft`；artifact 表最後恰好一個 is_active row、version=2。 (結果：**PASS**)
+
+    3.  **既有測試守門**：
+        *   `test_artifact_hash_mismatch_blocks_apply_and_keeps_candidate_draft`：sequential race 路徑（用 `force_replace_active_artifact_for_test` 模擬「審批期間另一個 agent 動了 artifact」）仍維持原本行為，未被新邏輯打破。
+        *   *完整測試*：`python3 -m unittest discover -s tests` → 64 tests run, 63 passed, 1 skipped。 (結果：**PASS**)
+
+    4.  **追蹤檔同步**：
+        *   `tracking/open-issues.md`：ISSUE-002 從 Deferred 區移到 Fixed History 區改名 `FIX-005`；Deferred 計數由 3 → 2。
+        *   `tracking/status.md`：剩餘 Open Issues 與硬性要求行同步調整為 2 個 deferred 風險。
+
+*   **第十六輪結論**：**PASS**。ISSUE-002 已實際關閉（從 Deferred 升級為 Fixed History 的 FIX-005）。原型階段剩 2 個 deferred Medium/Low 風險（ISSUE-001 SQL 沙盒資料狀態依賴 + ISSUE-003 自動斷言幻覺），兩者皆有具體緩解方案待產線階段引入。

@@ -10,8 +10,8 @@
 *   **最近一次修改時間**：2026-05-24T16:00:00+08:00
 *   **剩餘 Open Issues**：
     *   **Blocker/High**: 0
-    *   **Deferred Medium/Low (已知風險)**: 3 (詳見 tracking/open-issues.md)
-*   **是否符合 Gary 的硬性要求**：符合原型階段硬性要求；仍有 3 個 deferred Medium/Low 風險
+    *   **Deferred Medium/Low (已知風險)**: 2（原 3 已收斂 1：ISSUE-002 並行 apply race condition 已修為 FIX-005，詳見 tracking/open-issues.md）
+*   **是否符合 Gary 的硬性要求**：符合原型階段硬性要求；仍有 2 個 deferred Medium/Low 風險
 
 ---
 
