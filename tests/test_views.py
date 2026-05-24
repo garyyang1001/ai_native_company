@@ -57,6 +57,44 @@ class ViewTests(unittest.TestCase):
     def test_approvals_view_has_human_empty_state(self):
         self.assertIn("目前沒有待審核修正案", render_approvals_view(self.store))
 
+    def test_views_render_sql_patch_with_sandbox_schema_and_replay_sample(self):
+        # 建一個 sql_patch candidate 並手動寫一筆成功 replay（含 sandbox_schema + rows），
+        # 驗證 UI 呈現「SQL 修正」標籤、沙盒 schema、replay 樣本。
+        artifact_id = self.engine.create_artifact("text_to_sql.prompts.docs", "sql", "SELECT 1")
+        failure_id = self.engine.create_failure_for_test("relation_does_not_exist")
+        candidate_id = self.engine.propose_improvement(
+            failure_id,
+            artifact_id,
+            "sql_patch",
+            "SELECT d.title FROM documents d JOIN document_tags_mapping t ON d.id = t.document_id WHERE t.tag_name = 'Important'",
+            {"expected_row_count": 1},
+            {"restore_artifact_id": artifact_id},
+        )
+        self.engine.record_replay(
+            candidate_id,
+            "success",
+            {"phase": "replay", "schema": "sandbox_temp_abcdef123456", "row_count": 1, "rows": [["Q2 Strategy"]]},
+            sandbox_schema="sandbox_temp_abcdef123456",
+            sandbox_env={"sandbox_type": "sql-temp-schema"},
+        )
+
+        improvements = render_improvements_view(self.store)
+        approvals = render_approvals_view(self.store)
+
+        # /improvements 表格：新增了「沙盒 schema」欄，sql_patch 顯示中文標籤
+        self.assertIn("SQL 修正", improvements)
+        self.assertIn("沙盒 schema", improvements)
+        self.assertIn("sandbox_temp_abcdef123456", improvements)
+
+        # /approvals 卡片：含 patch_type 標籤 + sandbox schema + replay 樣本
+        self.assertIn("SQL 修正", approvals)
+        self.assertIn("sandbox_temp_abcdef123456", approvals)
+        self.assertIn("Replay 結果", approvals)
+        self.assertIn("Q2 Strategy", approvals)
+        # 由於 replay 成功且 candidate 已 sandbox_verified，按鈕應該是啟用的
+        self.assertIn("批准並套用", approvals)
+        self.assertNotIn("先完成 replay", approvals)
+
 
 if __name__ == "__main__":
     unittest.main()

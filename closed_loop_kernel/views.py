@@ -139,21 +139,29 @@ def _render_system_event_item(row: dict[str, str]) -> str:
 def render_improvements_view(store: KernelStore) -> str:
     candidates = store.fetch_all(
         """
-        SELECT c.id, c.target_artifact_name, c.patch_type, c.status, f.failure_type
+        SELECT c.id, c.target_artifact_name, c.patch_type, c.status, f.failure_type,
+               (SELECT r.sandbox_schema FROM replays r
+                WHERE r.candidate_id = c.id AND r.status = 'success'
+                ORDER BY r.created_at DESC LIMIT 1) AS sandbox_schema
         FROM improvement_candidates c
         JOIN failures f ON f.id = c.failure_id
         ORDER BY c.created_at
         """
     )
     items = "\n".join(
-        f"<tr><td>{escape(_short_id(row['id']))}</td><td>{escape(row['target_artifact_name'])}</td><td>{escape(_patch_label(row['patch_type']))}</td><td>{escape(row['failure_type'])}</td><td>{escape(_status_label(row['status']))}</td></tr>"
+        f"<tr><td>{escape(_short_id(row['id']))}</td>"
+        f"<td>{escape(row['target_artifact_name'])}</td>"
+        f"<td>{escape(_patch_label(row['patch_type']))}</td>"
+        f"<td>{escape(row['failure_type'])}</td>"
+        f"<td>{escape(_status_label(row['status']))}</td>"
+        f"<td>{escape(row.get('sandbox_schema') or '—')}</td></tr>"
         for row in candidates
     )
     return _page(
         "修正案",
         f"""
         <table>
-          <thead><tr><th>編號</th><th>目標</th><th>類型</th><th>錯誤</th><th>狀態</th></tr></thead>
+          <thead><tr><th>編號</th><th>目標</th><th>類型</th><th>錯誤</th><th>狀態</th><th>沙盒 schema</th></tr></thead>
           <tbody>{items}</tbody>
         </table>
         """,
@@ -163,17 +171,22 @@ def render_improvements_view(store: KernelStore) -> str:
 def render_approvals_view(store: KernelStore) -> str:
     candidates = store.fetch_all(
         """
-        SELECT c.id, c.target_artifact_name, c.status,
+        SELECT c.id, c.target_artifact_name, c.patch_type, c.status,
                EXISTS (
                    SELECT 1 FROM replays r
                    WHERE r.candidate_id = c.id AND r.status = 'success'
-               ) AS has_successful_replay
+               ) AS has_successful_replay,
+               (SELECT r.sandbox_schema FROM replays r
+                WHERE r.candidate_id = c.id AND r.status = 'success'
+                ORDER BY r.created_at DESC LIMIT 1) AS sandbox_schema,
+               (SELECT r.validation_results FROM replays r
+                WHERE r.candidate_id = c.id AND r.status = 'success'
+                ORDER BY r.created_at DESC LIMIT 1) AS validation_results
         FROM improvement_candidates c
         WHERE c.status IN ('draft', 'sandbox_verified')
         ORDER BY c.created_at
         """
     )
-    cards = []
     if not candidates:
         return _page(
             "等待審核",
@@ -184,6 +197,7 @@ def render_approvals_view(store: KernelStore) -> str:
             </section>
             """,
         )
+    cards = []
     for row in candidates:
         enabled = row["status"] == "sandbox_verified" and row["has_successful_replay"]
         if enabled:
@@ -197,17 +211,47 @@ def render_approvals_view(store: KernelStore) -> str:
             """
         else:
             button = "<button disabled>先完成 replay</button>"
+
+        sandbox_block = _render_sandbox_summary(row)
+
         cards.append(
             f"""
             <article>
               <h2>{escape(row['target_artifact_name'])}</h2>
-              <p>修正案：{escape(_short_id(row['id']))}</p>
+              <p>修正案：{escape(_short_id(row['id']))}（{escape(_patch_label(row['patch_type']))}）</p>
               <p>狀態：{escape(_status_label(row['status']))}</p>
+              {sandbox_block}
               {button}
             </article>
             """
         )
     return _page("等待審核", "\n".join(cards))
+
+
+def _render_sandbox_summary(row: dict) -> str:
+    """
+    把候選最近一次成功 replay 的隔離 schema 與資料樣本以人類可讀方式呈現。
+
+    對 sql_patch 候選：顯示「沙盒 schema: sandbox_temp_xxx」與「Replay 結果: N 列, 樣本: [...]」。
+    對其他類型（code_patch 等）：若 validation_results 含 sandbox 資訊也順便顯示，否則整段不渲染。
+    """
+    schema = row.get("sandbox_schema")
+    results = _loads(row.get("validation_results"))
+    if not schema and not results:
+        return ""
+    parts: list[str] = []
+    if schema:
+        parts.append(f"<p>沙盒 schema：<code>{escape(schema)}</code></p>")
+    rows = results.get("rows") if isinstance(results, dict) else None
+    row_count = results.get("row_count") if isinstance(results, dict) else None
+    if row_count is not None or rows is not None:
+        count_text = row_count if row_count is not None else (len(rows) if isinstance(rows, list) else "?")
+        sample_text = ""
+        if isinstance(rows, list) and rows:
+            sample = rows[0] if len(rows) == 1 else rows[:3]
+            sample_text = f"，樣本 <code>{escape(json.dumps(sample, ensure_ascii=False))}</code>"
+        parts.append(f"<p>Replay 結果：{escape(str(count_text))} 列{sample_text}</p>")
+    return "".join(parts)
 
 
 def _page(title: str, body: str) -> str:
@@ -294,6 +338,7 @@ def _patch_label(value: str) -> str:
         "code_patch": "程式修正",
         "prompt_update": "Prompt 修正",
         "db_migration": "資料庫修正",
+        "sql_patch": "SQL 修正",
     }.get(value, value)
 
 
