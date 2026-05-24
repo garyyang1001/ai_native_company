@@ -15,7 +15,7 @@
 - `KernelEngine.replay_sql_candidate`：將 `SqlSandbox` 串入閉環。讀 `sql_patch` candidate → lint → 開臨時 schema → 可選跑 setup_sql → 以 sandbox_runner 跑 proposed_content → 比對 `expected_row_count` / `expected_result` → 寫 `replays` 並把 candidate 標 `sandbox_verified` / `draft`。
 - `closed_loop_kernel.sql_demo`：Scenario 1（SQL self-healing）可重跑端到端 demo。把錯的 SQL 失敗、提候選、sandbox replay、批准、套用、retry 成功完整跑一遍，輸出最終 attempts / candidate / failure / replay 狀態。
 - PostgreSQL DDL renderer：輸出 `pgcrypto`、核心 FK、append-only trigger、orphan view。
-- 最小 HTML UI：`/events`、`/events/:id`、`/improvements`、`/approvals` 已可透過本地 HTTP server 開啟。
+- 最小 HTML UI：`/events`、`/events/:id`、`/improvements`、`/approvals` 已可透過本地 HTTP server 開啟。`/improvements` 表格已含「沙盒 schema」欄、`/approvals` 卡片會顯示候選的 patch_type 標籤（程式修正 / SQL 修正 / Prompt 修正）、隔離 schema 與 replay rows 樣本。
 - `/approvals` 支援本地 `批准並套用` / `拒絕` POST action；approve 會套用 candidate，reject 會留下 rejected approval。
 - `closed_loop_kernel.demo`：可跑出 Scenario 2（Python 技能 patch）類型的本地閉環 demo。
 - `closed_loop_kernel.sql_demo`：可跑出 Scenario 1（SQL self-healing）類型的本地閉環 demo。

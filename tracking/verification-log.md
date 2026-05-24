@@ -440,3 +440,32 @@
         *   *完整測試*：`python3 -m unittest discover -s tests` → 62 tests run, 61 passed, 1 skipped（Linux-only 記憶體 rlimit）。 (結果：**PASS**)
 
 *   **第十四輪結論**：**PASS**。Phase 4 (a) 已收斂；Gary 可以重複 `python3 -m closed_loop_kernel.http_app` 而不丟歷史，要重置時改用 `seed` 或 `seed-and-serve` 子命令。剩餘 Phase 4 (b)（UI 加 `sql_patch` 顯示路徑）與 (c)（SqlSandbox 物理連線升級）保留作為下一輪。
+
+---
+
+## 15. 第十五輪驗證檢驗 (Round 15 Verification - UI sql_patch Display Path)
+
+*   **驗證時間**：2026-05-24T16:00:00+08:00
+*   **檢驗人**：Claude (Opus 4.7) under Gary 自主開發授權
+*   **檢查項目與實體證據**：
+
+    本輪處理 Phase 4 (b)：把 SQL 自癒場景跑完後的隔離 schema 與 replay 樣本，在 `/improvements` 與 `/approvals` 頁面以人類可讀方式呈現。
+
+    1.  **`_patch_label` 補 `sql_patch`**：
+        *   *實作檔案*：`closed_loop_kernel/views.py`。
+        *   *變動*：`_patch_label` mapping 新增 `sql_patch → "SQL 修正"`，讓表格與卡片不再印 raw enum 字串。 (結果：**PASS**)
+
+    2.  **`/improvements` 表格新增「沙盒 schema」欄**：
+        *   *實作*：`render_improvements_view` 的 SQL 查詢加 scalar 子查詢，取每個 candidate 最近一次 `status='success'` replay 的 `sandbox_schema`；表頭與表格列同步加上一欄；無對應 replay 的 candidate（如 code_patch）顯示 em dash `—`。 (結果：**PASS**)
+
+    3.  **`/approvals` 卡片加 sandbox 摘要**：
+        *   *實作*：`render_approvals_view` 的 SQL 查詢同步擴充取 `sandbox_schema` 與 `validation_results`；新增 `_render_sandbox_summary` helper：顯示「沙盒 schema：`<code>...</code>`」與「Replay 結果：N 列，樣本 `<code>[...]</code>`」。candidate 卡片標題現在會顯示 patch_type 中文標籤（程式修正 / SQL 修正）。 (結果：**PASS**)
+
+    4.  **測試覆蓋**：
+        *   `tests/test_views.py::ViewTests::test_views_render_sql_patch_with_sandbox_schema_and_replay_sample`：建一個 sql_patch candidate、手動寫一筆成功 replay（含 sandbox_temp_abcdef123456 與 rows=[["Q2 Strategy"]]），驗證 `/improvements` 與 `/approvals` 兩個頁面都呈現新欄位、卡片按鈕在 sandbox_verified 狀態下解鎖。
+        *   *完整測試*：`python3 -m unittest discover -s tests` → 63 tests run, 62 passed, 1 skipped（Linux-only 記憶體 rlimit）。 (結果：**PASS**)
+
+    5.  **手動端到端驗證**：
+        *   `python3 -m closed_loop_kernel.sql_demo` 跑完 → `python3 -m closed_loop_kernel.http_app --port 8767`（serve 模式不 reset）→ `curl /improvements` 顯示 `SQL 修正` + `sandbox_temp_2565351890f4` 完整字串；`curl /events` 顯示 `已套用` / `批准` 等系統事件。 (結果：**PASS**)
+
+*   **第十五輪結論**：**PASS**。Phase 4 兩個剩餘子項中的 (b) 已收斂；UI 完整反映 SQL self-healing 跑完後的隔離證據。剩餘待辦只剩 (c)：把 `SqlSandbox` 從 `SET LOCAL ROLE` 升級為獨立物理連線（需 Gary 在配 trust auth / password 時參與）。
