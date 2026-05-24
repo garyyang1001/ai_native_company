@@ -6,8 +6,8 @@
 
 ## 1. 核心狀態摘要 (Status Summary)
 
-*   **目前整體狀態**：`postgres-prototype-landed` (PostgreSQL-backed KernelStore（讀方法已修 commit、不再洩漏 idle TX）、Python subprocess sandbox（POSIX rlimit + isolated mode + 環境隔離）、SQL DDL sandbox（`sandbox_runner` 低權限角色 + 動態 `sandbox_temp_*` schema + 並發測試 + `KernelEngine.replay_sql_candidate` 已串入）、SQL static lint（含角色逃逸與宿主 I/O 黑名單）、HTTP UI 與 approve/reject action、`http_app` 拆分為 serve/seed/seed-and-serve subcommand、UI `/improvements` 與 `/approvals` 已支援 `sql_patch` 候選的沙盒 schema 與 replay 樣本顯示、Scenario 1 與 Scenario 2 兩個閉環 demo 皆可重跑；非正式生產部署級)
-*   **最近一次修改時間**：2026-05-24T16:00:00+08:00
+*   **目前整體狀態**：`postgres-prototype-landed-awaiting-hermes-integration-decision` (PostgreSQL-backed KernelStore（讀方法已修 commit、不再洩漏 idle TX）、Python subprocess sandbox（POSIX rlimit + isolated mode + 環境隔離）、SQL DDL sandbox（`sandbox_runner` 低權限角色 + 動態 `sandbox_temp_*` schema + 並發測試 + `KernelEngine.replay_sql_candidate` 已串入）、SQL static lint（含角色逃逸與宿主 I/O 黑名單）、HTTP UI 與 approve/reject action、`http_app` 拆分為 serve/seed/seed-and-serve subcommand、UI `/improvements` 與 `/approvals` 已支援 `sql_patch` 候選的沙盒 schema 與 replay 樣本顯示、Scenario 1 與 Scenario 2 兩個閉環 demo 皆可重跑；Hermes 整合評估 v0 已交付，等 Gary 決策路線 A/B/C；非正式生產部署級)
+*   **最近一次修改時間**：2026-05-24T17:00:00+08:00
 *   **剩餘 Open Issues**：
     *   **Blocker/High**: 0
     *   **Deferred Medium/Low (已知風險)**: 2（原 3 已收斂 1：ISSUE-002 並行 apply race condition 已修為 FIX-005，詳見 tracking/open-issues.md）
@@ -30,6 +30,7 @@
 | **研究自檢** | [source-alignment.md](notes/source-alignment.md) | YC 逐字稿概念對齊與玩具 Demo 陷阱剖析 | `Reviewed` |
 | **研究自檢** | [research-findings.md](notes/research-findings.md) | 5 個真實、具體的外部技術來源與啟發 | `Reviewed` |
 | **研究自檢** | [self-review.md](notes/self-review.md) | 務實自檢、剔除自嗨詞、詳列 3 大殘留風險 | `Reviewed` |
+| **整合評估** | [hermes-integration-assessment-v0.md](docs/hermes-integration-assessment-v0.md) | Hermes 10 個兄弟資料夾完整掃描、事業/客戶地圖、多租戶 FK 計畫、三條落地路線（2026-05-24） | `Awaiting Gary Decision` |
 | **本地 prototype** | [PROTOTYPE.md](PROTOTYPE.md) | 本地可跑 prototype 範圍、命令與邊界 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/](closed_loop_kernel/) | PostgreSQL store 與核心 engine 初版 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/postgres.py](closed_loop_kernel/postgres.py) | PostgreSQL DDL renderer 初版 | `In Progress` |
