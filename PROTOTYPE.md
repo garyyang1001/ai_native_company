@@ -28,17 +28,20 @@ export KERNEL_DATABASE_URL='postgresql://USER@HOST:PORT/DBNAME'
 python3 -m unittest discover -s tests
 
 export KERNEL_ALLOW_DESTRUCTIVE_RESET=1   # 必填；demo/http_app 啟動會重置目標 DB
-python3 -m closed_loop_kernel.demo
-python3 -m closed_loop_kernel.sql_demo
-python3 -m closed_loop_kernel.http_app
+python3 -m closed_loop_kernel.demo                 # Scenario 2 一次性 demo（會 reset）
+python3 -m closed_loop_kernel.sql_demo             # Scenario 1 一次性 demo（會 reset）
+python3 -m closed_loop_kernel.http_app             # 預設 serve；不 reset、保留歷史
+python3 -m closed_loop_kernel.http_app seed        # 只 reset + 種 Scenario 2 種子，不啟 server
+python3 -m closed_loop_kernel.http_app seed-and-serve   # reset + seed 再開 server（舊行為）
 ```
 
-執行 PostgreSQL-backed suite、demo 與 http_app 都需要 `KERNEL_DATABASE_URL`，且只能指向一次性測試資料庫；缺 `KERNEL_ALLOW_DESTRUCTIVE_RESET=1` 時 demo 與 http_app 會直接 abort。
+執行 PostgreSQL-backed suite、demo 與 http_app 都需要 `KERNEL_DATABASE_URL`，且只能指向一次性測試資料庫。`demo` / `sql_demo` / `http_app seed*` 模式都會 `DROP SCHEMA public CASCADE`，缺 `KERNEL_ALLOW_DESTRUCTIVE_RESET=1` 時會直接 abort；`http_app`（無 subcommand，預設 serve）不會 reset，可重複啟動而不丟歷史。
 
 ## 邊界
 
 - 本 prototype 已用 PostgreSQL 作為 source-of-truth；尚未硬化成 production runtime（單一連線 + 程序內 RLock 序列化所有查詢）。
-- demo 與 http_app 啟動會 `DROP SCHEMA public CASCADE` 並重建表，僅能指向一次性測試資料庫。
+- `demo` / `sql_demo` 啟動會 `DROP SCHEMA public CASCADE` 並重建表，僅能指向一次性測試資料庫。
+- `http_app` 預設改為 `serve` 模式（不 reset、保留歷史）；要重新種 demo 才需 `seed` 或 `seed-and-serve`（兩者均要求 `KERNEL_ALLOW_DESTRUCTIVE_RESET=1`）。
 - Python sandbox 已套用 POSIX `resource` 模組的 CPU / 記憶體 / 檔案寫入 / process 數 / core dump rlimit、isolated Python 模式與最小化環境變數；尚未引入 OS-level sandbox（如 macOS `sandbox-exec`、Linux seccomp / namespaces），跨平台 OS hardening 留待後續。
 - SQL sandbox 已具備 `sandbox_runner` 低權限角色與動態 `sandbox_temp_<uuid>` schema，並有 6 thread 並發測試覆蓋；`KernelEngine.replay_sql_candidate` 已串入，`closed_loop_kernel.sql_demo` 跑 Scenario 1 端到端通過。Prototype 沙盒走 `SET LOCAL ROLE` 隔離；產線階段建議升級為獨立 `psycopg.connect(user=sandbox_runner)` 物理連線。
 - HTML views 已接本地 HTTP server 與本地 approve/reject action；持久化由 PostgreSQL 提供，但 demo seed 路徑會重置目標 DB。

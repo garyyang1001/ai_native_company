@@ -410,3 +410,33 @@
         *   *完整測試*：`python3 -m unittest discover -s tests` → 60 tests run, 59 passed, 1 skipped（Linux-only 記憶體 rlimit）。 (結果：**PASS**)
 
 *   **第十三輪結論**：**PASS**。Phase 3 與 Phase 5 完整收斂；兩個 scenario 皆可重跑並有測試守門。Phase 4 剩餘工作：(a) demo/http_app seed-once 拆分避免每次 reset；(b) HTTP UI 加 `sql_patch` 顯示路徑；(c) 產線階段把 SqlSandbox 升級成獨立物理連線（需 Gary 在配 trust auth / password 時參與）。
+
+---
+
+## 14. 第十四輪驗證檢驗 (Round 14 Verification - http_app Subcommand Split & Store TX Leak Fix)
+
+*   **驗證時間**：2026-05-24T15:00:00+08:00
+*   **檢驗人**：Claude (Opus 4.7) under Gary 自主開發授權
+*   **檢查項目與實體證據**：
+
+    本輪處理 Phase 4 (a)：把 `http_app` 拆成「不 reset」與「reset + seed」兩條路徑，讓 Gary 多次重啟瀏覽器不會把歷史砍掉。過程順手發現並修正 `KernelStore` 一個 pre-existing 連線洩漏 bug。
+
+    1.  **`http_app` subcommand 拆分**：
+        *   *實作檔案*：`closed_loop_kernel/http_app.py`。
+        *   *新 API*：
+            - `seed_demo_store()`（從 `build_demo_store` 改名）：reset + 種 Scenario 2 種子，需 `KERNEL_ALLOW_DESTRUCTIVE_RESET=1`。
+            - `open_store()`：只連線、不 reset；`initialize()` 走 idempotent `CREATE TABLE IF NOT EXISTS`。
+            - `serve(host, port, *, with_seed=False)`：預設 `with_seed=False`，呼叫 `open_store`；`with_seed=True` 才走 `seed_demo_store`。
+        *   *CLI subcommand*：argparse 加 `mode` 位置參數，可選 `serve`（預設）/ `seed`（只重置不開 server）/ `seed-and-serve`（reset 後開 server，舊行為）。`--host` / `--port` 支援自訂。
+        *   *手動驗證*：`python3 -m closed_loop_kernel.http_app --help` 顯示新說明；`http_app seed` 印出 "Seeded ..."；`http_app`（無 arg）開 server 後 `curl /events` 回 200 + "(DB state preserved)" 提示。 (結果：**PASS**)
+
+    2.  **`KernelStore` 讀方法不再洩漏 idle 交易**：
+        *   *問題*：`scalar` / `fetch_one` / `fetch_all` 在 psycopg `autocommit=False` 下會隱式啟動一筆 SELECT TX，但讀完從不 commit。每呼叫一次連線就停在 `idle in transaction`；多用幾條連線同時打 DB 後，後續任何要 exclusive lock 的 DDL（例如 `DROP SCHEMA public CASCADE`）就會永久卡住。
+        *   *發現經緯*：新加的 `test_open_store_is_non_destructive` 同時用兩條連線 → 下一輪 `seed_demo_store` reset 被 lock 卡死；用 `pg_stat_activity` 看到 6 條 idle TX 連線。
+        *   *修法*：`scalar` / `fetch_one` / `fetch_all` 三個讀方法的 `with self._lock` block 結尾加 `self.conn.commit()`，把隱式 TX 關掉。`transaction()` 路徑不受影響（它走 `_PostgresTransaction.execute`，由 context manager 在 scope 結束時統一 commit / rollback）。 (結果：**PASS**)
+
+    3.  **測試覆蓋**：
+        *   `tests/test_http_app.py` 新增 `test_serve_without_seed_preserves_existing_state` 與 `test_open_store_is_non_destructive`，連同既有 7 個路由 / approval / favicon / real-server 測試一起跑：9 tests passed。
+        *   *完整測試*：`python3 -m unittest discover -s tests` → 62 tests run, 61 passed, 1 skipped（Linux-only 記憶體 rlimit）。 (結果：**PASS**)
+
+*   **第十四輪結論**：**PASS**。Phase 4 (a) 已收斂；Gary 可以重複 `python3 -m closed_loop_kernel.http_app` 而不丟歷史，要重置時改用 `seed` 或 `seed-and-serve` 子命令。剩餘 Phase 4 (b)（UI 加 `sql_patch` 顯示路徑）與 (c)（SqlSandbox 物理連線升級）保留作為下一輪。
