@@ -25,6 +25,7 @@
 | **核心規格** | [event-flow-v0.md](spec/event-flow-v0.md) | 唯增 lifecycle 與部署事件流 | `Reviewed` |
 | **核心規格** | [html-views-v0.md](spec/html-views-v0.md) | 4 個極簡 UI 畫面與按鈕安全阻斷 | `Reviewed` |
 | **核心規格** | [acceptance-criteria-v0.md](spec/acceptance-criteria-v0.md) | 6 項原型驗收指標與測試 Assertion | `Reviewed` |
+| **根本原則** | [code-is-law-v0.md](spec/code-is-law-v0.md) | Code is Law — control flow 必須由程式碼規範，prompt 只負責 task 內容（2026-05-24 OHYA demo 反省後確立） | `Reviewed` |
 | **驗證場景** | [sql-self-healing-v0.md](scenarios/sql-self-healing-v0.md) | Scenario 1: 中性文件庫 DDL Prompt 自癒 | `Reviewed` |
 | **驗證場景** | [agent-skill-patch-v0.md](scenarios/agent-skill-patch-v0.md) | Scenario 2: 非 SQL python helper 技能自癒 | `Reviewed` |
 | **研究自檢** | [source-alignment.md](notes/source-alignment.md) | YC 逐字稿概念對齊與玩具 Demo 陷阱剖析 | `Reviewed` |
