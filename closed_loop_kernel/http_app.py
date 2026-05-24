@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
@@ -18,7 +19,13 @@ class HttpResponse:
     body: str
 
 
-def build_demo_store() -> KernelStore:
+def seed_demo_store() -> KernelStore:
+    """
+    重置目標 DB 並塞入 Scenario 2 (code_patch) 種子資料。
+
+    需要 `KERNEL_ALLOW_DESTRUCTIVE_RESET=1`；會 `DROP SCHEMA public CASCADE` 後重建。
+    用途：第一次跑 prototype、或刻意要回到乾淨種子狀態時呼叫一次。
+    """
     store = KernelStore.from_url(_database_url())
     try:
         _reset_demo_database(store)
@@ -47,6 +54,22 @@ def build_demo_store() -> KernelStore:
             {"restore_artifact_id": artifact_id},
         )
         engine.replay_code_candidate(candidate_id, function_name="compute_score", args=[10, None])
+        return store
+    except Exception:
+        store.close()
+        raise
+
+
+def open_store() -> KernelStore:
+    """
+    只連線、不 reset；schema 不存在則建（CREATE TABLE IF NOT EXISTS 是 idempotent）。
+
+    用途：serve 模式下 Gary 想保留先前 demo 的歷史（含 SQL self-healing scenario 跑完
+    的記錄）；多次重啟 server 不會把過去 attempts / approvals 清掉。
+    """
+    store = KernelStore.from_url(_database_url())
+    try:
+        store.initialize()
         return store
     except Exception:
         store.close()
@@ -88,8 +111,14 @@ def route_post(store: KernelStore, path: str) -> HttpResponse:
     return HttpResponse(404, "text/html; charset=utf-8", "<h1>Not Found</h1>")
 
 
-def serve(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
-    store = build_demo_store()
+def serve(host: str = "127.0.0.1", port: int = 8765, *, with_seed: bool = False) -> ThreadingHTTPServer:
+    """
+    啟動 HTTP server。
+
+    預設 `with_seed=False`：不 reset，沿用 DB 既有狀態（如果 schema 不存在會自動建）。
+    `with_seed=True`：先 reset + 種 Scenario 2 demo 資料；需要 KERNEL_ALLOW_DESTRUCTIVE_RESET=1。
+    """
+    store = seed_demo_store() if with_seed else open_store()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
@@ -149,8 +178,42 @@ def _see_other(target: str, message: str) -> HttpResponse:
     )
 
 
-if __name__ == "__main__":
-    server = serve()
+def _main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Closed Loop Kernel prototype HTTP UI",
+        epilog=(
+            "modes:\n"
+            "  serve            (default) 啟動 server，不 reset DB；保留先前歷史。\n"
+            "  seed             只 reset + 種 Scenario 2 demo 資料，不啟動 server。\n"
+            "  seed-and-serve   reset + seed 後啟動 server；一次性重置 demo 場景。\n"
+            "  seed 與 seed-and-serve 都需要 KERNEL_ALLOW_DESTRUCTIVE_RESET=1。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("mode", nargs="?", default="serve", choices=["serve", "seed", "seed-and-serve"])
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+
+    if args.mode == "seed":
+        store = seed_demo_store()
+        try:
+            print("Seeded Scenario 2 demo data into KERNEL_DATABASE_URL.")
+        finally:
+            store.close()
+        return
+
+    with_seed = args.mode == "seed-and-serve"
+    server = serve(host=args.host, port=args.port, with_seed=with_seed)
     host, port = server.server_address
-    print(f"Closed Loop Kernel prototype UI: http://{host}:{port}/events")
-    server.serve_forever()
+    seed_note = " (DB was reset + seeded)" if with_seed else " (DB state preserved)"
+    print(f"Closed Loop Kernel prototype UI: http://{host}:{port}/events{seed_note}")
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        server.kernel_store.close()
+
+
+if __name__ == "__main__":
+    _main()

@@ -3,7 +3,7 @@ import unittest
 import threading
 from urllib.request import urlopen
 
-from closed_loop_kernel.http_app import build_demo_store, route_post, route_request, serve
+from closed_loop_kernel.http_app import open_store, route_post, route_request, seed_demo_store, serve
 from tests.env_utils import enable_destructive_reset_for_test
 
 
@@ -12,7 +12,7 @@ class HttpAppTests(unittest.TestCase):
         if not os.environ.get("KERNEL_DATABASE_URL"):
             raise unittest.SkipTest("KERNEL_DATABASE_URL is required for PostgreSQL integration tests")
         enable_destructive_reset_for_test(self)
-        self.store = build_demo_store()
+        self.store = seed_demo_store()
         self.addCleanup(self.store.close)
 
     def test_routes_render_the_four_specified_views(self):
@@ -76,7 +76,8 @@ class HttpAppTests(unittest.TestCase):
         self.assertEqual(response.body, "")
 
     def test_real_http_server_serves_events_route(self):
-        server = serve(port=0)
+        # 顯式傳 with_seed=True：要 reset + 種 Scenario 2 demo 才看得到 "任務開始" 字樣
+        server = serve(port=0, with_seed=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -91,6 +92,36 @@ class HttpAppTests(unittest.TestCase):
             server.server_close()
             server.kernel_store.close()
             thread.join(timeout=2)
+
+    def test_serve_without_seed_preserves_existing_state(self):
+        # 已經有 setUp 把 store 種子資料準備好；用 with_seed=False 啟 server 應沿用同一個 DB
+        server = serve(port=0, with_seed=False)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address
+            with urlopen(f"http://{host}:{port}/events", timeout=2) as response:
+                body = response.read().decode("utf-8")
+            # setUp 種的 Scenario 2 attempt 應該還在，沒被 server 啟動時 reset 掉
+            self.assertIn("事件紀錄", body)
+            self.assertIn("任務開始", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server.kernel_store.close()
+            thread.join(timeout=2)
+
+    def test_open_store_is_non_destructive(self):
+        # 確認 open_store 不會把 setUp 種的資料清掉
+        attempt_count_before = self.store.scalar("SELECT COUNT(*) FROM attempts")
+        self.assertGreater(attempt_count_before, 0)
+
+        another = open_store()
+        try:
+            attempt_count_after = another.scalar("SELECT COUNT(*) FROM attempts")
+            self.assertEqual(attempt_count_after, attempt_count_before)
+        finally:
+            another.close()
 
 
 if __name__ == "__main__":

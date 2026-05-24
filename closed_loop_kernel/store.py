@@ -52,16 +52,22 @@ class KernelStore:
     def fetch_all(self, sql: str, params: Iterable[Any] | None = None) -> list[dict[str, Any]]:
         with self._lock:
             rows = self.conn.execute(_postgres_sql(sql), _postgres_params(params)).fetchall()
+            # psycopg autocommit=False 下，read 仍會隱式啟動一筆 TX；
+            # 不關掉，連線會停在 "idle in transaction"，阻擋後續 DDL（例如 reset 的
+            # DROP SCHEMA），多用幾個連線就鎖住。explicit commit 沒副作用且必要。
+            self.conn.commit()
         return [_normalize_row(row) for row in rows]
 
     def fetch_one(self, sql: str, params: Iterable[Any] | None = None) -> dict[str, Any] | None:
         with self._lock:
             row = self.conn.execute(_postgres_sql(sql), _postgres_params(params)).fetchone()
+            self.conn.commit()
         return _normalize_row(row) if row else None
 
     def scalar(self, sql: str, params: Iterable[Any] | None = None) -> Any:
         with self._lock:
             row = self.conn.execute(_postgres_sql(sql), _postgres_params(params)).fetchone()
+            self.conn.commit()
         if not row:
             return None
         if isinstance(row, dict):
