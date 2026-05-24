@@ -334,3 +334,50 @@
         *   *結果*：44 tests run, 43 passed, 1 skipped（Linux-only 記憶體測試於 macOS 跳過）。 (結果：**PASS**)
 
 *   **第十一輪結論**：**PASS**。Python sandbox 在現有 AST lint 之上加了 POSIX-level 資源/環境/時間防線，並補了測試證據。下一步聚焦 SQL sandbox runner（`sandbox_runner` role + 動態 schema）。OS-level sandbox（macOS `sandbox-exec` / Linux seccomp）暫不納入本階段。
+
+---
+
+## 12. 第十二輪驗證檢驗 (Round 12 Verification - SQL Sandbox Runner & Lint Hardening)
+
+*   **驗證時間**：2026-05-24T13:00:00+08:00
+*   **檢驗人**：Claude (Opus 4.7) under Gary 自主開發授權
+*   **檢查項目與實體證據**：
+
+    本輪聚焦 Phase 3 之 SQL 沙盒，補上 `event-flow-v0.md §3.1` 所要求的低權限角色 + 動態 schema 隔離，並擴充 SQL static lint 黑名單。
+
+    1.  **SQL static lint 黑名單擴充**：
+        *   *實作檔案*：`closed_loop_kernel/engine.py` 之 `_SQL_LINT_FORBIDDEN_PATTERNS` 與 `validate_sql_patch`。
+        *   *覆蓋類別*：
+            - 角色 / 授權切換：`SET/RESET ROLE`、`SET/RESET SESSION AUTHORIZATION`、`SECURITY DEFINER`；
+            - 權限管理：`CREATE/ALTER/DROP ROLE|USER|GROUP`、`GRANT`、`REVOKE`；
+            - Broad destruction：`DROP SCHEMA|DATABASE`、`TRUNCATE`、`ALTER SYSTEM`、原有的 `DROP TABLE`；
+            - 宿主 I/O：statement-leading `COPY`、`pg_read_file`、`pg_read_binary_file`、`pg_ls_dir`、`lo_import`、`lo_export`；
+            - 跨 schema：原有的 `public.` 前綴。
+        *   *錯誤訊息*：每條規則回傳具體原因（如 `RESET ROLE could escape sandbox role`），便於 candidate 作者修正。 (結果：**PASS**)
+
+    2.  **SqlSandbox primitive**：
+        *   *實作檔案*：`closed_loop_kernel/sql_sandbox.py`，新增 `SqlSandbox` 類別與 `SqlSandboxResult` dataclass。
+        *   *核心 API*：
+            - `ensure_role()`：idempotent 建立 `sandbox_runner` 角色（NOLOGIN/NOINHERIT），REVOKE public schema 全部權限，GRANT 角色給當前 admin 以供 `SET ROLE`。
+            - `temp_schema()`：context manager，產生 `sandbox_temp_<12-hex uuid>` schema，授予 runner `USAGE, CREATE`；離開時 finally 區塊 CASCADE 清理。
+            - `run_as_runner(sql, schema)`：交易內依序 `SET LOCAL search_path = schema, public` → `SET LOCAL ROLE sandbox_runner` → execute，回傳 `SqlSandboxResult(status, schema, rows, error_message)`。 (結果：**PASS**)
+        *   *Spec 偏離備案*：規格 (`event-flow-v0.md §3.1`) 寫的是「獨立資料庫連線帳號」。Prototype 走 `SET LOCAL ROLE`，privilege boundary 依然由 `sandbox_runner` 的 GRANT/REVOKE 強制，事務結束自動恢復；省去本機 trust auth 配置。產線需升級為獨立 `psycopg.connect(user=sandbox_runner, ...)` 物理連線。 (結果：**已於 `sql_sandbox.py` 與 `PROTOTYPE.md` 文件中明示**)
+
+    3.  **安全邊界測試**：
+        *   *測試檔案*：`tests/test_sql_sandbox.py`。
+        *   *核心斷言*：
+            - `test_run_as_runner_cannot_write_to_public_schema`：候選嘗試 `CREATE TABLE public.evil_table` 必須回 `permission denied`；
+            - `test_run_as_runner_cannot_select_from_kernel_state_tables`：候選嘗試 `SELECT 1 FROM public.attempts` 必須回 `permission denied`。 (結果：**PASS**)
+
+    4.  **並發測試**：
+        *   *測試檔案*：`tests/test_sql_sandbox.py::test_concurrent_temp_schemas_get_distinct_names_and_clean_up`。
+        *   *方法*：6 個 thread 同時各開一個 `temp_schema`，在自己的 schema 內 `CREATE TABLE local_t` + `INSERT` + `SELECT`，最後驗證所有 schema 名稱互不碰撞且沒有任何 schema 留在 DB。 (結果：**PASS**)
+
+    5.  **生命週期清理測試**：
+        *   `test_temp_schema_is_cleaned_up_even_if_caller_raises`：故意在 `with sandbox.temp_schema()` 內 raise，驗證 finally 仍會 DROP 該 schema。 (結果：**PASS**)
+
+    6.  **完整測試**：
+        *   *執行命令*：`KERNEL_DATABASE_URL='postgresql:///clk_test' KERNEL_ALLOW_DESTRUCTIVE_RESET=1 python3 -m unittest discover -s tests`。
+        *   *結果*：54 tests run, 53 passed, 1 skipped（Linux-only 記憶體 rlimit 測試於 macOS 跳過）。 (結果：**PASS**)
+
+*   **第十二輪結論**：**PASS**。Phase 3 沙盒（Python + SQL 雙路）已具備可重跑、可並發、可驗證權限邊界的 prototype；SQL static lint 涵蓋 spec 已知的 escape 路徑。下一步把 `SqlSandbox` 串入 `KernelEngine.replay_sql_candidate`，並把 `scenarios/sql-self-healing-v0.md` 轉成可重跑的 scenario script。物理獨立連線版本的 sandbox_runner 與 OS-level sandbox 留待產線階段。
