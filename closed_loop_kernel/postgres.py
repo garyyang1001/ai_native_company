@@ -28,6 +28,33 @@ FOR EACH ROW EXECUTE FUNCTION prevent_mutation();"""
 POSTGRES_SCHEMA = f"""
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
+CREATE TABLE IF NOT EXISTS teams (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL UNIQUE,
+    parent_team_id UUID REFERENCES teams(id),
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS agents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL UNIQUE,
+    team_id UUID NOT NULL REFERENCES teams(id),
+    profile JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS approval_routes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    artifact_owner_team_id UUID NOT NULL REFERENCES teams(id),
+    required_approver_team_id UUID NOT NULL REFERENCES teams(id),
+    rule_definition JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (artifact_owner_team_id, required_approver_team_id)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_type VARCHAR(100) NOT NULL,
@@ -147,6 +174,12 @@ END;
 $$ LANGUAGE plpgsql;
 
 {_append_only_triggers()}
+
+-- 治理層 FK：既有 11 表加上 team / agent 歸屬欄位（idempotent ALTER）
+-- artifacts 屬於哪個團隊 / failures 由哪個 agent 偵測 / improvement_candidates 由哪個 agent 提出
+ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS owner_team_id UUID REFERENCES teams(id);
+ALTER TABLE failures ADD COLUMN IF NOT EXISTS detected_by_agent_id UUID REFERENCES agents(id);
+ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS proposed_by_agent_id UUID REFERENCES agents(id);
 
 CREATE OR REPLACE VIEW view_orphan_attempts AS
 SELECT

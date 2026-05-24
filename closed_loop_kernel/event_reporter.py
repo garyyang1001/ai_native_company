@@ -222,6 +222,13 @@ class EventReporter:
         is_failure = outcome in _FAILED_OUTCOMES
         kernel_status = "failed" if is_failure else "success"
 
+        # FK 治理層：把 profile 名稱對到 agents 表的 id（若該 agent 已 seed）
+        agent_id = None
+        if row.get("profile"):
+            agent_row = store.fetch_one("SELECT id FROM agents WHERE name = ?", [row["profile"]])
+            if agent_row:
+                agent_id = agent_row["id"]
+
         attempt_id = _deterministic_uuid(f"ohya:run:{kanban_run_id}")
         input_payload = {
             "tenant": tenant,
@@ -295,8 +302,8 @@ class EventReporter:
                 failure_type = _OUTCOME_TO_FAILURE_TYPE.get(outcome, "unknown")
                 conn.execute(
                     """
-                    INSERT INTO failures (id, attempt_id, failure_type, context, status, created_at)
-                    VALUES (?, ?, ?, ?, 'open', ?)
+                    INSERT INTO failures (id, attempt_id, failure_type, context, status, detected_by_agent_id, created_at)
+                    VALUES (?, ?, ?, ?, 'open', ?, ?)
                     """,
                     [
                         str(uuid.uuid4()),
@@ -310,6 +317,7 @@ class EventReporter:
                             "error": error_message,
                             "summary": row.get("summary"),
                         }),
+                        agent_id,
                         _from_unix(row["ended_at"]) or now,
                     ],
                 )
