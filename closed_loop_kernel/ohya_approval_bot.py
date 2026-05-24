@@ -240,19 +240,79 @@ class OhyaApprovalBot:
                 conn.execute("UPDATE improvement_candidates SET status = 'rejected' WHERE id = ?", [candidate_id])
 
     def _format_approval_message(self, candidate: dict) -> str:
+        """
+        白話為主、技術詞 / 程式引用放括弧的訊息格式。
+        非技術人也能讀懂「發生什麼事、要改什麼、改了會怎樣」。
+        """
         short_id = candidate["id"][:8]
         patch_type = candidate.get("patch_type") or "unknown"
         target = candidate.get("target_artifact_name") or "(no target)"
-        proposed = (candidate.get("proposed_content") or "")[:600]
+        assertions = _parse_json(candidate.get("validation_assertions"))
+        failure_type = assertions.get("source_failure_type") or "unknown"
+        summary = assertions.get("summary") or "（無摘要）"
+        target_hint = assertions.get("target_hint") or target
+
+        patch_type_label = {
+            "code_patch": "程式修正",
+            "sql_patch": "SQL 修正",
+            "prompt_update": "Prompt 修正（業務語氣）",
+        }.get(patch_type, patch_type)
+
+        failure_label = {
+            "crash": "agent 程式崩潰",
+            "timeout": "agent 執行超時",
+            "spawn_failed": "agent 啟動失敗",
+            "gave_up": "agent 連續失敗放棄",
+            "failed": "agent 一般失敗",
+        }.get(failure_type, failure_type)
+
+        # 從 candidate 找對應的 replay 資訊（sandbox 跑過的測試結果）
+        replay_summary = self._summarize_replay(candidate["id"])
+
         return (
-            "🛠 OHYA 修正案待批准\n"
-            f"────────────\n"
-            f"編號：{short_id}\n"
-            f"類型：{patch_type}\n"
-            f"目標：{target}\n"
-            f"────────────\n"
-            f"提議內容：\n{proposed}"
+            "🛠 OHYA 自我修復 — 待你批准\n"
+            "━━━━━━━━━━━━━━\n"
+            "【發生了什麼】\n"
+            f"   {failure_label}\n\n"
+            "【建議怎麼修】\n"
+            f"   {summary}\n\n"
+            f"【已自動驗證】\n{replay_summary}\n\n"
+            "【會改哪個檔案 / 設定】\n"
+            f"   {target_hint}\n"
+            f"   修正類型：{patch_type_label}\n\n"
+            "【批准後會發生什麼】\n"
+            "   舊版本下架、新版本上架（version + 1）\n"
+            "   舊版仍保留在資料庫供回溯（append-only）\n\n"
+            "━━━━━━━━━━━━━━\n"
+            f"案件編號：{short_id}\n"
+            f"目標 artifact：{target}"
         )
+
+    def _summarize_replay(self, candidate_id: str) -> str:
+        from .store import KernelStore  # avoid top-level circular
+        # 用 self 的 kernel_url 開一個短暫連線取 replay 資訊
+        store = KernelStore.from_url(self.kernel_url)
+        try:
+            replay = store.fetch_one(
+                "SELECT status, validation_results FROM replays WHERE candidate_id = ? ORDER BY created_at DESC LIMIT 1",
+                [candidate_id],
+            )
+        finally:
+            store.close()
+        if not replay:
+            return "   ⚠️ 尚未跑過 sandbox 驗證"
+        status_icon = "✅" if replay["status"] == "success" else "❌"
+        results = _parse_json(replay["validation_results"])
+        # 嘗試從 result 抓「跑了幾次嘗試」之類的具體數字
+        details = results.get("result") if isinstance(results.get("result"), dict) else {}
+        attempts = details.get("attempts_taken")
+        final = details.get("final_result")
+        lines = [f"   {status_icon} 在隔離沙盒裡真實跑過候選程式碼"]
+        if attempts is not None:
+            lines.append(f"   ✅ 模擬連續失敗後第 {attempts} 次成功（attempts_taken={attempts}）")
+        if isinstance(final, dict):
+            lines.append(f"   ✅ 最終回傳：{final}")
+        return "\n".join(lines)
 
     def _record_event(self, store: KernelStore, event_type: str, payload: dict) -> None:
         store.execute(
