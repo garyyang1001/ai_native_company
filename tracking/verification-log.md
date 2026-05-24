@@ -298,3 +298,39 @@
         *   *結果*：23 tests passed。 (結果：**PASS**)
 
 *   **第十輪結論**：**PASS**。本地 prototype 已從 read-only 進入 interactive approval prototype；下一步是本地 SQLite 檔案持久化、PostgreSQL integration 與 sandbox hardening。
+
+---
+
+## 11. 第十一輪驗證檢驗 (Round 11 Verification - Python Sandbox Hardening)
+
+*   **驗證時間**：2026-05-24T12:00:00+08:00
+*   **檢驗人**：Claude (Opus 4.7) under Gary 自主開發授權
+*   **檢查項目與實體證據**：
+
+    本輪聚焦 Phase 3 之 Python subprocess sandbox hardening，補上資源限制、環境隔離與 timeout 後備防線。
+
+    1.  **POSIX `resource` rlimit 套用**：
+        *   *實作檔案*：`closed_loop_kernel/sandbox.py` 之 `_build_preexec` 工廠函式，以 `subprocess.Popen` 的 `preexec_fn` 在 child fork 後、exec 前套用。
+        *   *涵蓋 rlimit*：`RLIMIT_CPU`（軟硬限制差 1 秒給 cleanup）、`RLIMIT_AS` + `RLIMIT_DATA`（記憶體上限）、`RLIMIT_FSIZE`（單檔寫入大小，預設 1 KB）、`RLIMIT_NPROC`（fork/spawn 子程序數，macOS 不支援則略過）、`RLIMIT_CORE = 0`（禁 core dump）。
+        *   *Process group 隔離*：child 進入新 process group（`os.setsid()`），方便外層在 timeout 時整組終止。 (結果：**PASS**)
+
+    2.  **Python isolated mode 與環境變數最小化**：
+        *   *實作*：subprocess 啟動帶 `-I`（忽略 `PYTHON*` env vars、停用 user site）；env 改成顯式白名單（`PATH=/usr/bin:/bin`、`PYTHONDONTWRITEBYTECODE=1`、`PYTHONIOENCODING=utf-8`、`LC_ALL/LANG=C.UTF-8`、macOS 額外給 `HOME=/tmp`），不繼承呼叫者整個 `os.environ`。 (結果：**PASS**)
+
+    3.  **Wall-clock timeout 後備**：
+        *   *實作*：外層 `subprocess.run` 帶 `timeout = self.timeout_seconds + 2`；攔到 `TimeoutExpired` 後回傳 `SandboxResult(status="failed", error_message=...)`，不再讓例外往上炸到 engine。
+        *   *動機*：rlimit CPU 應該先觸發，但若 child 卡在 syscall（如 I/O wait）CPU 計時不會累積；wall-clock 是第二道防線。 (結果：**PASS**)
+
+    4.  **非零 returncode 解讀**：
+        *   *實作*：`_interpret_nonzero_exit` 區分 SIGKILL（典型 OOM）、SIGXCPU（CPU rlimit）、其他 signal、`MemoryError` 等情況，回傳人類可讀的 error_message，便於 candidate 鏈接到 replay 失敗原因。 (結果：**PASS**)
+
+    5.  **stdout 上限**：
+        *   *實作*：parse JSON 前先檢查 `proc.stdout` 大小（預設 1 MB），超過直接回傳失敗，避免 candidate 透過 print 灌爆 capture buffer。 (結果：**PASS**)
+
+    6.  **測試覆蓋**：
+        *   *新增測試*：`tests/test_python_sandbox.py` 新增 `test_subprocess_sandbox_kills_infinite_loop_via_cpu_rlimit`（CPU 超時觸發）、`test_subprocess_sandbox_does_not_inherit_parent_environment`（即使透過 `eval("__import__('os').environ.get(...)")` 繞過 AST lint 仍讀不到父行程環境變數）、`test_subprocess_sandbox_blocks_memory_blowup_via_rlimit_as`（Linux-only，記憶體上限）。
+        *   *既有測試擴充*：success 路徑增加對 `sandbox_env["isolated_mode"]` / `rlimit_cpu_seconds` / `rlimit_memory_mb` 欄位的斷言。
+        *   *執行命令*：`KERNEL_DATABASE_URL='postgresql:///clk_test' KERNEL_ALLOW_DESTRUCTIVE_RESET=1 python3 -m unittest discover -s tests`。
+        *   *結果*：44 tests run, 43 passed, 1 skipped（Linux-only 記憶體測試於 macOS 跳過）。 (結果：**PASS**)
+
+*   **第十一輪結論**：**PASS**。Python sandbox 在現有 AST lint 之上加了 POSIX-level 資源/環境/時間防線，並補了測試證據。下一步聚焦 SQL sandbox runner（`sandbox_runner` role + 動態 schema）。OS-level sandbox（macOS `sandbox-exec` / Linux seccomp）暫不納入本階段。

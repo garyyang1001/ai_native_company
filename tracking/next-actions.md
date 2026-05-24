@@ -9,10 +9,10 @@
 *   **下一個要修的文件**：目前無 Blocker/High 必修文件；本地 interactive prototype 已開始，行為測試、demo、PostgreSQL DDL renderer、Python subprocess sandbox、HTTP UI、approve/reject action 已通過第一批測試。後續文件更新應聚焦 prototype 實作差距，而不是重寫架構。
 *   **下一個要驗證的矛盾/工程挑戰**：
     *   建立 `sandbox_runner` 低特權 PostgreSQL role 與動態 Schema (`sandbox_temp_xxxx`)，驗證並發線程下能否穩定建立、切換、清理。
-    *   將 Python subprocess sandbox 加上更明確的資源限制、檔案 policy 與 timeout 行為驗證。
+    *   ~~將 Python subprocess sandbox 加上更明確的資源限制、檔案 policy 與 timeout 行為驗證。~~ **(已完成 2026-05-24)** POSIX `resource` rlimit（CPU/AS/DATA/FSIZE/NPROC/CORE）+ `setsid` process group + `python -I` isolated mode + 最小化環境變數 + wall-clock timeout 後備；測試覆蓋 CPU 超時、環境變數隔離（含 eval+__import__ 繞道路徑），記憶體上限測試於 Linux 平台跑（macOS skip）。下一階段 OS-level sandbox（macOS `sandbox-exec` / Linux seccomp）暫緩。
     *   demo/http_app 目前每次啟動都會 `DROP SCHEMA public CASCADE`；後續要設計可重啟保留狀態的 demo 流程（例如分離 seed-once 與 serve 兩個 entry point）。
 *   **是否需要 Gary 決策**：**原型代碼編寫不需再進行架構面重大決策。但只要涉及生產環境資料庫異動、真實代碼檔案部署、launchd 系統服務配置、或外部通訊/通知發送（如 Slack/Email 等），仍必須經過 Gary 明確審批授權（Explicit Approval）後方可執行。**
-*   **是否可以進入實作**：已進入本地 prototype 實作，PostgreSQL store 已落地；下一步是 SQL sandbox runner（低特權 role + 動態 schema）與 Python sandbox hardening（資源/檔案/timeout policy）。
+*   **是否可以進入實作**：已進入本地 prototype 實作，PostgreSQL store 與 Python sandbox hardening 已落地；下一步是 SQL sandbox runner（低特權 role + 動態 schema）。
 
 ---
 
@@ -29,7 +29,7 @@
     *   PostgreSQL integration test 已驗證外鍵、trigger、transaction rollback 行為一致。
 3.  **Phase 3: Real Sandbox Execution**
     *   實作 `sandbox_runner` role、動態 schema 建立、SQL replay。
-    *   Python subprocess sandbox 已有第一版；下一步補資源限制、檔案 policy 與 timeout 驗證。
+    *   Python subprocess sandbox 已套用 POSIX rlimit（CPU/AS/DATA/FSIZE/NPROC/CORE）、`setsid` process group、`python -I` isolated mode、最小化 env 與 wall-clock timeout（2026-05-24 完成）；OS-level sandbox（macOS `sandbox-exec` / Linux seccomp）暫緩。
 4.  **Phase 4: Gary Gate UI (interactive action 已開始)**
     *   目前已有 HTTP routes 與本地 approve/reject action；下一步補持久化 DB 與更完整的審核後狀態頁。
 5.  **Phase 5: Scenario Runs**
