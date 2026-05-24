@@ -50,6 +50,8 @@ class SyncResult:
     failures_opened: int = 0
     last_event_id: int = 0
     last_run_id: int = 0
+    source_profile: str | None = None
+    skipped_by_reason: dict[str, int] = field(default_factory=dict)
     skipped_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -59,10 +61,12 @@ class EventReporter:
         kanban_db_path: str,
         kernel_url: str,
         tenant_default: str = "ohya",
+        profile_filter: str | None = None,
     ):
         self.kanban_db_path = kanban_db_path
         self.kernel_url = kernel_url
         self.tenant_default = tenant_default
+        self.profile_filter = profile_filter
 
     def sync(self) -> SyncResult:
         kanban = self._open_kanban_readonly()
@@ -73,6 +77,7 @@ class EventReporter:
                 result = SyncResult(
                     last_event_id=checkpoint["last_event_id"],
                     last_run_id=checkpoint["last_run_id"],
+                    source_profile=self.profile_filter,
                 )
 
                 self._import_task_events(kanban, store, result)
@@ -113,12 +118,15 @@ class EventReporter:
             return {"last_event_id": 0, "last_run_id": 0}
 
     def _write_checkpoint(self, store: KernelStore, last_event_id: int, last_run_id: int) -> None:
+        payload = {"last_event_id": last_event_id, "last_run_id": last_run_id}
+        if self.profile_filter:
+            payload["source_profile"] = self.profile_filter
         store.execute(
             "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
             [
                 str(uuid.uuid4()),
                 CHECKPOINT_EVENT_TYPE,
-                json_param({"last_event_id": last_event_id, "last_run_id": last_run_id}),
+                json_param(payload),
                 _now(),
             ],
         )
@@ -133,9 +141,10 @@ class EventReporter:
             cur = kanban.execute(
                 """
                 SELECT te.id, te.task_id, te.run_id, te.kind, te.payload, te.created_at,
-                       t.tenant
+                       t.tenant, t.assignee, tr.profile AS run_profile
                 FROM task_events te
                 LEFT JOIN tasks t ON t.id = te.task_id
+                LEFT JOIN task_runs tr ON tr.id = te.run_id
                 WHERE te.id > ?
                 ORDER BY te.id ASC
                 """,
@@ -143,18 +152,43 @@ class EventReporter:
             )
         except sqlite3.DatabaseError as exc:
             # kanban.db 可能部分損毀；整段事件流跳過，但 task_runs 部分仍嘗試
-            result.skipped_rows.append({"table": "task_events", "error": f"query failed: {exc}"})
+            _skip(result, "task_events", None, "corrupt_source_table", f"query failed: {exc}")
             return
 
         for raw in cur:
             try:
                 row = dict(raw)
+                row_id = row.get("id")
+                missing = _missing_required(row, ["id", "task_id", "kind", "created_at"])
+                if missing:
+                    _skip(result, "task_events", row_id, "missing_required_field", f"missing {missing}")
+                    _advance_event_checkpoint(result, row_id)
+                    continue
+
+                source_profile = row.get("run_profile") or row.get("assignee")
+                if self.profile_filter and source_profile != self.profile_filter:
+                    _skip(
+                        result,
+                        "task_events",
+                        row_id,
+                        "profile_mismatch",
+                        f"profile {source_profile!r} does not match {self.profile_filter!r}",
+                    )
+                    _advance_event_checkpoint(result, row_id)
+                    continue
+
                 tenant = row.get("tenant") or self.tenant_default
-                event_payload = _safe_json_parse(row.get("payload"))
+                event_payload, json_error = _parse_json_object(row.get("payload"))
+                if json_error:
+                    _skip(result, "task_events", row_id, "bad_json", json_error)
+                    _advance_event_checkpoint(result, row_id)
+                    continue
                 event_payload["tenant"] = tenant
                 event_payload["kanban_task_id"] = row["task_id"]
                 event_payload["kanban_run_id"] = row.get("run_id")
                 event_payload["kanban_event_id"] = row["id"]
+                if source_profile:
+                    event_payload["source_profile"] = source_profile
 
                 store.execute(
                     "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
@@ -166,12 +200,11 @@ class EventReporter:
                     ],
                 )
                 result.events_imported += 1
-                if row["id"] > result.last_event_id:
-                    result.last_event_id = row["id"]
+                _advance_event_checkpoint(result, row_id)
             except Exception as exc:
-                result.skipped_rows.append(
-                    {"table": "task_events", "id": raw["id"] if "id" in raw.keys() else None, "error": str(exc)}
-                )
+                row_id = raw["id"] if "id" in raw.keys() else None
+                _skip(result, "task_events", row_id, "unexpected_error", str(exc))
+                _advance_event_checkpoint(result, row_id)
 
     def _import_task_runs(
         self,
@@ -187,27 +220,61 @@ class EventReporter:
                        t.title, t.tenant
                 FROM task_runs tr
                 LEFT JOIN tasks t ON t.id = tr.task_id
-                WHERE tr.id > ? AND tr.ended_at IS NOT NULL
+                WHERE tr.id > ?
                 ORDER BY tr.id ASC
                 """,
                 (result.last_run_id,),
             )
         except sqlite3.DatabaseError as exc:
             # 已知 OHYA kanban.db 此區段可能損毀；記下 skip
-            result.skipped_rows.append({"table": "task_runs", "error": f"query failed: {exc}"})
+            _skip(result, "task_runs", None, "corrupt_source_table", f"query failed: {exc}")
             return
 
         for raw in cur:
             try:
                 row = dict(raw)
+                row_id = row.get("id")
+                missing = _missing_required(
+                    row,
+                    ["id", "task_id", "profile", "status", "started_at", "ended_at"],
+                    any_of=[("outcome", "status")],
+                )
+                if missing:
+                    _skip(result, "task_runs", row_id, "missing_required_field", f"missing {missing}")
+                    _advance_run_checkpoint(result, row_id)
+                    continue
+
+                if self.profile_filter and row.get("profile") != self.profile_filter:
+                    _skip(
+                        result,
+                        "task_runs",
+                        row_id,
+                        "profile_mismatch",
+                        f"profile {row.get('profile')!r} does not match {self.profile_filter!r}",
+                    )
+                    _advance_run_checkpoint(result, row_id)
+                    continue
+
+                outcome = (row.get("outcome") or row.get("status") or "").lower()
+                if outcome not in _FAILED_OUTCOMES and outcome not in _SUCCESS_OUTCOMES:
+                    _skip(result, "task_runs", row_id, "unsupported_outcome", f"unsupported outcome {outcome!r}")
+                    _advance_run_checkpoint(result, row_id)
+                    continue
+
+                metadata, json_error = _parse_json_object(row.get("metadata"))
+                if json_error:
+                    _skip(result, "task_runs", row_id, "bad_json", json_error)
+                    _advance_run_checkpoint(result, row_id)
+                    continue
+                row["metadata_parsed"] = metadata
+
                 tenant = row.get("tenant") or self.tenant_default
                 self._write_attempt_and_optional_failure(store, row, tenant, result)
-                if row["id"] > result.last_run_id:
-                    result.last_run_id = row["id"]
+                _advance_run_checkpoint(result, row_id)
             except Exception as exc:
-                result.skipped_rows.append(
-                    {"table": "task_runs", "id": raw["id"] if "id" in raw.keys() else None, "error": str(exc)}
-                )
+                row_id = raw["id"] if "id" in raw.keys() else None
+                _skip(result, "task_runs", row_id, "unexpected_error", str(exc))
+                _advance_run_checkpoint(result, row_id)
 
     def _write_attempt_and_optional_failure(
         self,
@@ -241,7 +308,7 @@ class EventReporter:
         if not is_failure:
             output_payload = {
                 "summary": row.get("summary"),
-                "metadata": _safe_json_parse(row.get("metadata")),
+                "metadata": row.get("metadata_parsed", {}),
             }
         error_message = row.get("error") if is_failure else None
 
@@ -326,22 +393,58 @@ class EventReporter:
 
 
 def _safe_json_parse(value: Any) -> dict[str, Any]:
+    parsed, _error = _parse_json_object(value)
+    return parsed
+
+
+def _parse_json_object(value: Any) -> tuple[dict[str, Any], str | None]:
     if not value:
-        return {}
+        return {}, None
     if isinstance(value, dict):
-        return value
+        return value, None
     if isinstance(value, (bytes, bytearray)):
         try:
             value = value.decode("utf-8")
         except UnicodeDecodeError:
-            return {}
+            return {}, "payload is not valid utf-8"
     if not isinstance(value, str):
-        return {}
+        return {}, "payload is not a JSON string"
     try:
         parsed = json.loads(value)
     except (TypeError, json.JSONDecodeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {"value": parsed}
+        return {}, "payload is not valid JSON"
+    return (parsed, None) if isinstance(parsed, dict) else ({"value": parsed}, None)
+
+
+def _missing_required(row: dict[str, Any], required: list[str], any_of: list[tuple[str, ...]] | None = None) -> list[str]:
+    missing = [key for key in required if row.get(key) is None or row.get(key) == ""]
+    for group in any_of or []:
+        if not any(row.get(key) not in (None, "") for key in group):
+            missing.append("|".join(group))
+    return missing
+
+
+def _skip(result: SyncResult, table: str, row_id: Any, reason: str, error: str) -> None:
+    result.skipped_by_reason[reason] = result.skipped_by_reason.get(reason, 0) + 1
+    result.skipped_rows.append({"table": table, "id": row_id, "reason": reason, "error": error})
+
+
+def _advance_event_checkpoint(result: SyncResult, row_id: Any) -> None:
+    try:
+        row_id_int = int(row_id)
+    except (TypeError, ValueError):
+        return
+    if row_id_int > result.last_event_id:
+        result.last_event_id = row_id_int
+
+
+def _advance_run_checkpoint(result: SyncResult, row_id: Any) -> None:
+    try:
+        row_id_int = int(row_id)
+    except (TypeError, ValueError):
+        return
+    if row_id_int > result.last_run_id:
+        result.last_run_id = row_id_int
 
 
 def _from_unix(value: Any) -> str:

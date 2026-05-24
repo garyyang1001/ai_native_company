@@ -227,6 +227,22 @@ class FailureAnalyzer:
         engine = KernelEngine(self.store)
         for row in rows:
             try:
+                if run_sandbox and row["failure_type"] not in _SANDBOX_TEST_FUNCTION:
+                    skipped += 1
+                    self.store.execute(
+                        "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
+                        [
+                            str(uuid.uuid4()),
+                            "ohya_analyzer_skip",
+                            json_param({
+                                "failure_id": row["id"],
+                                "failure_type": row["failure_type"],
+                                "reason": "unsupported_failure_type_for_auto_sandbox",
+                            }),
+                            _now(),
+                        ],
+                    )
+                    continue
                 candidate_id = self._propose_for_failure(row, target_artifact)
                 candidates.append(candidate_id)
                 processed += 1
