@@ -1,9 +1,11 @@
+import os
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from closed_loop_kernel import KernelEngine, SecurityError
+from closed_loop_kernel import KernelEngine, KernelStore, SecurityError
 from tests.postgres_test_utils import build_postgres_store
 
 
@@ -110,6 +112,74 @@ class ClosedLoopKernelTests(unittest.TestCase):
             self.store.scalar("SELECT content FROM artifacts WHERE name = ? AND is_active = TRUE", ["prompts.search"]),
             "concurrent-v2",
         )
+
+    def test_concurrent_apply_against_same_artifact_serializes_via_row_lock(self):
+        # ISSUE-002 緩解驗證：兩個候選都針對同一個 active artifact（base hash 一樣），
+        # 兩條獨立連線在分開 thread 同時 apply。FOR UPDATE row-lock 應該讓他們序列化：
+        # 一個贏（artifact 推進到 v2）、一個輸（candidate 被退回 draft 並回報 race）。
+        if not os.environ.get("KERNEL_DATABASE_URL"):
+            raise unittest.SkipTest("KERNEL_DATABASE_URL is required")
+
+        artifact_id = self.engine.create_artifact("shared.prompt", "prompt", "v1")
+        failure_a = self.engine.create_failure_for_test("first")
+        failure_b = self.engine.create_failure_for_test("second")
+        candidate_a = self.engine.propose_improvement(
+            failure_a, artifact_id, "prompt_update", "v2-A",
+            {"replay": "ok"}, {"restore_artifact_id": artifact_id},
+        )
+        candidate_b = self.engine.propose_improvement(
+            failure_b, artifact_id, "prompt_update", "v2-B",
+            {"replay": "ok"}, {"restore_artifact_id": artifact_id},
+        )
+        for cid in (candidate_a, candidate_b):
+            self.engine.record_replay(cid, "success", {"replay": "ok"})
+            self.engine.approve_candidate(cid, "human_dri:gary", "concurrent test")
+
+        # 為了真正並發，各 thread 使用自己的 KernelStore（獨立 psycopg 連線）
+        # 而不是共用 self.store（其 RLock 會把他們強制序列化在 Python 層）
+        url = os.environ["KERNEL_DATABASE_URL"]
+        outcomes: dict[str, BaseException | str] = {}
+        outcomes_lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        def worker(label: str, candidate_id: str) -> None:
+            local_store = KernelStore.from_url(url)
+            local_engine = KernelEngine(local_store)
+            try:
+                barrier.wait(timeout=5)  # 兩個 thread 一起進 apply
+                new_id = local_engine.apply_candidate(candidate_id)
+                with outcomes_lock:
+                    outcomes[label] = ("success", new_id)
+            except BaseException as exc:
+                with outcomes_lock:
+                    outcomes[label] = ("error", exc)
+            finally:
+                local_store.close()
+
+        t1 = threading.Thread(target=worker, args=("A", candidate_a))
+        t2 = threading.Thread(target=worker, args=("B", candidate_b))
+        t1.start(); t2.start(); t1.join(timeout=10); t2.join(timeout=10)
+
+        statuses = sorted([outcomes["A"][0], outcomes["B"][0]])
+        self.assertEqual(statuses, ["error", "success"], f"unexpected outcomes: {outcomes!r}")
+
+        # 確認 race error 訊息與 candidate 狀態
+        loser_label = "A" if outcomes["A"][0] == "error" else "B"
+        loser_exc = outcomes[loser_label][1]
+        self.assertIn("Race condition", str(loser_exc))
+        loser_candidate = candidate_a if loser_label == "A" else candidate_b
+        self.assertEqual(
+            self.store.scalar("SELECT status FROM improvement_candidates WHERE id = ?", [loser_candidate]),
+            "draft",
+        )
+
+        # 贏家寫了 v2；artifact 表現在應該有兩個版本，is_active 在 v2
+        active = self.store.fetch_one(
+            "SELECT version, content FROM artifacts WHERE name = ? AND is_active = TRUE",
+            ["shared.prompt"],
+        )
+        self.assertEqual(active["version"], 2)
+        self.assertIn("v2-", active["content"])
 
     def test_orphan_lifecycle_is_reconciled_as_failed_attempt(self):
         attempt_id = self.engine.generate_id()

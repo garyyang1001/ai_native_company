@@ -8,10 +8,15 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from .store import KernelStore, json_param
+from .store import KernelStore, _normalize_row, json_param
 
 
 class SecurityError(Exception):
+    pass
+
+
+class _RaceCondition(Exception):
+    """Internal sentinel raised inside apply transaction to trigger rollback + candidate→draft."""
     pass
 
 
@@ -374,37 +379,53 @@ class KernelEngine:
         if not replay_success:
             raise Exception("successful replay required before apply")
 
-        active = self.store.fetch_one(
-            "SELECT * FROM artifacts WHERE name = ? AND is_active = TRUE",
-            [candidate["target_artifact_name"]],
-        )
-        if not active or active["content_hash"] != candidate["base_artifact_hash"]:
-            self.store.execute("UPDATE improvement_candidates SET status = 'draft' WHERE id = ?", [candidate_id])
-            raise Exception("Race condition detected: Artifact has changed since verification")
-
+        # ISSUE-002 緩解 + spec event-flow-v0.md §4：race condition 檢查必須在同一筆
+        # transaction 內、且對 active artifact 列拿 row-level lock（FOR UPDATE）。
+        # 否則兩個並發 apply 可能同時通過外部 hash 比對、再各自寫入。
         new_artifact_id = self.generate_id()
-        with self.store.transaction() as conn:
-            conn.execute(
-                "UPDATE artifacts SET is_active = FALSE WHERE name = ? AND is_active = TRUE",
-                [candidate["target_artifact_name"]],
+        race_detected = False
+        try:
+            with self.store.transaction() as conn:
+                locked = conn.execute(
+                    "SELECT id, version, content_hash FROM artifacts "
+                    "WHERE name = ? AND is_active = TRUE FOR UPDATE",
+                    [candidate["target_artifact_name"]],
+                ).fetchone()
+                if not locked:
+                    race_detected = True
+                    raise _RaceCondition()
+                locked = _normalize_row(locked)
+                if locked["content_hash"] != candidate["base_artifact_hash"]:
+                    race_detected = True
+                    raise _RaceCondition()
+
+                conn.execute(
+                    "UPDATE artifacts SET is_active = FALSE WHERE id = ?",
+                    [locked["id"]],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO artifacts (id, name, artifact_type, content, content_hash, version, is_active, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, TRUE, ?)
+                    """,
+                    [
+                        new_artifact_id,
+                        candidate["target_artifact_name"],
+                        candidate["target_artifact_type"],
+                        candidate["proposed_content"],
+                        _hash(candidate["proposed_content"]),
+                        locked["version"] + 1,
+                        _now(),
+                    ],
+                )
+                conn.execute("UPDATE improvement_candidates SET status = 'applied' WHERE id = ?", [candidate_id])
+                conn.execute("UPDATE failures SET status = 'resolved' WHERE id = ?", [candidate["failure_id"]])
+        except _RaceCondition:
+            self.store.execute(
+                "UPDATE improvement_candidates SET status = 'draft' WHERE id = ?",
+                [candidate_id],
             )
-            conn.execute(
-                """
-                INSERT INTO artifacts (id, name, artifact_type, content, content_hash, version, is_active, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, TRUE, ?)
-                """,
-                [
-                    new_artifact_id,
-                    candidate["target_artifact_name"],
-                    candidate["target_artifact_type"],
-                    candidate["proposed_content"],
-                    _hash(candidate["proposed_content"]),
-                    active["version"] + 1,
-                    _now(),
-                ],
-            )
-            conn.execute("UPDATE improvement_candidates SET status = 'applied' WHERE id = ?", [candidate_id])
-            conn.execute("UPDATE failures SET status = 'resolved' WHERE id = ?", [candidate["failure_id"]])
+            raise Exception("Race condition detected: Artifact has changed since verification")
         self._record_event("candidate_applied", {"candidate_id": candidate_id, "artifact_id": new_artifact_id})
         return new_artifact_id
 
