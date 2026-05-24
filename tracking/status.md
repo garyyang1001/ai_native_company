@@ -6,8 +6,8 @@
 
 ## 1. 核心狀態摘要 (Status Summary)
 
-*   **目前整體狀態**：`postgres-prototype-landed` (PostgreSQL-backed KernelStore、Python subprocess sandbox（POSIX rlimit + isolated mode + 環境隔離）、SQL DDL sandbox（`sandbox_runner` 低權限角色 + 動態 `sandbox_temp_*` schema + 並發測試）、SQL static lint（含角色逃逸與宿主 I/O 黑名單）、HTTP UI 與 approve/reject action 第一批測試已通過；非正式生產部署級)
-*   **最近一次修改時間**：2026-05-24T13:00:00+08:00
+*   **目前整體狀態**：`postgres-prototype-landed` (PostgreSQL-backed KernelStore、Python subprocess sandbox（POSIX rlimit + isolated mode + 環境隔離）、SQL DDL sandbox（`sandbox_runner` 低權限角色 + 動態 `sandbox_temp_*` schema + 並發測試 + `KernelEngine.replay_sql_candidate` 已串入）、SQL static lint（含角色逃逸與宿主 I/O 黑名單）、HTTP UI 與 approve/reject action 第一批測試已通過、Scenario 1 與 Scenario 2 兩個閉環 demo 皆可重跑；非正式生產部署級)
+*   **最近一次修改時間**：2026-05-24T14:00:00+08:00
 *   **剩餘 Open Issues**：
     *   **Blocker/High**: 0
     *   **Deferred Medium/Low (已知風險)**: 3 (詳見 tracking/open-issues.md)
@@ -35,6 +35,7 @@
 | **本地 prototype** | [closed_loop_kernel/postgres.py](closed_loop_kernel/postgres.py) | PostgreSQL DDL renderer 初版 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/sandbox.py](closed_loop_kernel/sandbox.py) | Python subprocess sandbox（含 POSIX rlimit / isolated mode / env 隔離 / wall-clock timeout） | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/sql_sandbox.py](closed_loop_kernel/sql_sandbox.py) | SQL DDL sandbox（`sandbox_runner` role + 動態 `sandbox_temp_*` schema + `SET LOCAL ROLE` 隔離） | `In Progress` |
+| **本地 prototype** | [closed_loop_kernel/sql_demo.py](closed_loop_kernel/sql_demo.py) | Scenario 1（SQL self-healing）可重跑閉環 demo | `Passing` |
 | **本地 prototype** | [closed_loop_kernel/views.py](closed_loop_kernel/views.py) | 4 個最小 HTML views renderer 初版 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/http_app.py](closed_loop_kernel/http_app.py) | 本地 HTTP UI server 初版 | `In Progress` |
 | **本地 prototype** | [tests/](tests/) | acceptance 行為測試初版 | `Passing` |

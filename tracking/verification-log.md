@@ -381,3 +381,32 @@
         *   *結果*：54 tests run, 53 passed, 1 skipped（Linux-only 記憶體 rlimit 測試於 macOS 跳過）。 (結果：**PASS**)
 
 *   **第十二輪結論**：**PASS**。Phase 3 沙盒（Python + SQL 雙路）已具備可重跑、可並發、可驗證權限邊界的 prototype；SQL static lint 涵蓋 spec 已知的 escape 路徑。下一步把 `SqlSandbox` 串入 `KernelEngine.replay_sql_candidate`，並把 `scenarios/sql-self-healing-v0.md` 轉成可重跑的 scenario script。物理獨立連線版本的 sandbox_runner 與 OS-level sandbox 留待產線階段。
+
+---
+
+## 13. 第十三輪驗證檢驗 (Round 13 Verification - SQL Replay Engine Wiring & Scenario 1 Demo)
+
+*   **驗證時間**：2026-05-24T14:00:00+08:00
+*   **檢驗人**：Claude (Opus 4.7) under Gary 自主開發授權
+*   **檢查項目與實體證據**：
+
+    本輪把 SqlSandbox 串入 KernelEngine，並把 `scenarios/sql-self-healing-v0.md` 轉成可重跑端到端 demo，使 Phase 5 兩個 scenario 都能在本地跑出實際輸出。
+
+    1.  **`KernelEngine.replay_sql_candidate` 落地**：
+        *   *實作檔案*：`closed_loop_kernel/engine.py` 之 `replay_sql_candidate` 與 `_check_sql_assertions`。
+        *   *流程*：load candidate → 確認 patch_type == `sql_patch` → `validate_sql_patch(proposed_content)` → `sandbox.temp_schema()` → 可選 `run_as_runner(setup_sql, schema)` → `run_as_runner(proposed_content, schema)` → 比對 `expected_row_count` / `expected_result` → `record_replay` 寫 `replays.sandbox_schema`。
+        *   *結果分支*：lint 違規 → SecurityError 不寫 replay；setup 失敗 → `replays(failed, phase=setup)`；replay 失敗 → `replays(failed)` 帶 DB 錯誤訊息；assertion 違規 → `replays(failed)` 帶具體期望值；全綠 → `replays(success)` 並 `candidate → sandbox_verified`。 (結果：**PASS**)
+        *   *Trust 邊界*：`setup_sql` 不過 lint（caller-trusted 內部輸入，可能合法引用 `public.*` 以複製生產表）；`proposed_content` 必須過 lint。
+
+    2.  **Scenario 1 可重跑 demo**：
+        *   *實作檔案*：`closed_loop_kernel/sql_demo.py`。
+        *   *劇本*：active artifact 用錯的 SQL（`public.document_tags`）→ 寫 failed attempt + open failure → 提 `sql_patch` candidate（修正為 `document_tags_mapping`）→ SqlSandbox replay（setup 在 temp schema 內建兩表 + 種一筆 Important seed，replay 跑修正 SQL，assertion `expected_row_count=1` + `expected_result=[["Q2 Strategy"]]`）→ approve → apply → retry attempt success。
+        *   *最終狀態*：`attempts` 兩列（failed 不可篡改 + retry success），`candidate=applied`，`failure=resolved`，`replay=success`，`replays.sandbox_schema` 仍是 `sandbox_temp_*` 形式，`active artifact` 已換成修正版 SQL。 (結果：**PASS**)
+        *   *執行命令*：`KERNEL_DATABASE_URL=postgresql:///clk_test KERNEL_ALLOW_DESTRUCTIVE_RESET=1 python3 -m closed_loop_kernel.sql_demo`。
+
+    3.  **測試覆蓋**：
+        *   `tests/test_sql_sandbox.py::ReplaySqlCandidateTests`（5 個）：success / assertion violation / replay error / lint rejection / wrong patch_type。
+        *   `tests/test_sql_demo.py::SqlDemoTests`：完整 demo 端到端，校驗最終狀態。
+        *   *完整測試*：`python3 -m unittest discover -s tests` → 60 tests run, 59 passed, 1 skipped（Linux-only 記憶體 rlimit）。 (結果：**PASS**)
+
+*   **第十三輪結論**：**PASS**。Phase 3 與 Phase 5 完整收斂；兩個 scenario 皆可重跑並有測試守門。Phase 4 剩餘工作：(a) demo/http_app seed-once 拆分避免每次 reset；(b) HTTP UI 加 `sql_patch` 顯示路徑；(c) 產線階段把 SqlSandbox 升級成獨立物理連線（需 Gary 在配 trust auth / password 時參與）。
