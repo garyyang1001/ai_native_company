@@ -17,11 +17,13 @@ from wannavegtour.line_router import DispatchAction, LineRouter, PRICE_EDIT_REFU
 from wannavegtour.query_parser import ParsedQuery, QueryIntent
 
 
-def _mk_config(target_groups=None):
+def _mk_config(target_groups=None, invocation_prefixes=None):
     return LineConfig(
         channel_id="cid", channel_secret="cs", channel_access_token="cat",
         bot_basic_id="@bot", bot_user_id="Uself",
         target_groups=target_groups or [],
+        invocation_prefixes=tuple(invocation_prefixes) if invocation_prefixes is not None
+                            else ("小弟", "@小弟", "/小弟"),
     )
 
 
@@ -41,10 +43,11 @@ def _mk_event(text="3/5 江南還收嗎", *, event_type="message", message_type=
     )
 
 
-def _mk_router(target_groups=None):
+def _mk_router(target_groups=None, invocation_prefixes=None):
     availability = MagicMock()
     historical = MagicMock()
-    return LineRouter(_mk_config(target_groups), availability, historical), availability, historical
+    config = _mk_config(target_groups, invocation_prefixes)
+    return LineRouter(config, availability, historical), availability, historical
 
 
 class TestPassiveListeningMode(unittest.TestCase):
@@ -156,6 +159,109 @@ class TestMentionDispatch(unittest.TestCase):
         ))
         self.assertEqual(result.action, DispatchAction.REPLY)
         avail.check.assert_called_once()
+
+
+class TestInvocationByPrefix(unittest.TestCase):
+    """Text-prefix invocation path — works on every LINE client including
+    desktop where Bot Mention autocomplete is not supported.
+
+    Prefixes default to (小弟, @小弟, /小弟). Strict startswith match
+    after text.strip(). Mention path remains primary when present."""
+
+    def test_prefix_triggers_availability_check(self):
+        router, avail, _ = _mk_router()
+        avail.check.return_value = CheckResult(
+            kind=CheckResultKind.FOUND_NONE,
+            query=ParsedQuery(raw_text="x", intent=QueryIntent.AVAILABILITY_CHECK,
+                              month=12, day=27, destination_hint="江南", matched_year=2026),
+        )
+        result = router.dispatch(_mk_event("小弟 12/27 江南還收嗎"))
+        self.assertEqual(result.action, DispatchAction.REPLY)
+        self.assertEqual(result.worker, "availability_checker")
+        self.assertEqual(result.audit_extras["invocation"], "prefix:小弟")
+        self.assertEqual(result.audit_extras["cleaned_text"], "12/27 江南還收嗎")
+
+    def test_at_prefix_alias(self):
+        router, avail, _ = _mk_router()
+        avail.check.return_value = CheckResult(
+            kind=CheckResultKind.FOUND_NONE,
+            query=ParsedQuery(raw_text="x", intent=QueryIntent.AVAILABILITY_CHECK,
+                              month=3, day=5, destination_hint="峴港", matched_year=2026),
+        )
+        result = router.dispatch(_mk_event("@小弟 3/5 峴港"))
+        self.assertEqual(result.action, DispatchAction.REPLY)
+        self.assertEqual(result.audit_extras["invocation"], "prefix:@小弟")
+        self.assertEqual(result.audit_extras["cleaned_text"], "3/5 峴港")
+
+    def test_slash_prefix_alias(self):
+        router, _, hist = _mk_router()
+        hist.lookup.return_value = HistoricalResult(
+            kind=HistoricalLookupKind.LIFECYCLE_FOUND_NONE,
+            query=ParsedQuery(raw_text="x", intent=QueryIntent.HISTORICAL_LOOKUP,
+                              month=None, day=None, destination_hint="不丹", matched_year=None),
+        )
+        result = router.dispatch(_mk_event("/小弟 不丹有沒有成團"))
+        self.assertEqual(result.action, DispatchAction.REPLY)
+        self.assertEqual(result.audit_extras["invocation"], "prefix:/小弟")
+
+    def test_prefix_with_leading_whitespace_still_triggers(self):
+        router, avail, _ = _mk_router()
+        avail.check.return_value = CheckResult(
+            kind=CheckResultKind.FOUND_NONE,
+            query=ParsedQuery(raw_text="x", intent=QueryIntent.AVAILABILITY_CHECK,
+                              month=12, day=27, destination_hint="江南", matched_year=2026),
+        )
+        result = router.dispatch(_mk_event("  小弟 12/27 江南"))
+        self.assertEqual(result.action, DispatchAction.REPLY)
+
+    def test_no_space_after_prefix_still_triggers(self):
+        router, avail, _ = _mk_router()
+        avail.check.return_value = CheckResult(
+            kind=CheckResultKind.FOUND_NONE,
+            query=ParsedQuery(raw_text="x", intent=QueryIntent.AVAILABILITY_CHECK,
+                              month=12, day=27, destination_hint="江南", matched_year=2026),
+        )
+        result = router.dispatch(_mk_event("小弟12/27 江南"))
+        self.assertEqual(result.action, DispatchAction.REPLY)
+        # cleaned text should drop the "小弟" prefix
+        self.assertEqual(result.audit_extras["cleaned_text"], "12/27 江南")
+
+    def test_prefix_mid_sentence_does_NOT_trigger(self):
+        """'我小弟最近想旅遊' must NOT trigger — '小弟' is not at start."""
+        router, avail, _ = _mk_router()
+        result = router.dispatch(_mk_event("我小弟最近想旅遊"))
+        self.assertEqual(result.action, DispatchAction.SILENT)
+        self.assertIn("not invoked", result.skip_reason or "")
+        avail.check.assert_not_called()
+
+    def test_mention_wins_over_prefix(self):
+        """If BOTH mention.isSelf and prefix are present, mention path is used
+        (richer signal with exact LINE-provided offsets)."""
+        router, avail, _ = _mk_router()
+        avail.check.return_value = CheckResult(
+            kind=CheckResultKind.FOUND_NONE,
+            query=ParsedQuery(raw_text="x", intent=QueryIntent.AVAILABILITY_CHECK,
+                              month=12, day=27, destination_hint="江南", matched_year=2026),
+        )
+        result = router.dispatch(_mk_event(
+            "@小弟 12/27 江南", mention_is_self=True,
+            mention_self_index=0, mention_self_length=3,
+        ))
+        self.assertEqual(result.audit_extras["invocation"], "mention")
+
+    def test_configurable_prefixes_override_default(self):
+        router, avail, _ = _mk_router(invocation_prefixes=["阿玩", "bot"])
+        avail.check.return_value = CheckResult(
+            kind=CheckResultKind.FOUND_NONE,
+            query=ParsedQuery(raw_text="x", intent=QueryIntent.AVAILABILITY_CHECK,
+                              month=12, day=27, destination_hint="江南", matched_year=2026),
+        )
+        # "小弟" no longer triggers
+        result = router.dispatch(_mk_event("小弟 12/27 江南"))
+        self.assertEqual(result.action, DispatchAction.SILENT)
+        # "阿玩" does
+        result = router.dispatch(_mk_event("阿玩 12/27 江南"))
+        self.assertEqual(result.action, DispatchAction.REPLY)
 
 
 class TestStripBotMention(unittest.TestCase):

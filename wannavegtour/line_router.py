@@ -4,23 +4,28 @@ Sits between line_listener (raw HTTP / signature) and the actual workers
 (availability_checker / historical_lookup). Pure logic — no I/O of its own
 beyond what the injected workers/client perform. Easy to unit-test.
 
-Policy (Pattern B — passive listening):
+Policy (Pattern B — passive listening with two invocation paths):
+
     Bot is a SILENT OBSERVER by default. Every text message is parsed and
     classified (intent recorded in audit log for training / replay), but
-    no reply is sent unless the bot is explicitly @mentioned. This keeps
-    the OP group's natural conversation undisturbed.
+    no reply is sent unless the bot is INVOKED via one of:
 
-    @mention strips the bot reference from text, then routes:
+      1. Structured @mention (mention.isSelf=true)
+         — works on iOS/Android LINE ≥ 14.17.0 only
+      2. Text prefix at start of message (line_config.invocation_prefixes)
+         — works on EVERY LINE client incl. Mac/Windows desktop where
+         Bot Mention autocomplete is not supported
+         — default prefixes: 小弟 / @小弟 / /小弟
+
+    When invoked: strip the invocation token (mention range OR prefix),
+    then route by intent:
         AVAILABILITY_CHECK → AvailabilityChecker  → reply
         HISTORICAL_LOOKUP  → HistoricalLookup     → reply
-        PRICE_EDIT_HINT    → reply with refusal text (NEVER auto-execute;
-                             also NEVER push to Telegram unsolicited)
+        PRICE_EDIT_HINT    → reply with refusal text (NEVER auto-execute)
         UNCLEAR            → reply with ack/help text
 
-    No @mention:
-        Any intent → silent. Audit log captures text + classified intent.
-
-    Non-text / non-message events: silent.
+    When not invoked: silent. Audit log captures text + classified intent
+    + sub-signals for future self-evolution training data.
 
 Group whitelist: if line config's `target_groups` is non-empty, only
 events from those groups are processed. Empty list = any group accepted.
@@ -39,12 +44,13 @@ from .query_parser import QueryIntent, parse_query
 from .response_formatter import format_historical, format_response
 
 
-# Message returned when bot is @mentioned but the message isn't classifiable.
+# Message returned when bot is invoked but the message isn't classifiable.
 UNCLEAR_ACK_TEXT = (
     "🤔 看不出你想問什麼。試試：\n"
-    "  • 『@bot 3/5 江南還剩多少？』(查名額)\n"
-    "  • 『@bot 7/22 暑假成團多少人』(問歷史)\n"
-    "  • 『@bot 今年賣最好的團』(排行)\n"
+    "  • 『小弟 3/5 江南還剩多少？』(查名額)\n"
+    "  • 『小弟 7/22 暑假成團多少人』(問歷史)\n"
+    "  • 『小弟 今年賣最好的團』(排行)\n"
+    "  (手機 LINE 也可改用 @bot autocomplete)"
 )
 
 PRICE_EDIT_REFUSAL_TEXT = (
@@ -111,16 +117,16 @@ class LineRouter:
                     skip_reason=f"group {event.group_id!r} not in target_groups whitelist",
                 )
 
-        # 3. PASSIVE LISTENING (Pattern B): without an @bot mention, the bot
-        # stays silent. We still parse + classify the intent so the audit log
-        # captures it as a training signal, but no LINE reply is sent.
-        if not event.mention_is_self:
+        # 3. PASSIVE LISTENING (Pattern B): bot stays silent unless invoked
+        # via @mention OR a configured text prefix.
+        invocation = _detect_invocation(event, self.line_config.invocation_prefixes)
+        if invocation is None:
             parsed = parse_query(event.text)
             return DispatchResult(
                 action=DispatchAction.SILENT,
                 target_id=target_id,
                 intent=parsed.intent.value, worker=None,
-                skip_reason="passive listening: not @mentioned",
+                skip_reason="passive listening: not invoked (@mention nor prefix)",
                 audit_extras={
                     "would_have_replied": parsed.intent.value in (
                         QueryIntent.AVAILABILITY_CHECK.value,
@@ -131,10 +137,9 @@ class LineRouter:
                 },
             )
 
-        # 4. @mentioned — strip the bot reference and dispatch by intent.
-        clean_text = _strip_bot_mention(
-            event.text, event.mention_self_index, event.mention_self_length,
-        )
+        # 4. Invoked — strip the trigger token and dispatch by intent.
+        invocation_kind, strip_index, strip_length = invocation
+        clean_text = _strip_bot_mention(event.text, strip_index, strip_length)
         parsed = parse_query(clean_text)
         intent = parsed.intent
 
@@ -147,7 +152,7 @@ class LineRouter:
                 reply_token=event.reply_token,
                 intent=intent.value, worker="availability_checker",
                 audit_extras={"result_kind": check.kind.value, "n_products": len(check.products),
-                              "cleaned_text": clean_text},
+                              "invocation": invocation_kind, "cleaned_text": clean_text},
             )
 
         if intent == QueryIntent.HISTORICAL_LOOKUP:
@@ -159,32 +164,31 @@ class LineRouter:
                 reply_token=event.reply_token,
                 intent=intent.value, worker="historical_lookup",
                 audit_extras={"result_kind": hist.kind.value, "n_products": len(hist.products),
-                              "cleaned_text": clean_text},
+                              "invocation": invocation_kind, "cleaned_text": clean_text},
             )
 
         if intent == QueryIntent.PRICE_EDIT_HINT:
             # Bot was explicitly invoked AND asked to change price.
             # Reply with refusal so the user sees we heard but won't act.
-            # No Telegram alert — even @mention does not authorize Telegram noise
-            # under passive-listening discipline; user is in the loop already.
             return DispatchResult(
                 action=DispatchAction.REPLY,
                 reply_text=PRICE_EDIT_REFUSAL_TEXT,
                 target_id=target_id,
                 reply_token=event.reply_token,
                 intent=intent.value, worker=None,
-                audit_extras={"original_text": event.text, "cleaned_text": clean_text},
+                audit_extras={"original_text": event.text, "invocation": invocation_kind,
+                              "cleaned_text": clean_text},
             )
 
-        # intent == UNCLEAR but @mentioned — give an ack so user knows we heard.
+        # intent == UNCLEAR but invoked — give an ack so user knows we heard.
         return DispatchResult(
             action=DispatchAction.REPLY,
             reply_text=UNCLEAR_ACK_TEXT,
             target_id=target_id,
             reply_token=event.reply_token,
             intent=intent.value, worker=None,
-            skip_reason="unclear but @mentioned, replying with ack",
-            audit_extras={"cleaned_text": clean_text},
+            skip_reason=f"unclear but invoked via {invocation_kind}, replying with ack",
+            audit_extras={"invocation": invocation_kind, "cleaned_text": clean_text},
         )
 
     def _group_allowed(self, group_id: str | None) -> bool:
@@ -193,6 +197,41 @@ class LineRouter:
         if not group_id:
             return False
         return group_id in self.line_config.target_groups
+
+
+def _detect_invocation(
+    event: LineEvent, prefixes: tuple[str, ...],
+) -> tuple[str, int, int] | None:
+    """Detect whether the bot is being invoked, and how.
+
+    Returns (invocation_kind, strip_index, strip_length) when invoked, else None.
+    invocation_kind is "mention" (LINE @autocomplete) or "prefix:<token>" (text trigger).
+
+    Priority: structured @mention wins (richer signal, exact char offsets from LINE).
+    Falls back to checking if text.strip() starts with any configured prefix.
+    """
+    if event.mention_is_self:
+        # mention_self_index/length may still be None (older LINE versions);
+        # _strip_bot_mention handles None gracefully.
+        idx = event.mention_self_index if event.mention_self_index is not None else 0
+        ln = event.mention_self_length if event.mention_self_length is not None else 0
+        return ("mention", idx, ln)
+
+    text = (event.text or "").strip()
+    if not text:
+        return None
+
+    # We want the strip index in the ORIGINAL text, not the stripped one, so
+    # _strip_bot_mention removes the right range. Find where the trimmed text
+    # starts in the original.
+    offset = (event.text or "").find(text)
+    if offset < 0:
+        offset = 0
+
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            return (f"prefix:{prefix}", offset, len(prefix))
+    return None
 
 
 def _strip_bot_mention(text: str, index: int | None, length: int | None) -> str:

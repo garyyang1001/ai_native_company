@@ -103,6 +103,12 @@ def credential_path_for_env() -> Path:
 
 # --- LINE credentials -------------------------------------------------------
 
+# Default text prefixes that invoke the bot (alternative to mobile @mention).
+# Strict startswith match after .strip(). Lets desktop LINE users (where Bot
+# Mention autocomplete isn't supported) trigger the bot the same way.
+DEFAULT_INVOCATION_PREFIXES = ("小弟", "@小弟", "/小弟")
+
+
 @dataclass(frozen=True)
 class LineConfig:
     """LINE Messaging API credentials for the wannavegtour bot."""
@@ -111,7 +117,8 @@ class LineConfig:
     channel_access_token: str
     bot_basic_id: str
     bot_user_id: str | None
-    target_groups: list[str]    # whitelist; empty list = accept any group
+    target_groups: list[str]              # whitelist; empty list = accept any group
+    invocation_prefixes: tuple[str, ...]  # text prefixes that invoke the bot
     site: str = "wannavegtour"
     api_root: str = "https://api.line.me"
 
@@ -160,6 +167,17 @@ def load_line_config(path: Path | str | None = None, *, allow_loose_perms: bool 
     if not isinstance(target_groups, list):
         raise CredentialError(f"LINE credential {p}: target_groups must be a list")
 
+    raw_prefixes = raw.get("invocation_prefixes")
+    if raw_prefixes is None:
+        prefixes: tuple[str, ...] = tuple(DEFAULT_INVOCATION_PREFIXES)
+    elif isinstance(raw_prefixes, list) and all(isinstance(x, str) for x in raw_prefixes):
+        # Filter out empty strings — those would match every message and break passive mode.
+        prefixes = tuple(s for s in raw_prefixes if s.strip())
+    else:
+        raise CredentialError(
+            f"LINE credential {p}: invocation_prefixes must be a list of non-empty strings"
+        )
+
     return LineConfig(
         channel_id=str(raw["channel_id"]),
         channel_secret=str(raw["channel_secret"]),
@@ -167,5 +185,6 @@ def load_line_config(path: Path | str | None = None, *, allow_loose_perms: bool 
         bot_basic_id=str(raw["bot_basic_id"]),
         bot_user_id=(str(raw["bot_user_id"]) if raw.get("bot_user_id") else None),
         target_groups=[str(g) for g in target_groups],
+        invocation_prefixes=prefixes,
         site=raw.get("site", "wannavegtour"),
     )
