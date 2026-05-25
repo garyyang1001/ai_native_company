@@ -80,6 +80,27 @@ class TestFoundOne(unittest.TestCase):
         out = format_response(r)
         self.assertNotIn("原價", out)
 
+    def test_total_sales_line_shown_when_nonzero(self):
+        r = CheckResult(
+            kind=CheckResultKind.FOUND_ONE, query=make_query(),
+            products=[make_product(total_sales=12)],
+        )
+        out = format_response(r)
+        self.assertIn("已報名：12 人", out)
+
+    def test_total_sales_hidden_when_zero(self):
+        r = CheckResult(kind=CheckResultKind.FOUND_ONE, query=make_query(), products=[make_product()])
+        out = format_response(r)
+        self.assertNotIn("已報名", out)
+
+    def test_total_sales_hidden_when_manage_stock_false(self):
+        r = CheckResult(
+            kind=CheckResultKind.FOUND_ONE, query=make_query(),
+            products=[make_product(manage_stock=False, total_sales=20)],
+        )
+        out = format_response(r)
+        self.assertNotIn("已報名", out)
+
 
 class TestFoundMany(unittest.TestCase):
     def test_lists_all_with_index(self):

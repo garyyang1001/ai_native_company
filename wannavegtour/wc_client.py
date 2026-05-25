@@ -163,6 +163,8 @@ class WCClient:
         status: str | Iterable[str] = "publish",
         per_page: int = 50,
         page: int = 1,
+        orderby: str | None = None,
+        order: str = "desc",
     ) -> list[WCProduct]:
         """List products.
 
@@ -175,13 +177,19 @@ class WCClient:
         if not isinstance(status, str):
             seen: dict[int, WCProduct] = {}
             for s in status:
-                for p in self.search_products(search=search, status=s, per_page=per_page, page=page):
+                for p in self.search_products(
+                    search=search, status=s, per_page=per_page, page=page,
+                    orderby=orderby, order=order,
+                ):
                     seen[p.id] = p
             return list(seen.values())
 
         params: dict[str, Any] = {"per_page": per_page, "page": page, "status": status}
         if search:
             params["search"] = search
+        if orderby is not None:
+            params["orderby"] = orderby
+            params["order"] = order
         raw = self._get("products", params=params)
         if not isinstance(raw, list):
             raise WCAPIError(f"expected list from /products, got {type(raw).__name__}")

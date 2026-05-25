@@ -56,6 +56,7 @@ def _format_one_product(p: WCProduct) -> str:
     lines = [
         f"🎯 {p.name}",
         _format_stock_line(p),
+        *([f"👥 已報名：{p.total_sales} 人"] if p.manage_stock and p.total_sales > 0 else []),
         f"💰 售價：{_format_price(p)}",
     ]
     if p.days:

@@ -95,9 +95,17 @@ class HistoricalLookup:
     # --- aggregate path ------------------------------------------------------
 
     def _aggregate(self, query: ParsedQuery, *, year_qualifier: str | None) -> HistoricalResult:
-        """Fan out + rank by total_sales desc. No per-product enrichment."""
+        """Use WC popularity ordering per status, then rank by total_sales desc."""
         try:
-            collected = self._fan_out_all_statuses()
+            by_id: dict[int, WCProduct] = {}
+            for status in _ALL_STATUSES:
+                batch = self.client.search_products(
+                    status=status, per_page=_AGGREGATE_TOP_N,
+                    orderby="popularity", order="desc",
+                )
+                for p in batch:
+                    by_id[p.id] = p
+            collected = list(by_id.values())
         except WCAPIError as e:
             return HistoricalResult(
                 kind=HistoricalLookupKind.ERROR, query=query, error_message=str(e),
@@ -111,8 +119,9 @@ class HistoricalLookup:
                 collected = [p for p in collected if p.date_modified.startswith(str(year_target))]
 
         # Rank by total_sales desc; tiebreak by date_modified desc.
+        collected = [p for p in collected if p.total_sales > 0]
         collected.sort(key=lambda p: (p.total_sales, p.date_modified), reverse=True)
-        top = [p for p in collected if p.total_sales > 0][:_AGGREGATE_TOP_N]
+        top = collected[:_AGGREGATE_TOP_N]
 
         if not top:
             return HistoricalResult(

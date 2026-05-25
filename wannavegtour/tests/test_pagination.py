@@ -13,16 +13,24 @@ from wannavegtour import (
     HistoricalLookupKind,
     parse_query,
 )
+from wannavegtour.historical_lookup import _AGGREGATE_TOP_N, _ALL_STATUSES
 from wannavegtour.wc_client import WCClient, WCProduct
 
 
-def _mkproduct(id: int, name: str, departure_date: str | None = None, status: str = "publish"):
+def _mkproduct(
+    id: int,
+    name: str,
+    departure_date: str | None = None,
+    status: str = "publish",
+    total_sales: int = 5,
+    date_modified: str = "2026-05-01T00:00:00",
+):
     return WCProduct(
         id=id, name=name, slug=f"p-{id}", status=status,
         permalink=f"https://x/p-{id}/",
         regular_price="50000", sale_price="",
         stock_quantity=10, manage_stock=True, stock_status="instock",
-        total_sales=5, date_modified="2026-05-01T00:00:00",
+        total_sales=total_sales, date_modified=date_modified,
         departure_date=departure_date,
         departure_month=None, days=None, dep_airport=[], categories=[],
     )
@@ -101,6 +109,69 @@ class TestHistoricalPagination(unittest.TestCase):
         self.assertEqual(statuses_called, {"publish", "private", "draft"})
         pages_per_status = max(c[1] for c in calls)
         self.assertEqual(pages_per_status, h.SEARCH_MAX_PAGES)
+
+
+class TestHistoricalAggregateOrderby(unittest.TestCase):
+    """Aggregate ranking should use WC server-side popularity ordering."""
+
+    def test_aggregate_uses_orderby_popularity(self):
+        client = MagicMock(spec=WCClient)
+        client.search_products.return_value = []
+
+        h = HistoricalLookup(client)
+        h.lookup(parse_query("今年賣最好的團"))
+
+        self.assertEqual(client.search_products.call_count, len(_ALL_STATUSES))
+        for call in client.search_products.call_args_list:
+            kwargs = call.kwargs
+            self.assertIn(kwargs["status"], _ALL_STATUSES)
+            self.assertEqual(kwargs["orderby"], "popularity")
+            self.assertEqual(kwargs["order"], "desc")
+            self.assertEqual(kwargs["per_page"], _AGGREGATE_TOP_N)
+            self.assertIn(kwargs.get("page", 1), (1, None))
+
+    def test_aggregate_dedupes_across_statuses(self):
+        client = MagicMock(spec=WCClient)
+
+        def side_effect(*, search=None, status="publish", per_page=50, page=1, orderby=None, order="desc"):
+            return {
+                "publish": [
+                    _mkproduct(1, "A", status="publish", total_sales=20),
+                    _mkproduct(2, "B", status="publish", total_sales=10),
+                ],
+                "private": [
+                    _mkproduct(1, "A duplicate", status="private", total_sales=20),
+                    _mkproduct(3, "C", status="private", total_sales=5),
+                ],
+                "draft": [],
+            }[status]
+
+        client.search_products.side_effect = side_effect
+        h = HistoricalLookup(client)
+        result = h.lookup(parse_query("歷年賣最好的團"))
+
+        ids = [p.id for p in result.products]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_aggregate_still_filters_zero_sales(self):
+        client = MagicMock(spec=WCClient)
+
+        def side_effect(*, search=None, status="publish", per_page=50, page=1, orderby=None, order="desc"):
+            return {
+                "publish": [
+                    _mkproduct(1, "A", status="publish", total_sales=0),
+                    _mkproduct(2, "B", status="publish", total_sales=12),
+                ],
+                "private": [_mkproduct(3, "C", status="private", total_sales=0)],
+                "draft": [_mkproduct(4, "D", status="draft", total_sales=3)],
+            }[status]
+
+        client.search_products.side_effect = side_effect
+        h = HistoricalLookup(client)
+        result = h.lookup(parse_query("歷年賣最好的團"))
+
+        self.assertEqual([p.id for p in result.products], [2, 4])
+        self.assertTrue(all(p.total_sales > 0 for p in result.products))
 
 
 if __name__ == "__main__":
