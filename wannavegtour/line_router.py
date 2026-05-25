@@ -50,8 +50,55 @@ UNCLEAR_ACK_TEXT = (
     "  • 『小弟 3/5 江南還剩多少？』(查名額)\n"
     "  • 『小弟 7/22 暑假成團多少人』(問歷史)\n"
     "  • 『小弟 今年賣最好的團』(排行)\n"
-    "  (手機 LINE 也可改用 @bot autocomplete)"
+    "  (打『小弟 ?』看完整功能說明)"
 )
+
+
+# Triggers for the help command. Exact match after .strip() and lowercasing
+# ASCII; CJK question marks kept as-is. Keep it short — exhaustive matching
+# is the parser's job, not the help gate's.
+HELP_TRIGGERS = frozenset({
+    "?", "？", "??", "？？",
+    "help", "Help", "HELP",
+    "幫助", "說明", "指令", "功能", "怎麼用",
+})
+
+# Plain-Chinese functionality summary. Printed when user invokes bot with
+# just a help trigger (e.g. `小弟 ?`). Stays factual — only lists what
+# actually ships today, not aspirational features.
+HELP_TEXT = (
+    "🤖 小弟現在會做這幾件事：\n"
+    "\n"
+    "📋 1. 查名額 / 售價（最常用）\n"
+    "  • 小弟 12/27 江南還收嗎\n"
+    "  • 小弟 9/15 韓國首爾還剩多少\n"
+    "  → 回剩餘位置、售價、出發地、連結\n"
+    "\n"
+    "📊 2. 問歷史團（成團 / 額滿 / 關團 多少人）\n"
+    "  • 小弟 7/22 暑假成團多少人\n"
+    "  • 小弟 不丹有沒有成團\n"
+    "  • 小弟 過年那團最後額滿了嗎\n"
+    "\n"
+    "🏆 3. 賣最好排行（看 TOP 10）\n"
+    "  • 小弟 今年賣最好的團\n"
+    "  • 小弟 去年賣最多\n"
+    "\n"
+    "🙅 4. 改價 / 改網頁（還沒上線）\n"
+    "  偵測到會拒絕，請手動進 WordPress 後台改。\n"
+    "\n"
+    "📌 怎麼叫小弟出來：\n"
+    "  • 任何裝置：『小弟 …』『@小弟 …』『/小弟 …』\n"
+    "  • 手機 LINE 也可直接 @阿玩旅遊OP專用機器人\n"
+    "  • 沒叫到的訊息小弟不會插嘴，但會默默記錄（供未來分析）\n"
+    "\n"
+    "📌 看資料注意：\n"
+    "  名額 / 售價來自 WordPress（WC stock）；若有保留位 / 候補請以 OP 為準。"
+)
+
+
+def _is_help_request(cleaned_text: str) -> bool:
+    """True when invoked text (post-strip) is just a help trigger."""
+    return cleaned_text.strip() in HELP_TRIGGERS
 
 PRICE_EDIT_REFUSAL_TEXT = (
     "🙅 偵測到改價/改資訊指令（Type 2）— 自動執行尚未上線，請手動到 WordPress 後台處理。"
@@ -137,9 +184,22 @@ class LineRouter:
                 },
             )
 
-        # 4. Invoked — strip the trigger token and dispatch by intent.
+        # 4. Invoked — strip the trigger token.
         invocation_kind, strip_index, strip_length = invocation
         clean_text = _strip_bot_mention(event.text, strip_index, strip_length)
+
+        # 4a. Help command? Check BEFORE parse_query so '?' alone is not
+        # treated as UNCLEAR; a help request is its own intent.
+        if _is_help_request(clean_text):
+            return DispatchResult(
+                action=DispatchAction.REPLY,
+                reply_text=HELP_TEXT,
+                target_id=target_id,
+                reply_token=event.reply_token,
+                intent="help_request", worker=None,
+                audit_extras={"invocation": invocation_kind, "cleaned_text": clean_text},
+            )
+
         parsed = parse_query(clean_text)
         intent = parsed.intent
 

@@ -264,6 +264,90 @@ class TestInvocationByPrefix(unittest.TestCase):
         self.assertEqual(result.action, DispatchAction.REPLY)
 
 
+class TestHelpCommand(unittest.TestCase):
+    """`小弟 ?` (and variants) return a plain-Chinese functionality summary."""
+
+    def test_question_mark_alone_triggers_help(self):
+        router, avail, hist = _mk_router()
+        result = router.dispatch(_mk_event("小弟 ?"))
+        self.assertEqual(result.action, DispatchAction.REPLY)
+        self.assertEqual(result.intent, "help_request")
+        self.assertIn("查名額", result.reply_text or "")
+        self.assertIn("問歷史團", result.reply_text or "")
+        self.assertIn("賣最好排行", result.reply_text or "")
+        avail.check.assert_not_called()
+        hist.lookup.assert_not_called()
+
+    def test_fullwidth_question_mark_triggers_help(self):
+        router, _, _ = _mk_router()
+        result = router.dispatch(_mk_event("小弟 ？"))
+        self.assertEqual(result.intent, "help_request")
+
+    def test_english_help_triggers_help(self):
+        router, _, _ = _mk_router()
+        for trigger in ("小弟 help", "小弟 Help", "小弟 HELP"):
+            result = router.dispatch(_mk_event(trigger))
+            self.assertEqual(result.intent, "help_request", trigger)
+
+    def test_chinese_help_words_trigger(self):
+        router, _, _ = _mk_router()
+        for trigger in ("小弟 幫助", "小弟 說明", "小弟 指令", "小弟 功能", "小弟 怎麼用"):
+            result = router.dispatch(_mk_event(trigger))
+            self.assertEqual(result.intent, "help_request", trigger)
+
+    def test_help_via_at_prefix(self):
+        router, _, _ = _mk_router()
+        result = router.dispatch(_mk_event("@小弟 ?"))
+        self.assertEqual(result.intent, "help_request")
+
+    def test_help_via_mobile_mention(self):
+        router, _, _ = _mk_router()
+        result = router.dispatch(_mk_event(
+            "@阿玩旅遊OP專用機器人 ?", mention_is_self=True,
+            mention_self_index=0, mention_self_length=12,
+        ))
+        self.assertEqual(result.intent, "help_request")
+
+    def test_question_mark_inside_real_query_does_NOT_trigger_help(self):
+        """『小弟 12/27 江南還收嗎？』has '?' but isn't a help request — it's
+        a real availability question that just happens to end with ?."""
+        router, avail, _ = _mk_router()
+        avail.check.return_value = CheckResult(
+            kind=CheckResultKind.FOUND_NONE,
+            query=ParsedQuery(raw_text="x", intent=QueryIntent.AVAILABILITY_CHECK,
+                              month=12, day=27, destination_hint="江南", matched_year=2026),
+        )
+        result = router.dispatch(_mk_event("小弟 12/27 江南還收嗎？"))
+        self.assertEqual(result.intent, QueryIntent.AVAILABILITY_CHECK.value)
+        self.assertNotEqual(result.intent, "help_request")
+        avail.check.assert_called_once()
+
+    def test_question_mark_without_invocation_stays_silent(self):
+        """Bare '?' (no 小弟 / no @) must NOT trigger help — bot is passive
+        unless explicitly invoked."""
+        router, _, _ = _mk_router()
+        result = router.dispatch(_mk_event("?"))
+        self.assertEqual(result.action, DispatchAction.SILENT)
+
+    def test_help_only_invocation_with_extra_text_is_NOT_help(self):
+        """『小弟 ? 還有別的嗎』isn't a help request — the trailing text
+        means the user actually asked something; fall through to parser.
+
+        The exact downstream intent is the parser's call (it may pick up
+        '還有' as an availability keyword and route to NEED_DATE, etc.);
+        what matters here is that the help gate did NOT fire."""
+        router, avail, _ = _mk_router()
+        avail.check.return_value = CheckResult(
+            kind=CheckResultKind.NEED_DATE,
+            query=ParsedQuery(raw_text="x", intent=QueryIntent.AVAILABILITY_CHECK,
+                              month=None, day=None,
+                              destination_hint="還有別的嗎", matched_year=None),
+            advisory=["請補出發日"],
+        )
+        result = router.dispatch(_mk_event("小弟 ? 還有別的嗎"))
+        self.assertNotEqual(result.intent, "help_request")
+
+
 class TestStripBotMention(unittest.TestCase):
     """Cover the _strip_bot_mention helper directly — covers CJK + edge cases."""
 
