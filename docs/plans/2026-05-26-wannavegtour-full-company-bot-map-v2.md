@@ -62,19 +62,55 @@ Gary 在這次討論之間把 Hermes 從 v0.8.0 升到 **v0.14.0 (release 2026.5
 - 重啟舊 listener:`bin/wannavegtour-line-up-linux`
 - Hermes gateway 停下(`hermes gateway stop`)或留著無流量(沒人指過去就閒置)
 
-### Code is Law 跟 α 方案的衝突(這是 agent 設定要解決的)
+### Code is Law 跟 α 方案的衝突(已解決 — 走 Option E)
 
-方案 α 是 Hermes 接管完整流程:**LINE webhook → Hermes adapter → AIAgent(LLM)→ Hermes 回 LINE**。
+方案 α 預設行為是 **LINE webhook → Hermes adapter → AIAgent(LLM)直接寫 reply → Hermes 回 LINE**,違反 P4。
 
-問題:這條預設路徑裡,**LLM 完整決定 reply 內容** — 違反 P4「Code is Law:LLM 永遠不能直接動 action 或寫 reply 文字」。
+**2026-05-26 解決**: Gary 推回 D (純規則,LLM 不在流程) 的初步推薦,要求「智能在 harness 內運作」(harness engineering)。經對齊 Diana YC talk(`EN7frwQIbKc-transcript.txt` line 139-149 Strong DM 「software factory」案例) + 2026 harness engineering 領域研究,合成新方案 **Option E**。
 
-解法選項(等下次討論):
-- **A. 在 Hermes 內把 AIAgent subclass 成 deterministic dispatcher**(用 LLM 只當 JSON classifier),所有 reply 還是程式 template 生成。這需要動 Hermes 程式碼,跟「不繞路」精神有張力。
-- **B. 讓 Hermes 用既有 LINE plugin,但配 deterministic tools / skills,並用 prompt 強制 agent 只回呼 tool**,不直接寫文字。LLM 跑 tool calling loop,Code is Law 守在 tool 那層。
-- **C. Hermes 跑 agent,但每次 reply 在 send 之前過一個 sidecar 驗證 worker**(`closed_loop_kernel` 的 sandbox 模式),違反就 escalate 不發。
-- **D. 維持現狀,Hermes 接 webhook 後不直接呼叫 AIAgent,而是先打 webhook 給我們自己的 line_router(dispatch 程式),由 line_router 決定是否回**。這 effectively 把 Hermes 當 dumb webhook proxy,違反「用 Hermes 原生路徑」精神。
+**Option E:LLM 提案 + Harness 驗證 + 迭代或 escalate**
 
-我先列這 4 條,等 Gary 想清楚要走哪條(或第 5 條)再寫實作細節。
+```
+LINE webhook
+  → Hermes LINE adapter (HMAC / reply token / push fallback)
+  → Hermes AIAgent (Codex GPT-5.4 via OAuth)
+      └─ SOUL.md 強制工具順序:query_intent → fetch_wc_data
+         → compose_reply → validate_reply → send_reply / escalate
+  → AIAgent 內部 loop:
+      tool: query_intent(text)             → JSON {intent, entities, confidence}
+      tool: fetch_wc_data(intent, entities) → 真實 WC 資料(或 null)
+      tool: compose_reply(intent, data)     → template 生 reply 草稿
+      tool: validate_reply(draft, ...)      → pass / fail + reasons
+        ├─ pass → tool: send_reply(draft)   → Hermes 送 LINE
+        ├─ fail → agent 看 reasons 修一版重 validate(max 3 次)
+        └─ 3 次都 fail → tool: escalate_to_gary(...) → Telegram
+  → 全程進 closed_loop_kernel events 表
+```
+
+**為什麼這滿足所有條件**:
+
+| 原則 | Option E 表現 |
+|---|---|
+| Code is Law(control flow 在 code) | ✅ Tool contract 是 code,LLM 只在 tool 間決定順序,SOUL 強制順序 |
+| LLM 不直接寫 reply | ✅ reply 由 `compose_reply` template 生成,LLM 不寫字 |
+| 智能,不是 dumb 規則 | ✅ `query_intent` tool 內部可用 LLM 補規則表抓不到的 fuzzy intent |
+| Diana spec + harness + iterate + threshold | ✅ validate = harness,retry = iterate,3 次 = threshold |
+| Hermes 原生路徑 | ✅ 用 AIAgent + tool-calling,idiomatic |
+| Token maxing (Diana) | ✅ 每筆 LINE 訊息可能 3-5 次 LLM call |
+| Closed loop(每筆進 kernel) | ✅ events 表自然存所有 cycle,可 replay |
+| OAuth 訂閱計費 | ✅ 留在 Hermes `openai-codex` shim(Anthropic 2026 已禁第三方 Claude OAuth) |
+| 不繞路 | ✅ Hermes 從頭管到尾 |
+
+**詳細實作 spec**: 見 [`docs/plans/2026-05-26-op-bot-hermes-harness-spec.md`](./2026-05-26-op-bot-hermes-harness-spec.md)(SOUL.md 完整稿、6 個 tool 規格、validator 規則、test plan、edge case 清單)。
+
+### Historical candidates(已捨棄,留檔)
+
+下面 4 個是 2026-05-26 早上提出的初版候選,**已被 Option E 取代**,留檔供未來決策回溯:
+
+- ~~**A. AIAgent subclass 成 deterministic dispatcher**~~ — LLM 當 JSON classifier。被取代理由:仍要 hack Hermes 程式碼;Diana harness engineering 模式更接近 Option E 的「tool 順序強制 + iterate」。
+- ~~**B. SOUL prompt 強制只 call tool**~~ — 純靠 prompt 約束 LLM。被取代理由:prompt 不是強制,LLM 不爽會違反;Option E 的「強制工具順序 + validator gate」是真正可驗證的 harness。
+- ~~**C. Sidecar validator 在 send 前擋**~~ — LLM 寫,validator 一次擋。被取代理由:擋下後沒 retry 路徑,reply 直接失敗;Option E 的「validate 失敗 → agent retry → 三次後 escalate」是 Diana 描述的「iterate until probabilistic satisfaction threshold」。Option E ⊃ C(C 是 E 的一次性簡化版)。
+- ~~**D. Hermes 當 dumb webhook proxy**~~ — LLM 完全不在流程。被取代理由:違反 Gary「不要繞路」+ Diana「token maxing」+ harness engineering 領域研究「natural-language control logic beat Python (+17 pts, 1200→34 calls)」(MindStudio 2026 finding)。
 
 ### Hermes 官方架構驗證結果(2026-05-26 在 DGX 上實際查過)
 

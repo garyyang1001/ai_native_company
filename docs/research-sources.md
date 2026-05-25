@@ -6,13 +6,15 @@
   - 重要主題：AI-native service companies、AI Operating System for Companies、Company Brain。
   - 對本 repo 的啟發：公司要變成 AI 可讀、可查、可閉環調整的系統。
 
-- How To Build A Company With AI From The Ground Up: https://readtube.co/videos/how-to-build-a-company-with-ai-from-the-ground-up-EN7frwQIbKc
-  - 2026-04-24 的 YC talk 轉錄/摘要頁。
+- How To Build A Company With AI From The Ground Up: https://youtu.be/EN7frwQIbKc
+  - 2026-04-24 的 YC talk，Diana (YC partner) 講 AI native company。
   - 對本 repo 的啟發：AI 原生公司不是單純導入工具，而是讓公司工作流進入 intelligence layer。
+  - **重點段落**：line 124-149「software factories — specs and scenario-based validations drive agents to write tests and iterate on code until it meets a probabilistic satisfaction threshold and it works」— 即 Harness Engineering 思想。
 
-- 本地逐字稿：`X_JsIHUfUjc-transcript.txt`
-  - 本 repo 的第一手語意來源。
-  - 後續架構判斷應優先對齊這份逐字稿，而不是只看二手摘要。
+- 本地逐字稿（兩份，互補）：
+  - `X_JsIHUfUjc-transcript.txt` — Gary 那場（13:29，391 segments）：sensor layer / record everything / closed loop / monitoring / self-improvement。
+  - `EN7frwQIbKc-transcript.txt` — Diana 那場（10:26，252 segments）：software factory / spec + test harness / token maxing / 3 archetypes (IC / DRI / AI founder)。
+  - 兩份都是第一手語意來源。後續架構判斷應優先對齊兩份逐字稿，而不是二手摘要。
 
 ## Hermes Agent
 

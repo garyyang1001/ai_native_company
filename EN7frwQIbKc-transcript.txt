@@ -1,0 +1,258 @@
+YouTube Transcript
+Video ID: EN7frwQIbKc
+Duration: 10:26
+Segments: 252
+URL: https://youtu.be/EN7frwQIbKc
+
+0:09 Hi, I'm Diana and I'm a partner at YC.
+0:12 Over the past few months, it's become
+0:14 clear to me that AI is not just going to
+0:17 change how quickly software gets built
+0:19 or what workflows get automated. It's
+0:21 going to fundamentally change the way
+0:23 startup should be run from what roles
+0:25 will exist to what products are possible
+0:28 to build. In this episode, I'm going to
+0:30 discuss how founders should think about
+0:32 building an AI native company, what
+0:34 roles their team should have, and what
+0:36 concrete internal practices they can
+0:38 adopt right now to move much faster.
+0:40 Currently, most people talk about AI in
+0:43 terms of productivity. They'll talk at
+0:45 length about how it can make engineers
+0:46 more productive or say we need to add
+0:49 copilot to existing workflows and ship
+0:52 more features. This framing misses the
+0:54 shift we're currently seeing, which is
+0:57 less about productivity boosts than
+0:59 entirely new capabilities. The right
+1:02 person with AI tools can now build
+1:04 features that used to require an entire
+1:06 team or were just impossible. Thinking
+1:09 about AI in terms of new capabilities
+1:11 has several implications for how
+1:13 founders should run their companies. At
+1:15 a high level, the way to think about AI
+1:17 is that it should not be a tool your
+1:20 company just uses. It should be the
+1:23 operating system your company runs on.
+1:26 Every workflow, every decision and every
+1:29 process should flow through an
+1:30 intelligent layer that is constantly
+1:33 learning and improving. What this means
+1:35 concretely is every important process in
+1:37 your company should be captured by an
+1:39 intelligent close loop. A close loop
+1:41 captures information, feeds it back into
+1:44 an intelligent systems, and improves the
+1:45 process over time. If you've ever
+1:47 studied control systems, you'll be
+1:49 familiar with the difference between an
+1:51 open loop and a closed loop system. Open
+1:53 loops are controlled systems without
+1:55 feedback loops. In the old world,
+1:57 companies basically ran as open loops.
+2:00 You made a decision, executed it, and
+2:02 didn't always systematically measure the
+2:05 outcome and adjust the process. Open
+2:07 loops are inherently lossy. A closed
+2:10 loop, on the other hand, is
+2:11 self-regulating. It continuously
+2:14 monitors its output and adjusts its
+2:16 process to better meet the stated goal.
+2:19 Closed loops are extremely powerful for
+2:21 correctness and stability. With
+2:23 self-improving agents, your company
+2:25 should run as a closed loop. To build
+2:26 these closed loops, you will need to
+2:28 make your entire company queryable. In
+2:32 other words, the whole organization
+2:34 should be legible to AI. Every important
+2:36 action should produce an artifact that
+2:38 the intelligence at the center of the
+2:40 company can learn from and use to
+2:42 self-improve. This means recording your
+2:45 meetings with the AI notetaker,
+2:47 minimizing DMs and emails, and embedding
+2:49 agents throughout communication of all
+2:51 channels. It also means building custom
+2:54 dashboards with everything in the
+2:55 company, revenue, sales, engineering,
+2:58 hiring, ops, everything. Here's a
+3:00 concrete example of how it could work.
+3:02 Take engineering, management, and sprint
+3:05 planning. If you have an agent that has
+3:06 access to your linear tickets, all your
+3:09 Slack engineering channels, all customer
+3:11 feedback from emails or tools like Pylon
+3:14 and GitHub, highle plans in a notion or
+3:16 Google doc, sales calls and recordings
+3:19 from daily standups, then the agent can
+3:22 analyze what was actually shipped in
+3:24 your previous sprint and how well they
+3:26 met customers needs for real. From
+3:29 there, you can go a step further with
+3:32 full visibility into what shipped, what
+3:34 worked, and what didn't. Agents can
+3:36 start looking ahead. They can propose
+3:38 sprint plans for engineers that are way
+3:40 more predictable and accurate and on
+3:42 track. The days of anch manager status
+3:44 rollups that are super lossy are gone.
+3:47 Having managed engineering teams myself
+3:49 and now seeing this across multiple YC
+3:52 companies, this is a gamecher. What used
+3:55 to require constant coordination becomes
+3:58 legible and querable by default. I've
+4:02 seen teams that do this cut their
+4:03 engineering sprint time in half and get
+4:05 close to 10x more done in that time. The
+4:09 overarching principle here is that to
+4:11 get their full capabilities, you need to
+4:13 provide models with as much context as
+4:15 you would provide an employee. When you
+4:18 do this, your company stops operating as
+4:20 a open loop where information is
+4:22 fragmented and manually interpreted. It
+4:24 becomes instead a closed loop system.
+4:27 Status, decisions, and outcomes are
+4:29 continuously captured and fed back into
+4:31 this intelligence layer. The result is a
+4:34 system that always has an upto-date view
+4:36 of what's actually happening. There's
+4:39 also a new paradigm emerging for how the
+4:42 highest velocity companies build product
+4:45 AI software factories. If you're
+4:48 familiar with the testdriven development
+4:50 or TDD, this is the next evolution of
+4:53 that. With software factories, humans
+4:56 write a spec and a set of tests that
+4:59 define success and then AI agents
+5:02 generate the implementation
+5:04 and code and iterate until the test
+5:07 pass. The human defines what to build
+5:10 and judges the output. The actual code
+5:13 is the agent's job. Some companies have
+5:15 already pushed this to the point where
+5:17 their repos contain no handwritten code,
+5:21 just specs and test harnesses. Strong
+5:24 DM's AI team is an example of how to do
+5:27 this. Their end goal was a system that
+5:30 essentially eliminated the need for a
+5:32 human to write or review code. And so
+5:35 they built their own software factory
+5:37 where specs and a scenario based
+5:39 validations drive agents to write tests
+5:41 and iterate on code until it meets a
+5:44 probabilistic satisfaction threshold and
+5:47 it works. This is how you achieve the
+5:50 thousandx engineer that Steve Jay talks
+5:53 about by surrounding a single engineer
+5:56 with a system of agents that enable them
+5:58 to build things they would have never
+6:00 been able to build before. The era of
+6:03 the thousand or even 10,000 X engineer
+6:06 is here. One implication of building
+6:08 your company this way with AI loops
+6:10 everywhere, a queryable organization and
+6:13 software factories is that the classic
+6:15 management hierarchy no longer makes
+6:17 sense. In the old world, you needed
+6:19 middle managers and coordinators to
+6:22 route information inefficiently up and
+6:25 down an organization. In the new world,
+6:28 the intelligence layer serves that
+6:30 purpose. If your company is queryable,
+6:33 artifactrich, and legible to an AI, you
+6:37 should have almost no human middleware.
+6:40 This matters because your company's
+6:41 velocities is only as fast as its
+6:45 information flow. Every layer of human
+6:48 routing you can remove is the direct
+6:50 speed gain. A great example is what Jack
+6:54 Dorsey is doing over at Block. After
+6:56 going deep on the tools, he's come to
+6:59 the same conclusion many have. This is
+7:02 about more than just incremental
+7:04 productivity gains. His view is that if
+7:06 you keep the same org chart and
+7:08 management structure, you've missed the
+7:10 shift entirely. The company itself has
+7:13 to be rebuilt as an intelligence layer
+7:15 with humans at the edge guiding it
+7:17 rather than routing information through
+7:18 it. Going forward, Jack suggests every
+7:21 company will have three employee
+7:23 archetypes. The first is the individual
+7:25 contributor or IC basically the builder
+7:28 operator. This is someone who directly
+7:30 makes and runs things in an AI native
+7:32 company. This is not limited to
+7:34 engineers. Everyone builds and ops
+7:38 support sales. Everyone comes to
+7:41 meetings with working prototypes not
+7:43 pitch decks. Second is the DRRI the
+7:46 directly responsible individual focused
+7:49 on strategy and customer outcomes. This
+7:51 is not a classic manager is the person
+7:53 with a clear responsibility for the
+7:56 result. One person, one outcome, no
+7:59 hiding. The third is the AI founder
+8:02 type. This person still builds, still
+8:05 coaches and leads by example. If you're
+8:07 the founder, this needs to be you at the
+8:09 forefront, showing your team what
+8:12 massive capability gains look like, not
+8:14 delegating your AI strategy to someone
+8:16 else. With this structure, companies
+8:19 will be able to get outsized results
+8:21 with much smaller teams. Maximizing
+8:23 token usage, not headcount, will be the
+8:26 critical shift. The best companies will
+8:28 be the ones that are token maxing. Think
+8:30 of the trade-off this way. One person
+8:32 with AI tools can be the equivalent of
+8:35 what used to take a large engineering
+8:37 team at a preAI company. That means
+8:41 dramatically leaner engineering, design,
+8:43 HR, and admin teams. And so you should
+8:46 be willing to run an uncomfortably high
+8:48 API bill because it's replacing what
+8:51 would have taken a far more expensive
+8:53 and inflated headcount. But don't just
+8:57 take my word for any of this. You cannot
+9:00 outsource your conviction on the power
+9:02 of these tools. You need to develop it
+9:04 yourself by actually sitting with coding
+9:06 agents and using them until you start to
+9:08 break your own priors about what is now
+9:11 possible to build. If you are an early
+9:13 stage founder, you have a huge advantage
+9:16 in getting ahead on this. You don't have
+9:18 legacy systems in orchards or thousands
+9:20 of people to retrain. You are small
+9:22 enough to build your company right from
+9:24 day one. The opposite is the case for
+9:27 existing companies. They have to
+9:29 maintain and grow a live product while
+9:32 unwinding years of standard operating
+9:35 procedures and core assumptions about
+9:37 how software gets built. Some companies
+9:39 can achieve this by spinning up small
+9:41 internal skunk work teams that can build
+9:43 AI native systems from scratch separate
+9:45 from the core business. Mutiny is a
+9:47 great example of this. But for most,
+9:50 every change to their core processes
+9:53 risk breaking something that already
+9:54 works. So by their nature, these large
+9:57 companies will have a much harder time
+10:00 going AI native. Startups don't have
+10:03 that constraint and that's a major edge
+10:06 to take advantage of. You can design
+10:08 your systems, workflows and culture
+10:10 around AI from the start and as a result
+10:14 operate thousand times faster than the
+10:16 incumbents.
+10:22 Same
