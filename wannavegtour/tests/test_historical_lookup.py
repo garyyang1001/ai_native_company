@@ -113,6 +113,46 @@ class TestHistoricalUnit(unittest.TestCase):
         result = h.lookup(parse_query("12/27 江南還收嗎"))
         self.assertEqual(result.kind, HistoricalLookupKind.UNCLEAR)
 
+    def test_chengtuan_query_falls_back_to_current_tour_when_no_marker(self):
+        """『成團了嗎』on a tour with no 【成團】 marker but matching publish
+        product should fall back to CURRENT_TOUR_LIFECYCLE_STATUS rather
+        than returning 'found_none'."""
+        client = MagicMock(spec=WCClient)
+        # First call: lifecycle marker search → returns nothing matching 0709
+        # Second call (fallback): publish search → returns the publish 7/9 product
+        publish_product = _mkproduct(
+            id=99, name="7/9【韓國首爾】桃園出發", status="publish",
+            departure_date="20260709", total_sales=8, stock_quantity=12,
+        )
+        # search_products gets called multiple times — for both initial
+        # cross-status search AND fallback publish search.
+        def side_effect(**kwargs):
+            search = kwargs.get("search")
+            status = kwargs.get("status")
+            page = kwargs.get("page", 1)
+            if search == "韓國首爾" and status == "publish" and page == 1:
+                return [publish_product]
+            return []
+        client.search_products.side_effect = side_effect
+
+        h = HistoricalLookup(client)
+        result = h.lookup(parse_query("7/9 韓國首爾 成團了嗎"))
+        self.assertEqual(result.kind, HistoricalLookupKind.CURRENT_TOUR_LIFECYCLE_STATUS)
+        self.assertEqual(len(result.products), 1)
+        self.assertEqual(result.products[0].id, 99)
+        self.assertEqual(result.extras["lifecycle_hint"], "成團")
+        self.assertTrue(result.extras["via_fallback"])
+
+    def test_fallback_not_triggered_without_lifecycle_hint(self):
+        """If the user didn't explicitly use 成團/額滿/關團 keywords, the
+        fallback path is skipped — we return LIFECYCLE_FOUND_NONE as before."""
+        client = MagicMock(spec=WCClient)
+        client.search_products.return_value = []
+        h = HistoricalLookup(client)
+        # "上次峴港那團多少人" → past-tense, has destination, but no lifecycle_hint
+        result = h.lookup(parse_query("上次峴港 多少人"))
+        self.assertEqual(result.kind, HistoricalLookupKind.LIFECYCLE_FOUND_NONE)
+
 
 class TestHistoricalFormatter(unittest.TestCase):
     def test_aggregate_top_format(self):

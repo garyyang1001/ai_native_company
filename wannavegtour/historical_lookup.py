@@ -45,6 +45,10 @@ class HistoricalLookupKind(str, enum.Enum):
     LIFECYCLE_FOUND_ONE = "lifecycle_found_one"
     LIFECYCLE_FOUND_MANY = "lifecycle_found_many"
     LIFECYCLE_FOUND_NONE = "lifecycle_found_none"
+    # User asked a lifecycle question ("成團了嗎"/"額滿了沒"/"關團了嗎") on a tour
+    # that is still actively on sale (no lifecycle marker yet). Answer honestly:
+    # "目前 N 人報名，剩 M 位，還在賣中" — let user judge if the count is "成團".
+    CURRENT_TOUR_LIFECYCLE_STATUS = "current_tour_lifecycle_status"
     AGGREGATE_TOP = "aggregate_top"
     NEED_QUERY_DETAIL = "need_query_detail"        # 太模糊
     UNCLEAR = "unclear"
@@ -221,6 +225,17 @@ class HistoricalLookup:
 
         # Bucket.
         if not candidates:
+            # FALLBACK: user asked a lifecycle question (成團/額滿/關團) on a date
+            # + destination that exists as a CURRENT publish product but has no
+            # lifecycle marker yet (still actively on sale). Show current
+            # stock + sales — let the human judge if it counts as "成團".
+            # Only triggers when lifecycle_hint is present (so we know the user
+            # asked a lifecycle-shaped question, not a generic historical query).
+            if lifecycle_hint and query.has_date and query.destination_hint:
+                fallback = self._fallback_to_current_tour(query, lifecycle_hint)
+                if fallback is not None:
+                    return fallback
+
             advisory = [
                 "查不到符合條件的歷史團。",
                 "可能：(a) 標題前綴 marker 不在 [成團/額滿/關團/優質小團] 之列，"
@@ -241,6 +256,54 @@ class HistoricalLookup:
         )
 
     # --- helpers -------------------------------------------------------------
+
+    def _fallback_to_current_tour(
+        self, query: ParsedQuery, lifecycle_hint: str,
+    ) -> HistoricalResult | None:
+        """For 'X 成團了嗎 / 額滿了嗎' on a publish tour: search for it without
+        the lifecycle filter, and report current stock + sales so the human
+        can judge. Returns None if nothing matches in publish either."""
+        try:
+            candidates: list[WCProduct] = []
+            for page in range(1, self.SEARCH_MAX_PAGES + 1):
+                batch = self.client.search_products(
+                    search=query.destination_hint, status="publish",
+                    per_page=self.SEARCH_PER_PAGE, page=page,
+                )
+                candidates.extend(batch)
+                if len(batch) < self.SEARCH_PER_PAGE:
+                    break
+        except WCAPIError:
+            return None
+
+        # Enrich (search list may not include meta_data on this WC version).
+        enriched: list[WCProduct] = []
+        for c in candidates:
+            if c.departure_date:
+                enriched.append(c)
+                continue
+            try:
+                enriched.append(self.client.get_product(c.id))
+            except WCAPIError:
+                continue
+
+        mmdd = query.departure_date_mmdd
+        full = query.departure_date_full
+        exact = [p for p in enriched if full and p.departure_date == full]
+        matches = exact if exact else [
+            p for p in enriched if p.departure_date and mmdd and p.departure_date.endswith(mmdd)
+        ]
+
+        if not matches:
+            return None
+
+        # Sort most-modified first; trim to 5 so reply stays bounded.
+        matches.sort(key=lambda p: p.date_modified, reverse=True)
+        return HistoricalResult(
+            kind=HistoricalLookupKind.CURRENT_TOUR_LIFECYCLE_STATUS,
+            query=query, products=matches[:5],
+            extras={"lifecycle_hint": lifecycle_hint, "via_fallback": True},
+        )
 
     def _fan_out_all_statuses(self) -> list[WCProduct]:
         """Pull all publish + private + draft, paginated. De-dupes by product id

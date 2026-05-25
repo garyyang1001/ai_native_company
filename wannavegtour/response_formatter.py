@@ -184,6 +184,38 @@ def format_historical(result: HistoricalResult) -> str:
             body += f"\n\n📌 {note}"
         return body
 
+    if kind == HistoricalLookupKind.CURRENT_TOUR_LIFECYCLE_STATUS:
+        # User asked "成團了嗎 / 額滿了嗎" on a publish tour with no lifecycle
+        # marker yet. Show current numbers; let human judge.
+        lifecycle_hint = result.extras.get("lifecycle_hint") or "成團"
+        if len(result.products) == 1:
+            p = result.products[0]
+            stock_str = (
+                f"剩 {p.stock_quantity} 位"
+                if p.manage_stock and p.stock_quantity is not None
+                else "（未管理庫存）"
+            )
+            sales_str = f"目前 {p.total_sales} 人報名" if p.total_sales > 0 else "目前無人報名"
+            body = (
+                f"📊 {p.name}\n"
+                f"👥 {sales_str}，{stock_str}\n"
+                f"💰 售價：{_format_price(p)}\n"
+                f"📅 還在賣中，尚未『{lifecycle_hint}』達標\n"
+                f"🔗 {p.permalink}"
+            )
+            return body + "\n\n📌 是否算『" + lifecycle_hint + "』請以你們團規為準（WC 不知道你們設多少人成團）。"
+        # Many products match — list them with sales/stock.
+        header = f"📊 找到 {len(result.products)} 個符合的團（都還在賣，未『{lifecycle_hint}』達標）："
+        items = []
+        for i, p in enumerate(result.products, start=1):
+            stock_str = (
+                f"剩 {p.stock_quantity} 位"
+                if p.manage_stock and p.stock_quantity is not None else "庫存未管"
+            )
+            sales_str = f"{p.total_sales} 人" if p.total_sales > 0 else "0 人"
+            items.append(f"  {i}. {p.name[:55]}\n     👥 已報名 {sales_str}｜{stock_str}\n     {p.permalink}")
+        return header + "\n" + "\n".join(items)
+
     if kind == HistoricalLookupKind.LIFECYCLE_FOUND_NONE:
         return "🚫 " + "\n".join(result.advisory)
 
