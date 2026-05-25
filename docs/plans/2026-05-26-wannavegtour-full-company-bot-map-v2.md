@@ -2,9 +2,255 @@
 
 **取代之前的**: `docs/plans/2026-05-26-hermes-wannavegtour-integration-plan-v1.md` 不是廢掉,v1 是「現有 OP Bot 怎麼進到下一階」的施工順序,本份 v2 是「整間公司最後長什麼樣」的完整地圖。v1 的 Phase 0(基礎建設)是 v2 全部 Bot 共用的地基。
 
-**狀態**: 草稿(等 Gary 確認)
+**狀態**: 草稿(立即動工項目已鎖定,其他 4 隻 Bot 待處理)
 **日期**: 2026-05-26
-**作者**: Claude(根據 Gary 親口口述 vision 整理)
+**作者**: Claude(根據 Gary 親口口述 vision + Hermes 官方架構驗證)
+
+---
+
+## ⚡ 立即動工:OP 小弟 接 Hermes Profile
+
+**Gary 2026-05-26 決定**: 只先做 OP 小弟接 Hermes Profile,其他 4 隻 Bot 全部標記待處理(下面各節已標)。設計**必須照 Hermes 官方架構**(`/home/wannavegtour/.hermes/hermes-agent/`,v0.8.0,我已驗證)。
+
+### Hermes 官方架構驗證結果(2026-05-26 在 DGX 上實際查過)
+
+| 項目 | 狀態 | 證據 |
+|---|---|---|
+| `hermes` CLI | ✅ 已安裝 v0.8.0 | `/home/wannavegtour/.local/bin/hermes` |
+| `hermes profile create/use/list` | ✅ 真實官方指令 | `hermes profile --help` 確認 |
+| Codex OAuth(`openai-codex` provider) | ✅ 官方支援 | `hermes_cli/runtime_provider.py:151, 488, 695` |
+| Profile 目錄規範 | ✅ 已定義 | `~/.hermes/profiles/<name>/{config.yaml, .env, state.db, SOUL.md, memories/, sessions/, skills/, ...}` |
+| **LINE 平台 adapter** | ❌ **官方沒有** | `gateway/platforms/` 有 16 個平台(telegram, slack, discord, signal 等),**LINE 沒** |
+| 加新平台的官方指南 | ✅ 有 | `gateway/platforms/ADDING_A_PLATFORM.md` |
+| 通用 webhook adapter | ✅ 有 | `gateway/platforms/webhook.py` (671 行) |
+| Programmatic AIAgent | ✅ 有 | `batch_runner.py` 示範模式 |
+
+**重要修正**: 之前 session-context 提到「`~/.hermes/hermes-agent/plugins/platforms/line/adapter.py` 1606 行已存在」,**這在 DGX 上不對**。可能是 Mac 上某個自製版本,或記憶有誤。DGX 上**完全沒有 LINE adapter**,要走以下三條路其中一條。
+
+### 三條接法,選一條(我推薦 β)
+
+#### 方案 α:照官方步驟寫一個完整 LINE Adapter
+- 在 `gateway/platforms/line.py` 寫新 adapter,繼承 `BasePlatformAdapter`
+- 照 `ADDING_A_PLATFORM.md` checklist 全部實作:`connect / disconnect / send / send_typing / send_image / send_document / get_chat_info` 等 7+ 個方法
+- 在 `gateway/config.py` 的 `Platform` enum 加 `LINE = "line"`
+- **跑法**:`hermes -p wannavegtour-op-assistant gateway` 整套接管 LINE webhook
+- **工作量**:中-大(~1-2 週,要做完整 platform 規格)
+- **優點**:跟 Hermes 100% 對齊,未來 LINE 圖片/語音/檔案功能跟其他平台共用
+- **缺點**:殺雞用牛刀,我們現階段只要文字回答;大改現有 listener
+- 技術名詞:full platform adapter, `BasePlatformAdapter` subclass
+
+#### 方案 β:現有 listener 直接 call Hermes Profile(推薦)
+- 現有 `wannavegtour/line_listener.py` **不動**(LINE webhook 接收、簽章驗證、reply API 全部留)
+- 在 `wannavegtour/line_router.py` 多一段:用 Python 直接 `instantiate` `AIAgent`(照 `batch_runner.py` 的 pattern),把 LINE 訊息丟給 Agent 問「這是什麼意圖?回 JSON」
+- Agent 返回 structured JSON(例如 `{"intent": "availability", "confidence": 0.9, "destination_hint": "日本"}`)
+- 現有 `query_parser` + `line_router` 用 **Code is Law** 規則 dispatch — Agent 只當 classifier sensor
+- Profile 提供:模型 config / OAuth / SOUL.md 身分 / memories / sessions
+- **跑法**:listener 還是 `python -m wannavegtour.line_listener`(或之後的 systemd),Agent 是 in-process,不啟動 gateway
+- **工作量**:小(~1-2 天,~50 行 code)
+- **優點**:現有系統不動;Code is Law 紅線天然守住(LLM 不在 control flow,只在 classifier 一個 function 內);Hermes profile 提供身分 + 模型 + 記憶
+- **缺點**:沒走 Hermes gateway,LINE 流量管理在 listener 自己(但這目前就是這樣)
+- 技術名詞:programmatic AIAgent (per `batch_runner.py`), in-process classifier
+
+#### 方案 γ:用 Hermes 通用 webhook adapter
+- 用現有 `gateway/platforms/webhook.py`(671 行,通用 HTTP + HMAC + payload→prompt template)
+- 設定 webhook route 接 LINE webhook,在 config 寫 prompt template
+- LINE 簽章是 `x-line-signature` HMAC-SHA256,要驗證 webhook.py 的 HMAC 是不是 LINE 規格相容(可能要小改)
+- **跑法**:`hermes gateway` 啟動 webhook 服務,LINE platform 那邊把 webhook URL 指過來
+- **工作量**:中(~3-5 天,要客製 LINE signature + 回 LINE reply token 的反向流程)
+- **優點**:用 Hermes 內建框架;比 α 輕
+- **缺點**:LINE 的 reply_token(1 分鐘有效)+ push fallback 是 LINE 特殊流程,通用 webhook 不一定 cover;LINE 圖片/sticker 之後要做還是要寫 LINE 邏輯
+- 技術名詞:generic webhook adapter, payload template
+
+### 我的推薦:方案 β
+
+**理由**:
+1. **現有 OP Bot 不能中斷** — α 跟 γ 都要動 listener / 切 webhook URL,β 是純加法
+2. **Code is Law 最乾淨** — Agent 只在「判斷意圖」一個 function 內被呼叫,前後全 Python rule,LLM 永遠不寫 reply 字
+3. **Hermes profile 真正帶來的價值是模型 + OAuth + 記憶 + 身分** — 這些 β 全拿到,α/γ 多拿的「gateway 流量管理」我們現階段用不到
+4. **未來不擋路** — 第 2 個客戶 / 第 2 個 channel 出現時要升 α,β 的 Agent 呼叫程式 + Profile 設定可以直接搬
+
+### 方案 β 具體實作計畫
+
+#### 步驟 1: 建 Hermes Profile
+
+```bash
+hermes profile create wannavegtour-op-assistant
+# 會自動建立 ~/.hermes/profiles/wannavegtour-op-assistant/ 目錄,
+# 含 config.yaml / .env / SOUL.md / memories/ / sessions/ / state.db 等
+```
+
+技術名詞:`hermes_cli/profiles.py` 的 `create_profile()` function
+
+#### 步驟 2: 設定 config.yaml
+
+`~/.hermes/profiles/wannavegtour-op-assistant/config.yaml`:
+
+```yaml
+model:
+  default: "openai/gpt-5.5"          # 待 Gary 確認模型名(見開放問題)
+  provider: "openai-codex"            # Codex OAuth
+  context_length: 131072
+  max_tokens: 4096
+
+terminal:
+  backend: "local"
+  cwd: "/home/wannavegtour/Desktop/AI Native Company/Gary"
+
+memory:
+  memory_enabled: true                # 開啟長期記憶
+  user_profile_enabled: true          # 記錄 OP 用戶習慣
+  memory_char_limit: 2200
+  user_char_limit: 1375
+
+compression:
+  enabled: true                       # 對話過長自動壓縮
+  threshold: 0.50
+  protect_last_n: 20
+```
+
+技術名詞:Hermes config schema (`cli-config.yaml.example`)
+
+#### 步驟 3: Codex OAuth 登入
+
+```bash
+hermes -p wannavegtour-op-assistant login --provider openai-codex
+# 跳出瀏覽器 OAuth flow,完成後 token 存進 profile 的 auth.json
+```
+
+技術名詞:`hermes_cli/auth.py`,OAuth credential pool
+
+#### 步驟 4: 寫 SOUL.md(Agent 身分 + 約束)
+
+`~/.hermes/profiles/wannavegtour-op-assistant/SOUL.md` 草稿:
+
+```markdown
+# OP Assistant — 阿玩旅遊 OP 部門助理
+
+## 我是誰
+我是阿玩旅遊 OP(營運)部門的 AI 助理「小弟」。
+我服務的對象是公司內部 OP 同事,在內部 LINE 群組裡幫忙查行程、查出團、推送資訊。
+
+## 我能做什麼
+- 看懂 OP 同事的訊息意圖,回傳結構化 JSON 給 Code is Law 程式
+- 我不直接寫回應文字,回應文字由程式 template 生成
+- 我不做任何修改類動作(改價、改頁、刪資料一律拒絕分類)
+
+## 嚴格約束(不可違反)
+1. 所有 control flow 在 Python,不在我「腦袋裡」
+2. 我只是 classifier sensor,輸出永遠是 structured JSON
+3. 我不能決定「要不要回」、「回什麼」 — 程式決定
+4. 我不能呼叫外部 API,所有資料查詢由程式呼叫工具
+5. 我看不到 channel_secret / access_token / 任何密碼
+
+## 我說的語言
+- 對 OP 同事:繁體中文,簡短
+- 內部 JSON:英文 key,值看內容
+
+## 記憶範圍
+- 短期:這次 session 內的對話
+- 長期:OP 同事常問什麼意圖(用於改善 classification)、官網有什麼旅遊產品(用於 lookup speed)
+```
+
+技術名詞:SOUL.md(`AGENTS.md` 段 "Profile-Specific Customization")
+
+#### 步驟 5: 接 listener 端
+
+`wannavegtour/line_router.py` 加一個 helper:
+
+```python
+# 新增 import
+from hermes_cli.profiles import get_profile_dir
+from run_agent import AIAgent
+import json
+
+_HERMES_PROFILE = "wannavegtour-op-assistant"
+_agent = None
+
+def _get_agent():
+    """Lazy-init Hermes Agent. Called once per process."""
+    global _agent
+    if _agent is None:
+        # 切到 profile HERMES_HOME
+        import os
+        os.environ["HERMES_HOME"] = str(get_profile_dir(_HERMES_PROFILE))
+        _agent = AIAgent(
+            platform="line",
+            session_id=None,        # 每次訊息一個 session,或 per-LINE-group
+            # provider 自動從 profile config 讀 (openai-codex)
+        )
+    return _agent
+
+def _classify_with_hermes(text: str, group_id: str, user_id: str) -> dict:
+    """LLM 當 classifier sensor。永遠回 JSON。"""
+    prompt = (
+        f"分類以下 OP 訊息意圖。回 JSON 格式: "
+        f'{{"intent": "...", "confidence": 0-1, "extracted": {{...}}}}\n\n'
+        f"訊息: {text}\n群組: {group_id}\n用戶: {user_id}"
+    )
+    try:
+        raw = _get_agent().chat(prompt)
+        return json.loads(raw.strip())
+    except Exception as e:
+        log.warning(f"Hermes classify failed: {e}; fallback to rule-based only")
+        return {"intent": "unknown", "confidence": 0.0, "extracted": {}}
+```
+
+呼叫點(在現有 `dispatch_event` 開頭,**輔助** rule-based parser 而不是取代):
+
+```python
+# 現有 deterministic parser (Code is Law) 先跑
+parser_result = query_parser.parse(event.text)
+
+# 如果 parser 沒抓到,問 Hermes Agent 是不是有別的意圖
+if parser_result.intent == "unknown":
+    agent_hint = _classify_with_hermes(event.text, event.group_id, event.user_id)
+    # 用 hint 當 parser 的「第二意見」,但最終 dispatch 還是 Python 規則決定
+    parser_result = query_parser.merge_with_hint(parser_result, agent_hint)
+
+# 之後完全照原 dispatch 邏輯
+...
+```
+
+**重要**:Agent 只「提示」,最終 dispatch action 還是 Python 寫死的 if-else / rule table — Code is Law 守住。
+
+#### 步驟 6: 環境變數設定
+
+`bin/wannavegtour-line-up-linux` 或之後的 systemd unit 加:
+
+```bash
+# Hermes profile 自動切換(也可以 listener 內 os.environ 設,兩種方式都行)
+# 推薦在 listener init 程式內設,避免 PATH/env 漂移
+```
+
+#### 步驟 7: 驗收
+
+- listener 收到「小弟 日本團 7月有幾位」→ rule parser 抓到 → 走原流程(沒呼叫 Agent,latency 不變)
+- listener 收到「小弟 那個賣最好的歐洲團是哪個啊」→ rule parser 抓不到 → 呼叫 Hermes Agent → Agent 回 `{"intent": "aggregate", "extracted": {"region": "europe"}}` → Python merge → 走 aggregate worker
+- listener 收到「小弟 把日本團改成 9900」→ rule parser 抓到 PRICE_EDIT → **不**呼叫 Agent(已知意圖),直接走拒絕流程
+- 每次 Agent 呼叫都記進 `closed_loop_kernel` event,之後可以 replay(對應 v1 Phase 0.1 / 0.2)
+
+#### 步驟 8: 監測
+
+- Agent 呼叫次數 / 成功率(JSON parse 成功 vs 失敗 fallback)
+- Agent latency(p50 / p95) — Codex OAuth 預期 ~500-2000ms
+- 「rule parser 抓不到,Agent 也抓不到」的訊息累積成 audit signal,Gary review 後決定加 rule
+
+### 三件還沒對的事(等 Gary 確認再動)
+
+1. **模型名**: `config.yaml` 我寫 `openai/gpt-5.5`,但 Codex OAuth 對應的可選 model 我沒實際 query。要 `hermes login` 之後 `hermes model` 看清單。Gary 提的 GPT-5.5 是訂閱方案的最新還是別的?
+2. **session_id 策略**: 每筆訊息一個 session,還是 per LINE group 一個 session,還是 per OP user 一個 session?各有 trade-off(記憶範圍 vs 隔離),建議先 per group。
+3. **memory 內容**: SOUL.md 之外,memories/ 要不要先 seed?例如把目前 query_parser 的 intent 清單寫進 MEMORY.md,Agent 知道我們有哪些 intent。
+
+### v1 Phase 0 仍然要做(地基)
+
+這份 OP Agent 加上去之後,**Phase 0(events 進 kernel + replay + Telegram bridge)變更急** — 因為每次 Agent classify 都會產生 audit data,沒 kernel 收就只是 JSONL,沒法 replay 或自我改進。
+
+優先順序(2026-05-26 鎖定):
+1. **本檔「立即動工」段** — OP Agent 接 Hermes Profile(本週)
+2. **v1 Phase 0.1** — line_router 寫 event 進 kernel(下週)
+3. **v1 Phase 0.2** — replay 工具(2 週內)
+4. **v1 Phase 0.3** — Telegram bridge(3 週內)
+5. **其他 4 隻 Bot** — 全部 defer(本檔下方各節已標)
 
 ---
 
@@ -146,7 +392,9 @@ graph TB
 
 ---
 
-### 2. 行銷部門 Bot(新建)
+### 2. 行銷部門 Bot(新建) — 🕓 待處理
+
+> **狀態 2026-05-26**:**defer**(本週只動 OP 小弟接 Hermes Profile)。下面內容是長期 vision,等 OP 小弟跑穩、Phase 0 地基蓋完再啟動本節。
 
 **在哪**:行銷部門 LINE 群組(目前還沒這個 Bot)
 
@@ -167,7 +415,9 @@ graph TB
 
 ---
 
-### 3. 客戶群組監聽 Bot(新建,跨多個群)
+### 3. 客戶群組監聽 Bot(新建,跨多個群) — 🕓 待處理
+
+> **狀態 2026-05-26**:**defer**。隱私敏感度最高,要先確定 retention / 加密策略 + LINE 圖片處理可行性研究(下方待辦清單第 3 項)再動。
 
 **在哪**:**所有出團客戶的 LINE 群組**
 - 我們一個月出 30 幾團 = 30 幾個客戶群
@@ -199,7 +449,9 @@ graph TB
 
 ---
 
-### 4. CEO 個人助理 Bot(新建)
+### 4. CEO 個人助理 Bot(新建) — 🕓 待處理
+
+> **狀態 2026-05-26**:**defer**。Gary 沒選為第一個動工(原本我推薦這個當 dogfood,Gary 決定先做 OP 小弟接 Hermes)。等 OP 小弟跑穩、Hermes profile 模式驗證後再啟動。
 
 **在哪**:CEO 自己的 LINE 群組(可以是個人聊天室或自建小群)
 
@@ -220,7 +472,9 @@ graph TB
 
 ---
 
-### 5. LINE 官方客服帳號 Bot(待規劃,你之後會做的)
+### 5. LINE 官方客服帳號 Bot(待規劃,你之後會做的) — 🕓 待處理
+
+> **狀態 2026-05-26**:**defer**。Gary 講「之後還會有」,規格未定。
 
 **在哪**:阿玩旅遊的 LINE 官方帳號(LINE OA,對外的客戶第一接觸點)
 
