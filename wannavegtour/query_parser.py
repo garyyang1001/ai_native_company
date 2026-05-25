@@ -204,14 +204,19 @@ _PAST_TENSE_KEYWORDS = (
     "上次", "上回", "之前", "最後", "那次", "後來", "結果",
 )
 
-# Aggregate / ranking questions.
+# Aggregate / ranking questions. Watch for spoken-style variants with 的 / 得
+# in the middle ("賣的最好", "賣得最好") — those don't match strict substring
+# of "賣最好" because of the inserted character. Be liberal.
 _AGGREGATE_KEYWORDS = (
-    "賣最好", "賣得最", "賣最多", "賣得多", "最多人",
+    "賣最好", "賣得最好", "賣的最好",
+    "賣最多", "賣得最多", "賣的最多",
+    "賣得最", "賣得多",
+    "最多人",
     "排行", "前幾", "Top", "top",
 )
 
 # Year qualifier — pure rough match, HistoricalLookup decides the actual range.
-_YEAR_QUALIFIERS = ("今年", "去年", "前年", "歷年", "近期", "近幾")
+_YEAR_QUALIFIERS = ("今年", "去年", "前年", "歷年", "近期", "近幾", "最近")
 
 # NOTE: We deliberately do NOT keep a "lifecycle question keywords" list with
 # ambiguous tokens like "報名" / "多少人" / "幾人" / "人數". Those words appear

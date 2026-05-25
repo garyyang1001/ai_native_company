@@ -261,5 +261,34 @@ class TestCodexRegressionRouting(unittest.TestCase):
         self.assertEqual(parse_query("上次峴港那團多少人").intent, QueryIntent.HISTORICAL_LOOKUP)
 
 
+class TestAggregateColloquialVariants(unittest.TestCase):
+    """Real OP query that failed in production: '我們最近賣的最好的是那些？ 列10團來'.
+    Spoken Chinese inserts 的 / 得 between 賣 and 最好/最多. Plus '最近' as
+    year qualifier wasn't covered before."""
+
+    def test_garys_exact_failed_query(self):
+        p = parse_query("我們最近賣的最好的是那些？ 列10團來")
+        self.assertEqual(p.intent, QueryIntent.HISTORICAL_LOOKUP)
+        self.assertTrue(p.extras["is_aggregate"])
+        self.assertEqual(p.extras["year_qualifier"], "最近")
+
+    def test_de_variants_match_aggregate(self):
+        for q in ("賣的最好", "賣的最多", "賣得最好", "賣得最多"):
+            p = parse_query(q)
+            self.assertEqual(p.intent, QueryIntent.HISTORICAL_LOOKUP, q)
+            self.assertTrue(p.extras["is_aggregate"], q)
+
+    def test_zui_jin_year_qualifier(self):
+        p = parse_query("最近賣最好的")
+        self.assertEqual(p.extras["year_qualifier"], "最近")
+
+    def test_original_phrasing_still_works(self):
+        """Regression: '今年賣最好的團' must still work after adding variants."""
+        p = parse_query("今年賣最好的團")
+        self.assertEqual(p.intent, QueryIntent.HISTORICAL_LOOKUP)
+        self.assertTrue(p.extras["is_aggregate"])
+        self.assertEqual(p.extras["year_qualifier"], "今年")
+
+
 if __name__ == "__main__":
     unittest.main()

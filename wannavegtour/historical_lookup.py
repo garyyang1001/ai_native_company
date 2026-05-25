@@ -322,9 +322,10 @@ class HistoricalLookup:
         return list(by_id.values())
 
     def _resolve_year_target(self, qualifier: str, today: dt.date | None = None) -> int | None:
-        """Translate '今年' / '去年' / '前年' / '歷年' to a year integer or None for歷年."""
+        """Translate '今年' / '去年' / '前年' / '歷年' / '最近' to a year integer
+        or None for 歷年 (no filter)."""
         today = today or dt.date.today()
-        if qualifier in ("今年", "近期", "近幾"):
+        if qualifier in ("今年", "近期", "近幾", "最近"):
             return today.year
         if qualifier == "去年":
             return today.year - 1
