@@ -379,16 +379,24 @@ python3 -m closed_loop_kernel.demo
 python3 -m closed_loop_kernel.http_app
 ```
 
+## Design Decisions (Not Limitations)
+
+- **Routing is deterministic Python (no LLM classifier).** Matches AI Native Company "code is rule" principle (`spec/code-is-law-v0.md`). LLM-based hybrid classifiers are intentionally NOT planned for the L1 listener. LLMs may appear in content generation but never in routing/dispatch.
+
 ## Known Limitations / Pending
 
-- No `launchd` plist or systemd unit exists. A Mac reboot will not automatically restart the listener.
-- Current launcher is macOS-first because it uses `caffeinate`.
-- A basic `/healthz` liveness endpoint exists. There is no richer readiness / metrics endpoint yet.
-- Type 2 price / page editing worker is not implemented. Current behavior is explicit refusal.
-- Hybrid LLM classifier is not implemented. Routing is deterministic rules only.
-- LINE listener writes local JSONL audit records, but there is no retention / cleanup job yet.
-- DGX Spark with a Hermes-native LINE plugin is a separate migration path. Do not mix that with this L1 stdlib listener unless Gary decides to replace the current launcher/runtime.
-- Type 1 currently reads WooCommerce directly. It does not write to `closed_loop_kernel` yet; business events should be imported later once the event-store contract is decided.
+- **Operational**:
+  - No systemd unit yet. Listener does not auto-restart on boot. Plan approved 2026-05-25: install `~/.config/systemd/user/wannavegtour-line.service` using `.venv/bin/python`, `Restart=on-failure`, `StandardOutput=journal`. (`loginctl enable-linger wannavegtour` already set on DGX Spark.)
+  - Sleep prevention: `sleep.target` / `suspend.target` / `hibernate.target` already masked on DGX Spark. `hybrid-sleep.target` still static (cosmetic — won't fire automatically). macOS launcher still uses `caffeinate` for that path.
+  - `/healthz` is liveness only. Pending: `/readyz` (probes WC + LINE) and `/metrics` (Prometheus). Not urgent at current volume.
+  - JSONL audit log has no retention/cleanup. Pending: logrotate (monthly, keep 12).
+
+- **Product**:
+  - Type 2 (WC write — edit prices / page content) not implemented. Current behavior is explicit refusal. High risk: needs allowed-users gate, confirm-before-apply, change log. Deferred until Type 1 audit trail proven solid.
+
+- **Architectural**:
+  - Type 1 events flow into local JSONL audit log only, NOT into `closed_loop_kernel` event store. Closed-loop architecture (per AI Native Company spec) requires kernel event-store integration. Blocked on confirming `closed_loop_kernel` event-store contract.
+  - DGX Spark + Hermes-native LINE plugin is an alternative architecture (v2): instead of standalone listener, route LINE webhook through Hermes runtime sharing routing/kanban with other Hermes agents. v1 (current) and v2 cannot coexist on same LINE channel. Decision pending — tied to upcoming Hermes integration discussion.
 
 ## Cross-References
 
