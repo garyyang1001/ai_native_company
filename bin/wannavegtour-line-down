@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Stop wannavegtour LINE listener stack cleanly.
+# Reverse order of bin/wannavegtour-line-up: tailscale funnel → listener → caffeinate.
+
+set -euo pipefail
+
+RUN_DIR="$HOME/.hermes/run/wannavegtour"
+LISTEN_PORT="${WANNAVEG_LISTEN_PORT:-8765}"
+
+CAFF_PID_FILE="$RUN_DIR/caffeinate.pid"
+LIST_PID_FILE="$RUN_DIR/listener.pid"
+
+# --- 1. tailscale funnel -------------------------------------------------------
+
+if command -v tailscale >/dev/null 2>&1; then
+  if tailscale funnel status 2>/dev/null | grep -q "$LISTEN_PORT"; then
+    tailscale funnel --https=443 off 2>/dev/null || \
+      tailscale funnel "$LISTEN_PORT" off 2>/dev/null || true
+    echo "[tailscale funnel] turned off"
+  else
+    echo "[tailscale funnel] not currently exposed; skipped"
+  fi
+else
+  echo "[tailscale funnel] tailscale CLI not present; skipped"
+fi
+
+# --- 2. listener ---------------------------------------------------------------
+
+# Helper: kill ONLY if the PID's command line matches the expected marker.
+# Protects against PID reuse after crash/reboot — without this, line-down could
+# TERM/KILL an unrelated process that happens to have inherited the PID number.
+kill_if_matches() {
+  local pid="$1"
+  local marker="$2"
+  local label="$3"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "[$label] pid file present but process already gone (pid=$pid)"
+    return 1
+  fi
+  # ps -p <pid> -o command= returns the full command line on macOS / Linux.
+  local cmdline
+  cmdline=$(ps -p "$pid" -o command= 2>/dev/null || echo "")
+  if ! echo "$cmdline" | grep -q "$marker"; then
+    echo "[$label] pid=$pid no longer matches '$marker' (cmdline: $cmdline) — refusing to kill"
+    echo "       (PID was likely reused after a crash; remove pid file manually if needed)"
+    return 1
+  fi
+  return 0
+}
+
+if [ -f "$LIST_PID_FILE" ]; then
+  LIST_PID=$(cat "$LIST_PID_FILE")
+  if kill_if_matches "$LIST_PID" "wannavegtour.line_listener" "listener"; then
+    kill -TERM "$LIST_PID" 2>/dev/null || true
+    sleep 1
+    if kill -0 "$LIST_PID" 2>/dev/null; then
+      kill -KILL "$LIST_PID" 2>/dev/null || true
+      echo "[listener] pid=$LIST_PID force-killed"
+    else
+      echo "[listener] pid=$LIST_PID stopped"
+    fi
+    rm -f "$LIST_PID_FILE"
+  fi
+else
+  echo "[listener] no pid file at $LIST_PID_FILE; nothing to stop"
+fi
+
+# --- 3. caffeinate -------------------------------------------------------------
+
+if [ -f "$CAFF_PID_FILE" ]; then
+  CAFF_PID=$(cat "$CAFF_PID_FILE")
+  if kill_if_matches "$CAFF_PID" "caffeinate" "caffeinate"; then
+    kill -TERM "$CAFF_PID" 2>/dev/null || true
+    echo "[caffeinate] pid=$CAFF_PID stopped; Mac may now sleep normally"
+    rm -f "$CAFF_PID_FILE"
+  fi
+else
+  echo "[caffeinate] no pid file at $CAFF_PID_FILE; nothing to stop"
+fi
+
+echo "[done] all components stopped"

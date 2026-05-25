@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Start wannavegtour LINE listener stack on this Mac.
+#
+# Components launched (in order):
+#   1. caffeinate                  — prevent system sleep (-dimsu)
+#   2. wannavegtour.line_listener  — HTTP server on 127.0.0.1:8765 (background)
+#   3. tailscale funnel            — expose 8765 publicly via tailnet HTTPS
+#
+# State directory: ~/.hermes/run/wannavegtour/
+#   - caffeinate.pid
+#   - listener.pid
+#   - listener.log
+#   - funnel.pid (best-effort; tailscale funnel runs as `--bg` daemon by itself)
+#
+# Idempotent: re-running while already up is a no-op for components that
+# are still alive. Use bin/wannavegtour-line-down to stop everything.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RUN_DIR="$HOME/.hermes/run/wannavegtour"
+LISTEN_HOST="${WANNAVEG_LISTEN_HOST:-127.0.0.1}"
+LISTEN_PORT="${WANNAVEG_LISTEN_PORT:-8765}"
+
+mkdir -p "$RUN_DIR"
+chmod 700 "$RUN_DIR"
+
+CAFF_PID_FILE="$RUN_DIR/caffeinate.pid"
+LIST_PID_FILE="$RUN_DIR/listener.pid"
+LIST_LOG_FILE="$RUN_DIR/listener.log"
+
+# --- pre-flight ----------------------------------------------------------------
+
+echo "[wannavegtour-line-up] pre-flight checks…"
+
+if ! command -v tailscale >/dev/null 2>&1; then
+  echo "  ✗ tailscale CLI not found; install from https://tailscale.com/download" >&2
+  exit 1
+fi
+echo "  ✓ tailscale present"
+
+if ! python3 -c "import wannavegtour" 2>/dev/null; then
+  # Re-try with the repo on PYTHONPATH so users can run from anywhere.
+  export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
+  if ! python3 -c "import wannavegtour" 2>/dev/null; then
+    echo "  ✗ wannavegtour package not importable; checked $REPO_ROOT" >&2
+    exit 1
+  fi
+fi
+echo "  ✓ wannavegtour package importable"
+
+# Validate credentials are filled (fail fast — no point starting listener that 401s).
+if ! python3 -c "from wannavegtour.config import load_config, load_line_config; load_config(); load_line_config()" 2>/dev/null; then
+  echo "  ✗ credentials not loaded; check ~/.hermes/credentials/wannavegtour/{wc-api,line-bot}.json" >&2
+  echo "    (run with 'python3 -c \"from wannavegtour.config import load_line_config; load_line_config()\"' to see the error)" >&2
+  exit 1
+fi
+echo "  ✓ credentials loaded (WC + LINE)"
+
+# --- 1. caffeinate -------------------------------------------------------------
+
+if [ -f "$CAFF_PID_FILE" ] && kill -0 "$(cat "$CAFF_PID_FILE")" 2>/dev/null; then
+  echo "[caffeinate] already running (pid $(cat "$CAFF_PID_FILE"))"
+else
+  caffeinate -dimsu &
+  CAFF_PID=$!
+  echo "$CAFF_PID" > "$CAFF_PID_FILE"
+  echo "[caffeinate] started pid=$CAFF_PID (prevents display+disk+idle+system sleep)"
+fi
+
+# --- 2. listener ---------------------------------------------------------------
+
+if [ -f "$LIST_PID_FILE" ] && kill -0 "$(cat "$LIST_PID_FILE")" 2>/dev/null; then
+  echo "[listener] already running (pid $(cat "$LIST_PID_FILE"))"
+else
+  cd "$REPO_ROOT"
+  PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}" \
+    nohup python3 -m wannavegtour.line_listener \
+      --host "$LISTEN_HOST" --port "$LISTEN_PORT" \
+      >> "$LIST_LOG_FILE" 2>&1 &
+  LIST_PID=$!
+  echo "$LIST_PID" > "$LIST_PID_FILE"
+  echo "[listener] started pid=$LIST_PID on http://$LISTEN_HOST:$LISTEN_PORT (log: $LIST_LOG_FILE)"
+  # Wait up to 3s for listener to bind, fail fast if it crashed.
+  for _ in 1 2 3 4 5 6; do
+    sleep 0.5
+    if curl -sS -m 1 "http://$LISTEN_HOST:$LISTEN_PORT/healthz" >/dev/null 2>&1; then
+      echo "[listener] /healthz responded ✓"
+      break
+    fi
+    if ! kill -0 "$LIST_PID" 2>/dev/null; then
+      echo "  ✗ listener died immediately; check $LIST_LOG_FILE" >&2
+      tail -20 "$LIST_LOG_FILE" >&2 || true
+      exit 1
+    fi
+  done
+fi
+
+# --- 3. tailscale funnel -------------------------------------------------------
+
+# `tailscale funnel --bg <port>` is the canonical recipe — runs as a tailscaled
+# service, persists across this script's exit. We just need to (re)run it to
+# ensure the routing is in place; the command is idempotent.
+echo "[tailscale funnel] configuring on port $LISTEN_PORT…"
+if tailscale funnel --bg "$LISTEN_PORT" 2>&1; then
+  echo "[tailscale funnel] ✓ exposed"
+else
+  echo "  ⚠️  funnel command failed; check Tailscale ACL has \"nodeAttrs\" with \"attr\":[\"funnel\"] for autogroup:member" >&2
+  echo "     (this script keeps caffeinate + listener running; you can re-run funnel manually after fixing ACL)" >&2
+fi
+
+# Print the public URL.
+TAILNET=$(tailscale status --json 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" 2>/dev/null || echo "unknown.ts.net")
+echo
+echo "════════════════════════════════════════════════════════════════════"
+echo "  Public webhook URL (set this in LINE Developers Console):"
+echo "    https://$TAILNET/wannavegtour/line/webhook"
+echo
+echo "  Health check:"
+echo "    https://$TAILNET/healthz"
+echo
+echo "  Stop everything:  $REPO_ROOT/bin/wannavegtour-line-down"
+echo "  Tail listener log: tail -F $LIST_LOG_FILE"
+echo "════════════════════════════════════════════════════════════════════"
