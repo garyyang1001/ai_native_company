@@ -10,7 +10,71 @@
 
 ## ⚡ 立即動工:OP 小弟 接 Hermes Profile
 
-**Gary 2026-05-26 決定**: 只先做 OP 小弟接 Hermes Profile,其他 4 隻 Bot 全部標記待處理(下面各節已標)。設計**必須照 Hermes 官方架構**(`/home/wannavegtour/.hermes/hermes-agent/`,v0.8.0,我已驗證)。
+**Gary 2026-05-26 決定**: 只先做 OP 小弟接 Hermes Profile,其他 4 隻 Bot 全部標記待處理(下面各節已標)。設計**必須照 Hermes 官方架構**。
+
+**Gary 後續指示**(2026-05-26 14:xx): 不要繞路,**必須用 Hermes 原生 LINE 路徑** — 排除 β / γ,鎖定 **方案 α(Hermes 官方 LINE plugin)**。先把 Hermes ↔ LINE 串接起來,哪個 Agent 設定等會再處理。
+
+### 進度更新(2026-05-26)— Hermes 已升 v0.14.0,LINE plugin 已串接 ✓
+
+Gary 在這次討論之間把 Hermes 從 v0.8.0 升到 **v0.14.0 (release 2026.5.16)**,**LINE plugin 內建上線了**(原本我記的「DGX 沒 LINE adapter」已過時)。實際在 `/home/wannavegtour/.hermes/hermes-agent/plugins/platforms/line/`:
+
+| 項目 | 狀態 | 證據 |
+|---|---|---|
+| LINE plugin 檔案 | ✅ | `plugins/platforms/line/{adapter.py (1638 行), plugin.yaml, __init__.py}` |
+| Plugin enabled | ✅ | `hermes plugins enable platforms/line` 已執行,寫進 `~/.hermes/config.yaml plugins.enabled` |
+| Codex OAuth 登入 | ✅ | `~/.hermes/auth.json`,`active_provider: openai-codex`,`auth_mode: chatgpt`,2026-05-25 refresh |
+| LINE env 變數設定 | ✅ | `~/.hermes/.env`(mode 600)有完整 8 個 `LINE_*` 變數,值從 `~/.hermes/credentials/wannavegtour/line-bot.json` 抓 |
+| Gateway smoke test | ✅ | `hermes gateway run --quiet` 起得來,bind `127.0.0.1:8646`,`GET /line/webhook/health → 200`,正常關閉 |
+| 預設模型 | gpt-5.4 | `hermes status` 顯示 |
+
+**Env vars 設定值**(實際填的):
+- `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_CHANNEL_SECRET` — 從現有 credentials 帶
+- `LINE_PORT=8646`(Hermes 預設,跟舊 listener 的 8765 不衝突)
+- `LINE_HOST=127.0.0.1`(只接 Tailscale Funnel reverse proxy,防外網直連)
+- `LINE_PUBLIC_URL=https://spark-8035.tailb40323.ts.net`(媒體外部 URL)
+- `LINE_ALLOWED_GROUPS=C24cf0311116b96f22aced7cc2f7cac8d`(只 OP 群,白名單)
+- `LINE_HOME_CHANNEL=C24cf0311116b96f22aced7cc2f7cac8d`(cron/通知預設目標)
+- `LINE_SLOW_RESPONSE_THRESHOLD=45`(45 秒沒回就觸發 postback 按鈕)
+
+**還沒做的事(等 agent 設定 + Gary 點頭才動)**:
+- ❌ Hermes gateway **沒**持續跑(只測完關掉了)
+- ❌ Tailscale Funnel **沒切換**,還指 8765 → 舊 listener
+- ❌ LINE Developers Console / API 上的 webhook URL **沒換**,還是 `https://spark-8035.tailb40323.ts.net/wannavegtour/line/webhook`(舊 listener path)
+- ❌ 舊 listener **沒停**,8765 還在收 webhook 並回應 OP 群
+- ❌ wannavegtour-op-assistant **profile 沒建**(目前用 default profile 配 LINE plugin,等決定要不要分 profile 再搬)
+- ❌ Agent classifier(Code is Law β 思路)**沒做** — 但用方案 α 後,Hermes 預設會用 Codex 直接接管 reply 流程,Code is Law 的守則要怎麼介入需要再設計
+
+**為什麼還不切換**: 一但 LINE webhook URL 指向 Hermes:8646,**Codex (GPT-5.4) 會直接生 reply 給 OP 同事**,沒走我們的 `query_parser` + `availability_checker` 等決定性流程。OP 會拿到「LLM 隨便回答」的答案,違反 Code is Law,而且資訊也錯。
+
+### Cutover Checklist(Gary 同意 + agent 設計確定後才動)
+
+1. 決定 agent 架構(下節「三件還沒對的事」)
+2. 啟動 Hermes gateway 為持續服務:`hermes gateway install`(systemd 接管,boot 自動)
+3. Tailscale Funnel 切換:`tailscale funnel reset` → 重設指向 `127.0.0.1:8646`
+4. LINE webhook URL 切換:`PUT /v2/bot/channel/webhook/endpoint` 設新 URL = `https://spark-8035.tailb40323.ts.net/line/webhook`(注意路徑變了)
+5. `POST /v2/bot/channel/webhook/test` 驗證新 URL 回 200
+6. 停舊 listener:`bin/wannavegtour-line-down`
+7. 連續觀察 30 分鐘:有沒有 reply 失敗、有沒有 Code is Law 違反
+
+**回退方案**(若 cutover 後出問題):
+- LINE webhook URL 切回 `/wannavegtour/line/webhook`
+- Tailscale Funnel 切回 8765
+- 重啟舊 listener:`bin/wannavegtour-line-up-linux`
+- Hermes gateway 停下(`hermes gateway stop`)或留著無流量(沒人指過去就閒置)
+
+### Code is Law 跟 α 方案的衝突(這是 agent 設定要解決的)
+
+方案 α 是 Hermes 接管完整流程:**LINE webhook → Hermes adapter → AIAgent(LLM)→ Hermes 回 LINE**。
+
+問題:這條預設路徑裡,**LLM 完整決定 reply 內容** — 違反 P4「Code is Law:LLM 永遠不能直接動 action 或寫 reply 文字」。
+
+解法選項(等下次討論):
+- **A. 在 Hermes 內把 AIAgent subclass 成 deterministic dispatcher**(用 LLM 只當 JSON classifier),所有 reply 還是程式 template 生成。這需要動 Hermes 程式碼,跟「不繞路」精神有張力。
+- **B. 讓 Hermes 用既有 LINE plugin,但配 deterministic tools / skills,並用 prompt 強制 agent 只回呼 tool**,不直接寫文字。LLM 跑 tool calling loop,Code is Law 守在 tool 那層。
+- **C. Hermes 跑 agent,但每次 reply 在 send 之前過一個 sidecar 驗證 worker**(`closed_loop_kernel` 的 sandbox 模式),違反就 escalate 不發。
+- **D. 維持現狀,Hermes 接 webhook 後不直接呼叫 AIAgent,而是先打 webhook 給我們自己的 line_router(dispatch 程式),由 line_router 決定是否回**。這 effectively 把 Hermes 當 dumb webhook proxy,違反「用 Hermes 原生路徑」精神。
+
+我先列這 4 條,等 Gary 想清楚要走哪條(或第 5 條)再寫實作細節。
 
 ### Hermes 官方架構驗證結果(2026-05-26 在 DGX 上實際查過)
 
