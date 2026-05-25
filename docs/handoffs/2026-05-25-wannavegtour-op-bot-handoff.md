@@ -18,6 +18,13 @@ state: 10 commits ahead of main, not pushed from this handoff commit
 
 This handoff is for code migration and continuation. It does not move secrets, local runtime logs, production databases, or Hermes runtime state.
 
+## Migration Status
+
+- 2026-05-25: Migrated to NVIDIA DGX Spark (`spark-8035`, Linux).
+- Public webhook (Tailscale Funnel): `https://spark-8035.tailb40323.ts.net/wannavegtour/line/webhook`
+- LINE webhook endpoint set via Messaging API (`PUT /v2/bot/channel/webhook/endpoint`), test reply `success:true / 200`.
+- Linux launcher added: `bin/wannavegtour-line-up-linux` (macOS launcher kept as-is).
+
 ## What Was Built
 
 - `6459b75 Add wannavegtour Type 1/3/4 workers (LINE OP -> WC REST)`:
