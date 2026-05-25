@@ -101,7 +101,7 @@ fi
 # `tailscale funnel --bg <port>` is the canonical recipe — runs as a tailscaled
 # service, persists across this script's exit. We just need to (re)run it to
 # ensure the routing is in place; the command is idempotent.
-echo "[tailscale funnel] configuring on port $LISTEN_PORT…"
+echo "[tailscale funnel] configuring on port ${LISTEN_PORT}..."
 if tailscale funnel --bg "$LISTEN_PORT" 2>&1; then
   echo "[tailscale funnel] ✓ exposed"
 else
