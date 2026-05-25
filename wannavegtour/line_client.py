@@ -53,6 +53,11 @@ class LineEvent:
     timestamp_ms: int
     message_id: str | None
     mention_is_self: bool      # mention.isSelf for bot-mention awareness (2024-10-30 feature)
+    # Char offset + length of the @bot mention in the text (None when not present).
+    # Used to strip the mention substring cleanly before parsing — display names
+    # vary (could be @Hermes小幫手 or @283nbnhf), so we rely on LINE's own indices.
+    mention_self_index: int | None
+    mention_self_length: int | None
     raw: dict[str, Any]
 
 
@@ -94,10 +99,17 @@ def parse_events(body: bytes) -> list[LineEvent]:
         message = ev.get("message") or {}
         mention = message.get("mention") if isinstance(message, dict) else None
         mention_is_self = False
+        mention_self_index: int | None = None
+        mention_self_length: int | None = None
         if isinstance(mention, dict):
             for m in (mention.get("mentionees") or []):
                 if isinstance(m, dict) and m.get("isSelf"):
                     mention_is_self = True
+                    idx = m.get("index")
+                    ln = m.get("length")
+                    if isinstance(idx, int) and isinstance(ln, int) and idx >= 0 and ln > 0:
+                        mention_self_index = idx
+                        mention_self_length = ln
                     break
         out.append(LineEvent(
             event_type=str(ev.get("type", "")),
@@ -110,6 +122,8 @@ def parse_events(body: bytes) -> list[LineEvent]:
             timestamp_ms=int(ev.get("timestamp", 0) or 0),
             message_id=(str(message.get("id")) if isinstance(message, dict) and message.get("id") else None),
             mention_is_self=mention_is_self,
+            mention_self_index=mention_self_index,
+            mention_self_length=mention_self_length,
             raw=ev,
         ))
     return out

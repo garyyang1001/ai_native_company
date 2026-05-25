@@ -4,14 +4,23 @@ Sits between line_listener (raw HTTP / signature) and the actual workers
 (availability_checker / historical_lookup). Pure logic — no I/O of its own
 beyond what the injected workers/client perform. Easy to unit-test.
 
-Policy (Pattern C in design docs):
-    intent == AVAILABILITY_CHECK   → AvailabilityChecker     → reply
-    intent == HISTORICAL_LOOKUP    → HistoricalLookup        → reply
-    intent == PRICE_EDIT_HINT      → NO REPLY; log + alert   → telegram
-                                     (we never auto-execute pricing changes)
-    intent == UNCLEAR              → silent (no reply)
-                                     UNLESS mention.isSelf=true → ack message
-    event.type != "message"        → silent (joins/leaves only logged)
+Policy (Pattern B — passive listening):
+    Bot is a SILENT OBSERVER by default. Every text message is parsed and
+    classified (intent recorded in audit log for training / replay), but
+    no reply is sent unless the bot is explicitly @mentioned. This keeps
+    the OP group's natural conversation undisturbed.
+
+    @mention strips the bot reference from text, then routes:
+        AVAILABILITY_CHECK → AvailabilityChecker  → reply
+        HISTORICAL_LOOKUP  → HistoricalLookup     → reply
+        PRICE_EDIT_HINT    → reply with refusal text (NEVER auto-execute;
+                             also NEVER push to Telegram unsolicited)
+        UNCLEAR            → reply with ack/help text
+
+    No @mention:
+        Any intent → silent. Audit log captures text + classified intent.
+
+    Non-text / non-message events: silent.
 
 Group whitelist: if line config's `target_groups` is non-empty, only
 events from those groups are processed. Empty list = any group accepted.
@@ -33,14 +42,13 @@ from .response_formatter import format_historical, format_response
 # Message returned when bot is @mentioned but the message isn't classifiable.
 UNCLEAR_ACK_TEXT = (
     "🤔 看不出你想問什麼。試試：\n"
-    "  • 『3/5 江南還剩多少？』(查名額)\n"
-    "  • 『7/22 暑假成團多少人』(問歷史)\n"
-    "  • 『今年賣最好的團』(排行)\n"
+    "  • 『@bot 3/5 江南還剩多少？』(查名額)\n"
+    "  • 『@bot 7/22 暑假成團多少人』(問歷史)\n"
+    "  • 『@bot 今年賣最好的團』(排行)\n"
 )
 
 PRICE_EDIT_REFUSAL_TEXT = (
-    "🙅 偵測到改價/改資訊指令（Type 2）— 自動執行尚未上線，請手動處理。"
-    "Gary 已被 Telegram 通知。"
+    "🙅 偵測到改價/改資訊指令（Type 2）— 自動執行尚未上線，請手動到 WordPress 後台處理。"
 )
 
 
@@ -48,7 +56,7 @@ class DispatchAction(str, enum.Enum):
     """What the listener should do after router returns."""
     REPLY = "reply"                # send a LINE message back to the group / user
     SILENT = "silent"              # no LINE response, just log
-    ALERT_TELEGRAM = "alert_telegram"  # log + push to Telegram (Type 2 hint)
+    ALERT_TELEGRAM = "alert_telegram"  # reserved — currently unused in passive mode
 
 
 @dataclass(frozen=True)
@@ -103,11 +111,33 @@ class LineRouter:
                     skip_reason=f"group {event.group_id!r} not in target_groups whitelist",
                 )
 
-        # 3. Parse.
-        parsed = parse_query(event.text)
+        # 3. PASSIVE LISTENING (Pattern B): without an @bot mention, the bot
+        # stays silent. We still parse + classify the intent so the audit log
+        # captures it as a training signal, but no LINE reply is sent.
+        if not event.mention_is_self:
+            parsed = parse_query(event.text)
+            return DispatchResult(
+                action=DispatchAction.SILENT,
+                target_id=target_id,
+                intent=parsed.intent.value, worker=None,
+                skip_reason="passive listening: not @mentioned",
+                audit_extras={
+                    "would_have_replied": parsed.intent.value in (
+                        QueryIntent.AVAILABILITY_CHECK.value,
+                        QueryIntent.HISTORICAL_LOOKUP.value,
+                    ),
+                    "destination_hint": parsed.destination_hint,
+                    "lifecycle_hint": (parsed.extras or {}).get("lifecycle_hint"),
+                },
+            )
+
+        # 4. @mentioned — strip the bot reference and dispatch by intent.
+        clean_text = _strip_bot_mention(
+            event.text, event.mention_self_index, event.mention_self_length,
+        )
+        parsed = parse_query(clean_text)
         intent = parsed.intent
 
-        # 4. Route by intent.
         if intent == QueryIntent.AVAILABILITY_CHECK:
             check = self.availability.check(parsed)
             return DispatchResult(
@@ -116,7 +146,8 @@ class LineRouter:
                 target_id=target_id,
                 reply_token=event.reply_token,
                 intent=intent.value, worker="availability_checker",
-                audit_extras={"result_kind": check.kind.value, "n_products": len(check.products)},
+                audit_extras={"result_kind": check.kind.value, "n_products": len(check.products),
+                              "cleaned_text": clean_text},
             )
 
         if intent == QueryIntent.HISTORICAL_LOOKUP:
@@ -127,37 +158,33 @@ class LineRouter:
                 target_id=target_id,
                 reply_token=event.reply_token,
                 intent=intent.value, worker="historical_lookup",
-                audit_extras={"result_kind": hist.kind.value, "n_products": len(hist.products)},
+                audit_extras={"result_kind": hist.kind.value, "n_products": len(hist.products),
+                              "cleaned_text": clean_text},
             )
 
         if intent == QueryIntent.PRICE_EDIT_HINT:
-            # Never auto-execute pricing changes. Alert Gary, do not reply in LINE.
+            # Bot was explicitly invoked AND asked to change price.
+            # Reply with refusal so the user sees we heard but won't act.
+            # No Telegram alert — even @mention does not authorize Telegram noise
+            # under passive-listening discipline; user is in the loop already.
             return DispatchResult(
-                action=DispatchAction.ALERT_TELEGRAM,
+                action=DispatchAction.REPLY,
                 reply_text=PRICE_EDIT_REFUSAL_TEXT,
                 target_id=target_id,
                 reply_token=event.reply_token,
                 intent=intent.value, worker=None,
-                audit_extras={"original_text": event.text},
+                audit_extras={"original_text": event.text, "cleaned_text": clean_text},
             )
 
-        # intent == UNCLEAR
-        # If bot was @mentioned explicitly, acknowledge so user knows we heard them.
-        # Otherwise stay silent — don't reply to every chat message.
-        if event.mention_is_self:
-            return DispatchResult(
-                action=DispatchAction.REPLY,
-                reply_text=UNCLEAR_ACK_TEXT,
-                target_id=target_id,
-                reply_token=event.reply_token,
-                intent=intent.value, worker=None,
-                skip_reason="unclear but @mentioned, replying with ack",
-            )
-
+        # intent == UNCLEAR but @mentioned — give an ack so user knows we heard.
         return DispatchResult(
-            action=DispatchAction.SILENT, target_id=target_id,
+            action=DispatchAction.REPLY,
+            reply_text=UNCLEAR_ACK_TEXT,
+            target_id=target_id,
+            reply_token=event.reply_token,
             intent=intent.value, worker=None,
-            skip_reason="intent=UNCLEAR and not @mentioned",
+            skip_reason="unclear but @mentioned, replying with ack",
+            audit_extras={"cleaned_text": clean_text},
         )
 
     def _group_allowed(self, group_id: str | None) -> bool:
@@ -166,3 +193,21 @@ class LineRouter:
         if not group_id:
             return False
         return group_id in self.line_config.target_groups
+
+
+def _strip_bot_mention(text: str, index: int | None, length: int | None) -> str:
+    """Remove the @bot substring at the LINE-provided index/length, then trim.
+
+    LINE gives us exact char offsets for each mentionee — we use them directly
+    instead of regex-guessing (display name varies: @Hermes小幫手, @283nbnhf,
+    etc., and may contain CJK width oddities). If the indices are missing or
+    out of bounds we fall back to the raw text so the parser still has data.
+    """
+    if not text:
+        return ""
+    if index is None or length is None or index < 0 or length <= 0:
+        return text.strip()
+    end = index + length
+    if end > len(text):
+        return text.strip()
+    return (text[:index] + text[end:]).strip()
