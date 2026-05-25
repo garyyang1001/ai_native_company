@@ -36,13 +36,23 @@ Gary 在這次討論之間把 Hermes 從 v0.8.0 升到 **v0.14.0 (release 2026.5
 - `LINE_HOME_CHANNEL=C24cf0311116b96f22aced7cc2f7cac8d`(cron/通知預設目標)
 - `LINE_SLOW_RESPONSE_THRESHOLD=45`(45 秒沒回就觸發 postback 按鈕)
 
-**還沒做的事(等 agent 設定 + Gary 點頭才動)**:
+**還沒做的事(等 agent 實作 + Telegram 設定 + Gary 點頭才動)**:
 - ❌ Hermes gateway **沒**持續跑(只測完關掉了)
 - ❌ Tailscale Funnel **沒切換**,還指 8765 → 舊 listener
 - ❌ LINE Developers Console / API 上的 webhook URL **沒換**,還是 `https://spark-8035.tailb40323.ts.net/wannavegtour/line/webhook`(舊 listener path)
 - ❌ 舊 listener **沒停**,8765 還在收 webhook 並回應 OP 群
-- ❌ wannavegtour-op-assistant **profile 沒建**(目前用 default profile 配 LINE plugin,等決定要不要分 profile 再搬)
-- ❌ Agent classifier(Code is Law β 思路)**沒做** — 但用方案 α 後,Hermes 預設會用 Codex 直接接管 reply 流程,Code is Law 的守則要怎麼介入需要再設計
+- ❌ 6 個 tool 還沒實作(query_intent / fetch_wc_data / compose_reply / validate_reply / send_reply / escalate_to_gary)— spec 在 `docs/plans/2026-05-26-op-bot-hermes-harness-spec.md`
+- ❌ Telegram 還沒設(default profile 接 Gary 個人 Telegram)— **blocked on Gary 提供 bot token + 個人 user ID**
+
+**已做的事(2026-05-26 15:xx,Codex 執行 + Claude 驗證)**:
+- ✅ **建好 `wannavegtour-op-assistant` 專屬 profile** (`~/.hermes/profiles/wannavegtour-op-assistant/`)
+- ✅ Default profile + wannavegtour profile 兩邊 model 都設成 `openai/gpt-5.5`,provider `OpenAI Codex` (OAuth)
+- ✅ 8 個 LINE_* env 從 default `.env` 搬到 wannavegtour profile `.env`,default 現在 0 個,wannaveg 8 個
+- ✅ LINE plugin: default profile **disabled**,wannavegtour profile **enabled**(避免 default 試圖搶 LINE 路徑)
+- ✅ SOUL.md 寫進初版佔位文(指向 spec doc,明確標「6 tool 沒實作前不切流量」)
+- ✅ 兩邊 .env 維持 mode 600
+- ✅ smoke test:wannavegtour profile gateway 起得來,bind 8646,/line/webhook/health 200,正常停
+- ✅ 生產 listener (PID 49146, 8765) 全程沒被影響,/healthz 還 200
 
 **為什麼還不切換**: 一但 LINE webhook URL 指向 Hermes:8646,**Codex (GPT-5.4) 會直接生 reply 給 OP 同事**,沒走我們的 `query_parser` + `availability_checker` 等決定性流程。OP 會拿到「LLM 隨便回答」的答案,違反 Code is Law,而且資訊也錯。
 
