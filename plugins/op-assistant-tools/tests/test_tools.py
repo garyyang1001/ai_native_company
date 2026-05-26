@@ -20,7 +20,7 @@ class TestQueryIntent:
     def test_empty(self):
         result = load(tools.query_intent({"text": ""}))
 
-        assert result["intent"] == "help_request"
+        assert result["intent"] == "help"
         assert result["confidence"] == 1.0
         assert result["source"] == "deterministic_help"
 
@@ -46,28 +46,28 @@ class TestQueryIntentHelpFastPath:
     def test_empty_text_returns_help(self):
         result = load(tools.query_intent({"text": ""}))
 
-        assert result["intent"] == "help_request"
+        assert result["intent"] == "help"
         assert result["confidence"] == 1.0
         assert result["source"] == "deterministic_help"
 
     def test_question_mark_only_returns_help(self):
         result = load(tools.query_intent({"text": "?"}))
 
-        assert result["intent"] == "help_request"
+        assert result["intent"] == "help"
         assert result["confidence"] == 1.0
         assert result["source"] == "deterministic_help"
 
     def test_fullwidth_question_mark_returns_help(self):
         result = load(tools.query_intent({"text": "？"}))
 
-        assert result["intent"] == "help_request"
+        assert result["intent"] == "help"
         assert result["confidence"] == 1.0
         assert result["source"] == "deterministic_help"
 
     def test_help_keyword_returns_help(self):
         result = load(tools.query_intent({"text": "help"}))
 
-        assert result["intent"] == "help_request"
+        assert result["intent"] == "help"
         assert result["confidence"] == 1.0
         assert result["source"] == "deterministic_help"
 
@@ -86,6 +86,8 @@ class TestFetchWcData:
         assert "help_text" in result["data"]
 
     def test_help_request_static(self):
+        # Backward-compat: fetch_wc_data also accepts legacy 'help_request' name
+        # and echoes input intent. SOUL.md canonical name is 'help'.
         result = load(tools.fetch_wc_data({"intent": "help_request", "entities": {}}))
 
         assert result["intent"] == "help_request"
