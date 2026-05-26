@@ -1,8 +1,4 @@
-"""Handlers for op-assistant-tools.
-
-Phase E fills query_intent / fetch_wc_data / compose_reply. The remaining
-side-effecting tools stay stubbed until Phase F.
-"""
+"""Handlers for op-assistant-tools."""
 
 from __future__ import annotations
 
@@ -48,17 +44,6 @@ def _json_default(value: Any) -> Any:
 
 def _json_dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, default=_json_default)
-
-
-def _stub(tool_name: str, args: dict) -> str:
-    return _json_dumps(
-        {
-            "status": "stub",
-            "tool": tool_name,
-            "args": args,
-            "note": "Phase E/F will fill real logic.",
-        },
-    )
 
 
 def _external_intent_from_parsed(parsed: Any) -> str:
@@ -543,12 +528,248 @@ def compose_reply(args: dict, **kwargs) -> str:
 
 
 def validate_reply(args: dict, **kwargs) -> str:
-    return _stub("validate_reply", args)
+    import re
+
+    args = args or {}
+    draft = args.get("draft", "")
+    data = args.get("data", {})
+
+    violations = []
+
+    if len(draft) > 200:
+        violations.append(f"length_over_200: actual={len(draft)}")
+
+    forbidden = ["保證", "承諾", "免費招待", "絕對成團", "我負責", "100% 成行"]
+    for word in forbidden:
+        if word in draft:
+            violations.append(f"forbidden_word: {word!r}")
+
+    simplified_chars = set("个团门头号关与从来时实业问号说话语长会国体没")
+    simp_hits = [c for c in draft if c in simplified_chars]
+    if simp_hits:
+        violations.append(f"simplified_chars: {''.join(set(simp_hits))[:10]}")
+
+    emoji_re = re.compile(
+        "["
+        "\U0001F300-\U0001F9FF"
+        "\U0001F600-\U0001F64F"
+        "\U0001F680-\U0001F6FF"
+        "\U00002600-\U000027BF"
+        "]+",
+        flags=re.UNICODE,
+    )
+    if emoji_re.search(draft):
+        violations.append("emoji_found")
+
+    if not isinstance(data, dict):
+        data = {}
+    canonical = data.get("tour_name") or data.get("data", {}).get("tour_name")
+    if canonical and "團" in draft:
+        tour_pattern = re.compile(r"素食[\w\s]{0,15}團")
+        for match in tour_pattern.findall(draft):
+            if canonical not in match and match not in canonical:
+                violations.append(
+                    f"hallucinated_tour: {match!r} not in canonical {canonical!r}"
+                )
+                break
+
+    if draft.startswith("稍等"):
+        violations.append("draft_includes_prefix: compose must NOT add 稍等; send_reply does")
+
+    passed = len(violations) == 0
+    retry_hint = "" if passed else "請依下列修正後重寫:" + "/ ".join(violations[:3])
+
+    return _json_dumps(
+        {"passed": passed, "violations": violations, "retry_hint": retry_hint}
+    )
+
+
+def _make_line_client() -> Any:
+    from wannavegtour.config import load_line_config
+    from wannavegtour.line_client import LineClient
+
+    return LineClient(load_line_config())
 
 
 def send_reply(args: dict, **kwargs) -> str:
-    return _stub("send_reply", args)
+    import time
+
+    args = args or {}
+    message_type = args.get("message_type")
+    if message_type and message_type != "text":
+        return _json_dumps({"sent": False, "reason": "non-text-ignored"})
+
+    group_id = args.get("group_id", "")
+    draft = args.get("draft", "")
+    is_escalate = bool(args.get("is_escalate", False))
+    dry_run = bool(args.get("dry_run", True))
+
+    if not group_id or (not draft and not is_escalate):
+        return _json_dumps({"sent": False, "reason": "missing group_id or draft"})
+
+    if group_id == "TEST_GROUP_DRYRUN":
+        dry_run = True
+
+    prefix_text = "稍等,我叫 Gary 出來面對。" if is_escalate else "稍等,我去查詢一下。"
+    sent_ids = []
+    t0 = time.monotonic()
+
+    try:
+        client = None if dry_run else _make_line_client()
+        if dry_run:
+            sent_ids.append(f"DRYRUN_PREFIX_{int(time.time() * 1000)}")
+        else:
+            client.push_text(group_id, prefix_text)
+            sent_ids.append("PREFIX_SENT")
+
+        if not is_escalate:
+            if dry_run:
+                sent_ids.append(f"DRYRUN_BODY_{int(time.time() * 1000)}")
+            else:
+                client.push_text(group_id, draft)
+                sent_ids.append("BODY_SENT")
+    except Exception as e:
+        return _json_dumps(
+            {
+                "sent": False,
+                "message_ids": sent_ids,
+                "error": str(e)[:200],
+                "dry_run": dry_run,
+            }
+        )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    return _json_dumps(
+        {
+            "sent": True,
+            "message_ids": sent_ids,
+            "latency_ms": latency_ms,
+            "dry_run": dry_run,
+            "is_escalate": is_escalate,
+            "prefix": prefix_text,
+        }
+    )
+
+
+ESCALATIONS_JSONL = "/home/wannavegtour/.hermes/escalations/wannavegtour.jsonl"
+
+
+def _load_hermes_env_value(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value:
+        return value
+
+    env_path = os.path.expanduser("~/.hermes/.env")
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw or raw.startswith("#") or "=" not in raw:
+                    continue
+                key, raw_value = raw.split("=", 1)
+                if key.strip() == name:
+                    return raw_value.strip().strip('"').strip("'")
+    except OSError:
+        return None
+    return None
 
 
 def escalate_to_gary(args: dict, **kwargs) -> str:
-    return _stub("escalate_to_gary", args)
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    args = args or {}
+    message_type = args.get("message_type")
+    if message_type and message_type != "text":
+        return _json_dumps({"sent": False, "reason": "non-text-ignored"})
+
+    reason = args.get("reason", "unspecified")
+    context = args.get("context", {})
+    group_id = args.get("group_id", "")
+    dry_run = bool(args.get("dry_run", True))
+
+    if not isinstance(context, dict):
+        context = {}
+    if group_id == "TEST_GROUP_DRYRUN":
+        dry_run = True
+
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "context": context,
+        "group_id": group_id,
+        "channels_attempted": [],
+    }
+
+    channels_fired = []
+    errors = {}
+
+    try:
+        jsonl_path = Path(ESCALATIONS_JSONL)
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(jsonl_path.parent, 0o700)
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            os.chmod(jsonl_path, 0o600)
+        except OSError:
+            pass
+        channels_fired.append("jsonl")
+    except Exception as e:
+        errors["jsonl"] = str(e)[:200]
+
+    try:
+        line_args = {
+            "group_id": group_id,
+            "draft": "",
+            "is_escalate": True,
+            "dry_run": dry_run,
+        }
+        send_result = json.loads(send_reply(line_args))
+        if send_result.get("sent"):
+            channels_fired.append("line_notice")
+        else:
+            errors["line_notice"] = send_result.get(
+                "error", send_result.get("reason", "send_reply returned sent=False")
+            )
+    except Exception as e:
+        errors["line_notice"] = str(e)[:200]
+
+    try:
+        bot_token = _load_hermes_env_value("TELEGRAM_BOT_TOKEN")
+        chat_id = _load_hermes_env_value("TELEGRAM_HOME_CHANNEL")
+        if not bot_token or not chat_id:
+            errors["telegram"] = "missing token or chat_id"
+        else:
+            text = (
+                "OP escalate\n"
+                f"reason: {reason}\n"
+                f"群: {group_id or '(none)'}\n"
+                f"原話: {context.get('original_text', '(no original)')[:200]}\n"
+                f"intent: {context.get('intent', '(unknown)')}"
+            )
+            if dry_run:
+                channels_fired.append("telegram_dryrun")
+            else:
+                import requests
+
+                response = requests.post(
+                    f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                    data={"chat_id": chat_id, "text": text},
+                    timeout=30,
+                )
+                response.raise_for_status()
+                channels_fired.append("telegram")
+    except Exception as e:
+        response = getattr(e, "response", None)
+        status = getattr(response, "status_code", "?") if response is not None else "?"
+        errors["telegram"] = f"{type(e).__name__}: status={status}"
+
+    return _json_dumps(
+        {
+            "escalated": len(channels_fired) > 0,
+            "channels": channels_fired,
+            "errors": errors,
+            "dry_run": dry_run,
+        }
+    )

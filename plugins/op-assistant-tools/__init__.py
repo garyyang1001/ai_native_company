@@ -1,9 +1,28 @@
 """op-assistant-tools plugin: 6-tool harness for wannavegtour OP LINE bot."""
 
-from tools.registry import registry
+try:
+    from tools.registry import registry
+except ModuleNotFoundError:
+    registry = None
 
-from . import schemas
-from . import tools
+try:
+    from . import schemas
+    from . import tools
+except ImportError:
+    import importlib.util
+    from pathlib import Path
+
+    def _load_local_module(module_name: str, filename: str):
+        path = Path(__file__).with_name(filename)
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {filename}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    schemas = _load_local_module("op_assistant_tools_schemas", "schemas.py")
+    tools = _load_local_module("op_assistant_tools_handlers", "tools.py")
 
 
 TOOLSET = "op_assistant"
@@ -23,53 +42,15 @@ _TOOL_DEFINITIONS = [
 ]
 
 
-registry.register(
-    name="query_intent",
-    toolset=TOOLSET,
-    schema=schemas.QUERY_INTENT,
-    handler=tools.query_intent,
-    check_fn=_always_available,
-)
-
-registry.register(
-    name="fetch_wc_data",
-    toolset=TOOLSET,
-    schema=schemas.FETCH_WC_DATA,
-    handler=tools.fetch_wc_data,
-    check_fn=_always_available,
-)
-
-registry.register(
-    name="compose_reply",
-    toolset=TOOLSET,
-    schema=schemas.COMPOSE_REPLY,
-    handler=tools.compose_reply,
-    check_fn=_always_available,
-)
-
-registry.register(
-    name="validate_reply",
-    toolset=TOOLSET,
-    schema=schemas.VALIDATE_REPLY,
-    handler=tools.validate_reply,
-    check_fn=_always_available,
-)
-
-registry.register(
-    name="send_reply",
-    toolset=TOOLSET,
-    schema=schemas.SEND_REPLY,
-    handler=tools.send_reply,
-    check_fn=_always_available,
-)
-
-registry.register(
-    name="escalate_to_gary",
-    toolset=TOOLSET,
-    schema=schemas.ESCALATE_TO_GARY,
-    handler=tools.escalate_to_gary,
-    check_fn=_always_available,
-)
+if registry is not None:
+    for name, schema, handler in _TOOL_DEFINITIONS:
+        registry.register(
+            name=name,
+            toolset=TOOLSET,
+            schema=schema,
+            handler=handler,
+            check_fn=_always_available,
+        )
 
 
 def register(ctx) -> None:
