@@ -4,6 +4,20 @@ This repository is the working space for turning 好事發生數位有限公司 
 
 The current priority is not to build a generic SEO agent and not to copy the OHYA architecture. The priority is to define a small, durable company kernel that lets real agents work while leaving structured records that can be reviewed, verified, cleaned, and reused.
 
+## How To Talk With Gary (2026-05-27 起)
+
+When the recipient of a reply is Gary, default to **plain language paired with a concrete scenario and a step-by-step flow**. Technical terms, function names, file paths, table names, and command snippets are allowed, but they belong in parentheses or short footnotes — not as the backbone of the explanation.
+
+Concretely:
+
+- Lead with the scenario in everyday Chinese (繁體). 例: 「OP 同事在 LINE 群打了一句話,bot 沒聽懂...」
+- Then walk the flow step by step. 一條訊息從哪裡進、經過誰、最後做什麼。
+- 技術名詞放括號內. e.g. 「資料先存到一張表(technical: `closed_loop_kernel.events`)」
+- 引用程式碼時用 file:line 加一句白話說明那段在幹嘛, 不直接貼大段 code.
+- 不要堆 acronym 或 schema 縮寫 (e.g. CRUD, FK, SoT) 不解釋就丟過來.
+
+This rule applies to all agents (Claude, Codex, Antigravity) when writing replies, summaries, or proposals destined for Gary. Internal review / agent-to-agent prompts may stay technical.
+
 ## Current Direction
 
 - Start from real agents and profiles, then collect their traces into the Closed Loop Kernel.
