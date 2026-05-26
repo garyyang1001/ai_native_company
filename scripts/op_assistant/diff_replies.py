@@ -335,8 +335,8 @@ def main() -> int:
     parser.add_argument("--show-fails", type=int, default=10, help="Top N fail cases to print")
     parser.add_argument(
         "--replay-version",
-        default="v2",
-        help="Only compare against attempts marked with this replay_version (default: v2). "
+        default="v5",
+        help="Only compare against attempts marked with this replay_version (default: v5). "
              "Pass empty string to fall back to legacy any-batch detection.",
     )
     args = parser.parse_args()

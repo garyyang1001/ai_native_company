@@ -62,11 +62,14 @@ from closed_loop_kernel.store import KernelStore, json_param  # noqa: E402
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
 REPLAY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000005")  # legacy v1 — kept for record
-REPLAY_V2_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000007")  # v2 with invocation filter
+REPLAY_V2_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000007")  # v2: invocation filter only
+REPLAY_V3_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000008")  # v3: + help_request fast path
+REPLAY_V4_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000009")  # v4: validate exemption (buggy, NameError)
+REPLAY_V5_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-00000000000a")  # v5: validate exemption (fixed)
 INBOUND_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000006")  # mirrors fork plugin
 MAX_RETRY = 3
 AGENT_ID = "op-assistant-replay"
-REPLAY_VERSION = "v2"
+REPLAY_VERSION = "v5"
 DEFAULT_INVOCATION_PREFIXES = ("小弟", "@小弟", "/小弟")
 
 
@@ -142,8 +145,8 @@ def _tool_call(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _attempt_id_for_event(event_id: str) -> str:
-    """v2 attempt_id — uses REPLAY_V2_NAMESPACE so it doesn't collide with v1 escalate rows."""
-    return str(uuid.uuid5(REPLAY_V2_NAMESPACE, str(event_id)))
+    """v4 attempt_id — uses REPLAY_V4_NAMESPACE so it doesn't collide with v1/v2/v3 rows."""
+    return str(uuid.uuid5(REPLAY_V5_NAMESPACE, str(event_id)))
 
 
 def _write_inbound_event(store: KernelStore, event_id: str, payload: dict[str, Any]) -> bool:

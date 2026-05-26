@@ -577,11 +577,14 @@ def validate_reply(args: dict, **kwargs) -> str:
 
     args = args or {}
     draft = args.get("draft", "")
+    intent = args.get("intent", "")
     data = args.get("data", {})
 
     violations = []
 
-    if len(draft) > 200:
+    # length cap is 200 for dynamic replies; help_request uses a static template
+    # that may legitimately exceed it (full feature list etc.)
+    if intent != "help_request" and len(draft) > 200:
         violations.append(f"length_over_200: actual={len(draft)}")
 
     forbidden = ["保證", "承諾", "免費招待", "絕對成團", "我負責", "100% 成行"]
@@ -603,7 +606,10 @@ def validate_reply(args: dict, **kwargs) -> str:
         "]+",
         flags=re.UNICODE,
     )
-    if emoji_re.search(draft):
+    # emoji check skipped for help_request — the static help template is
+    # designed with leading emoji (🤖 etc.); the rule exists to catch LLM
+    # over-enthusiasm on dynamic replies, not template content.
+    if intent != "help_request" and emoji_re.search(draft):
         violations.append("emoji_found")
 
     if not isinstance(data, dict):
