@@ -371,27 +371,56 @@ PGPASSWORD=$(cat ~/.hermes/credentials/wannavegtour/op_kernel/db_password.txt) \
 
 Gary 確認:**OP 對話確實包含同事姓名 + 客戶資料**。不能假裝沒有。
 
-### User ID → 同事名稱對應表
+### User ID → 同事名稱對應表(2026-05-26 已 seed)
 
-新檔 `~/.hermes/credentials/wannavegtour/op_mapping.json`(mode 600):
+實檔 `~/.hermes/credentials/wannavegtour/op_mapping.json`(mode 600,已寫入)。
+
+**真實群組**:`玩素食旅行社OP Team`(group_id `C24cf0311116b96f22aced7cc2f7cac8d`),total members 13 人。
+
+**已知 5 人**(從 audit log + LINE Profile API 對齊):
+
+| User ID | 暱稱(LINE displayName) |
+|---|---|
+| `Ufd364c78f6041ab4e30d37e804017b7a` | Gary |
+| `Uec2911424093f80c1533579150ac80c3` | 洪先生 |
+| `U366928d65b6287063b4592e32c5a9f05` | Mickey廖美怡 |
+| `Uee711d925e84c66126bd65c99ad5de45` | 蔡妙齡 |
+| `U3227b5769b3f246ffb30b1718704e6ac` | 姿婕❤️ |
+
+**未知 8 人**:LINE 群裡有 13 人,5 個在 audit log 出現過所以撈到 displayName,**8 個沒講話的暫時撈不到 user_id**。LINE API `/v2/bot/group/{id}/members/ids` 回 HTTP 403(需要 LINE OA 升級成「認證帳號」)。
+
+**補完策略**(已在 mapping JSON 的 `resolution_method.auto_update` 標註):
+- 增量補:Cron 1 ETL 遇到 mapping 沒有的 user_id → 自動 query `/v2/bot/group/{group_id}/member/{user_id}` → 寫回 mapping(需加 file lock)
+- 一次補:Gary 把 OA 升級成認證帳號(免費,需審核 1-2 週,提供統編 / 公司資料)→ 用 `/members/ids` 一次拿 13 人
+
+**完整 schema**(已寫入檔案):
 
 ```json
 {
-  "user_id_to_name": {
-    "Ufd364c78f6041ab4e30d37e804017b7a": "美鳳",
-    "Uec2911424093f80c1533579150ac80c3": "Gary",
-    "U<...>": "OP 同事 X",
-    "U<...>": "OP 同事 Y"
-  },
-  "group_id_to_name": {
-    "C24cf0311116b96f22aced7cc2f7cac8d": "OP 內部群"
-  },
   "schema_version": 1,
-  "last_updated": "2026-05-26"
+  "generated_at": "2026-05-26T13:12:35",
+  "company": "wannavegtour / 阿玩旅遊",
+  "groups": {
+    "C24cf0311116b96f22aced7cc2f7cac8d": {
+      "name": "玩素食旅行社OP Team",
+      "purpose": "OP 部門內部群,小弟服務對象",
+      "total_members_in_line": 13,
+      "members_known_count": 5,
+      "members_unknown_count": 8,
+      "members_unknown_reason": "需 LINE OA 認證帳號才能 enumerate all member ids (API 403)"
+    }
+  },
+  "user_id_to_name": {
+    "Ufd364c78f6041ab4e30d37e804017b7a": "Gary",
+    "Uec2911424093f80c1533579150ac80c3": "洪先生",
+    "U366928d65b6287063b4592e32c5a9f05": "Mickey廖美怡",
+    "Uee711d925e84c66126bd65c99ad5de45": "蔡妙齡",
+    "U3227b5769b3f246ffb30b1718704e6ac": "姿婕❤️"
+  },
+  "resolution_method": {...},
+  "notes": [...]
 }
 ```
-
-(我會挖過去 audit log 看實際出現的 user_id;Gary 補上每個 id 對應的名字。)
 
 ### ETL 階段 resolve user_id → name
 
