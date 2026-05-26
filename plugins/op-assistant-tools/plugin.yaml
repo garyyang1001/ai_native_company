@@ -1,0 +1,29 @@
+name: op-assistant-tools
+version: 0.1.0
+description: "6-tool deterministic harness for the wannavegtour OP assistant LINE bot. Implements Option E (Code is Law) — LLM as classifier sensor, Python for control flow."
+author: "Gary Yang (wannavegtour)"
+provides_tools:
+  - query_intent
+  - fetch_wc_data
+  - compose_reply
+  - validate_reply
+  - send_reply
+  - escalate_to_gary
+requires_env:
+  - name: KERNEL_DATABASE_URL
+    description: "PostgreSQL DSN for closed_loop_kernel (op-assistant)"
+    prompt: "Kernel DB URL"
+    password: true
+  - name: WANNAVEGTOUR_REPO_PATH
+    description: "Absolute path to Gary's wannavegtour repo (for re-using wannavegtour package)"
+    prompt: "wannavegtour repo path"
+    password: false
+optional_env:
+  - name: TELEGRAM_BOT_TOKEN
+    description: "Hermes Telegram bot token for escalate_to_gary push"
+    prompt: "Telegram bot token"
+    password: true
+  - name: TELEGRAM_HOME_CHANNEL
+    description: "Telegram chat_id to push escalate alerts (Gary's personal Telegram user_id)"
+    prompt: "Telegram chat ID"
+    password: false
