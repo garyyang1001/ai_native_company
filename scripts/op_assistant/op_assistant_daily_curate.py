@@ -36,6 +36,7 @@ KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
 
 # ★ M2 修正:uuid5 namespace(daily 跟 weekly 各用一個)
 DAILY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000002")
+HEALTH_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-00000000000a")  # 共用 health key
 
 # 直接打 Ollama OpenAI-compatible endpoint(跟 Hermes auxiliary.compression 共用模型)
 OLLAMA_URL = "http://127.0.0.1:11434/v1/chat/completions"
@@ -59,17 +60,34 @@ def run():
         if not events and not failures:
             return
 
-        # 用 gemma4:e4b 整理(直接 HTTP)
+        # ★ Wave 1 HIGH#3:Ollama call 包 try/except,timeout/network fail 寫 health event
         prompt = _build_curation_prompt(events, failures)
-        resp = requests.post(OLLAMA_URL, json={
-            "model": CURATION_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.2,    # 整理任務求穩
-        }, timeout=300)
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"]
-        summary = json.loads(raw)
+        try:
+            resp = requests.post(OLLAMA_URL, json={
+                "model": CURATION_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2,
+            }, timeout=300)
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"]
+            summary = json.loads(raw)
+        except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
+            # Deterministic health event(M5 噪音控制:同一天同樣的 cold-start fail 只寫一筆)
+            err_class = type(e).__name__
+            period_key_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            hid = str(uuid.uuid5(HEALTH_NAMESPACE, f"curate_llm_{err_class}_{period_key_today}"))
+            store.execute(
+                "INSERT INTO events (id, event_type, payload, created_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+                [hid, "daily_curation_llm_failure",
+                 json_param({"model": CURATION_MODEL, "endpoint": OLLAMA_URL,
+                             "error_class": err_class, "error": str(e)[:200],
+                             "period_key": period_key_today,
+                             "event_count": len(events), "open_failure_count": len(failures)}),
+                 datetime.now(timezone.utc).isoformat()]
+            )
+            return
 
         # 把 metrics merge 進 summary(L1 修正)
         summary["event_count"] = len(events)
@@ -79,10 +97,10 @@ def run():
         period_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         sid = str(uuid.uuid5(DAILY_NAMESPACE, period_key))
 
-        # 寫進 events table(不是 candidates!) — ON CONFLICT 保證 idempotent
-        store.execute(
+        # ★ Wave 1 HIGH#4:RETURNING id — 只在真正 INSERT 時才 push Telegram
+        result = store.fetch_one(
             "INSERT INTO events (id, event_type, payload, created_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+            "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING RETURNING id",
             [sid, "daily_curation_summary",
              json_param({
                  "period_start": cutoff_iso,
@@ -98,8 +116,10 @@ def run():
              }),
              datetime.now(timezone.utc).isoformat()]
         )
-        # Push Telegram(走 Hermes Bot API 直接送 Gary chat)
-        _push_telegram_summary(sid, summary)
+        if result:
+            # 真插入 → 第一次跑,push Telegram
+            _push_telegram_summary(sid, summary)
+        # else: cron 重跑 / 補跑 — 同一天 summary 已存在,不再 push(防 spam)
     finally:
         store.close()
 

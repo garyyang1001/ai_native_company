@@ -30,6 +30,7 @@ KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
 
 # M2 修正
 WEEKLY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000003")
+HEALTH_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-00000000000a")
 
 def run():
     week_start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -75,13 +76,16 @@ def run():
             "approvals": [dict(r) for r in approvals],
             "approved_patch_types": [dict(r) for r in approved_types],
         }
-        store.execute(
+        # ★ Wave 1 HIGH#4:RETURNING id — 只在真插入時才 push
+        result = store.fetch_one(
             "INSERT INTO events (id, event_type, payload, created_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+            "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING RETURNING id",
             [wid, "weekly_report", json_param(payload),
              datetime.now(timezone.utc).isoformat()]
         )
-        _push_weekly_report(wid, payload)
+        if result:
+            _push_weekly_report(wid, payload)
+        # else: 重跑同週 — 不再 push
     finally:
         store.close()
 
@@ -90,6 +94,24 @@ def _push_weekly_report(weekly_event_id, payload):
     bot_token = _get_telegram_bot_token()
     chat_id = _get_telegram_home_channel()
     if not bot_token or not chat_id:
+        # ★ Codex M5:跟 daily 一致,寫 skipped 健康事件,deterministic uuid 防噪音
+        try:
+            store = KernelStore.from_url(KERNEL_URL)
+            week_key = payload.get("period_key", "?")
+            hid = str(uuid.uuid5(HEALTH_NAMESPACE, f"weekly_push_skipped_{week_key}"))
+            store.execute(
+                "INSERT INTO events (id, event_type, payload, created_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+                [hid, "telegram_push_skipped",
+                 json_param({"reason": "missing token or chat_id",
+                             "has_token": bool(bot_token), "has_chat": bool(chat_id),
+                             "weekly_event_id": weekly_event_id,
+                             "period_key": week_key}),
+                 datetime.now(timezone.utc).isoformat()]
+            )
+            store.close()
+        except Exception:
+            pass
         return
 
     intents = payload["intent_distribution"][:5]
