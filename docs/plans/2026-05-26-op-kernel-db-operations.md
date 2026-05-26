@@ -47,19 +47,21 @@ flowchart TB
 
     KDB -.->|daily pg_dump| Backup[備份三層<br/>daily/weekly/monthly]
     Backup -.->|未來決定| Remote[異地備份<br/>S3 / restic / 第二台機]
-
-    style KDB fill:#9fc5e8
-    style SDB fill:#cfe2f3
-    style Tools fill:#ffd966
-    style TG fill:#ea9999
-    style Backup fill:#b6d7a8
 ```
 
-**怎麼讀**:
-- 🔵 **藍**:資料儲存層 — SDB 是 raw,KDB 是結構化
-- 🟡 **黃**:Code is Law 工具層 — 寫操作都在這收口
-- 🔴 **紅**:Gary 跟系統互動的窗口
-- 🟢 **綠**:備份
+**怎麼讀(從上到下,3 段)**:
+
+- **入口段**:OP LINE 群組 → Hermes LINE plugin → AIAgent。這條是即時的(LINE webhook 來就觸發)
+- **儲存段**(中間兩層 DB):
+  - `session.db` (SQLite) — Agent 自己用,raw 對話原文
+  - `closed_loop_kernel` (PostgreSQL @ Docker) — 結構化業務記錄,11 張表
+  - 兩者透過 hourly ETL cron 串起來
+- **學習段**(右半 + 下半):
+  - kernel candidates → Telegram → Gary 批准 → approvals → artifacts → 回去更新 Agent SOUL/MEMORY
+  - kernel → pg_dump → 三層備份(daily / weekly / monthly)
+  - 備份未來可推異地(虛線 = 還沒做)
+
+**實線 = 已規劃要做**;**虛線 = 待後話定**。
 
 ---
 
