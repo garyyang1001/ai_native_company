@@ -71,6 +71,7 @@ import mimetypes
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 import uuid
@@ -730,6 +731,14 @@ class LineAdapter(BasePlatformAdapter):
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
 
+        # wannavegtour deterministic router state. Initialized after the
+        # webhook server is bound so import/credential failures do not block
+        # the Hermes fallback path.
+        self._wc_router = None
+        self._wc_line_client = None
+        self._wc_line_event_cls = None
+        self._wc_dispatch_action_cls = None
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -784,6 +793,14 @@ class LineAdapter(BasePlatformAdapter):
 
         self._app = web.Application(client_max_size=WEBHOOK_BODY_MAX_BYTES)
         self._app.router.add_post(self.webhook_path, self._handle_webhook)
+        # ★ op-assistant fork: legacy path alias — the wannavegtour standalone listener
+        # (which we're cutting over from) used /wannavegtour/line/webhook. Accept it as
+        # alias so we can swap the Tailscale Funnel port without changing the LINE
+        # webhook URL at LINE Developers Console (zero-coordination cutover).
+        _LEGACY_LISTENER_PATH = "/wannavegtour/line/webhook"
+        if self.webhook_path != _LEGACY_LISTENER_PATH:
+            self._app.router.add_post(_LEGACY_LISTENER_PATH, self._handle_webhook)
+            self._app.router.add_get(f"{_LEGACY_LISTENER_PATH}/health", self._handle_health)
         # Public health probe — useful for tunnel/proxy verification.
         self._app.router.add_get(f"{self.webhook_path}/health", self._handle_health)
         # Media serving endpoint.
@@ -813,7 +830,50 @@ class LineAdapter(BasePlatformAdapter):
             self.webhook_path,
             f" (public: {self.public_base_url})" if self.public_base_url else "",
         )
+        self._init_wannavegtour_state()
         return True
+
+    def _init_wannavegtour_state(self) -> None:
+        """Wire the legacy wannavegtour Python router for deterministic OP replies."""
+        repo = os.environ.get(
+            "WANNAVEGTOUR_REPO_PATH",
+            "/home/wannavegtour/Desktop/AI Native Company/Gary",
+        )
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+
+        try:
+            from wannavegtour.config import load_config, load_line_config
+            from wannavegtour.wc_client import WCClient
+            from wannavegtour.line_client import (
+                LineClient as WC_LineClient,
+                LineEvent as WC_LineEvent,
+            )
+            from wannavegtour.line_router import LineRouter, DispatchAction
+            from wannavegtour.availability_checker import AvailabilityChecker
+            from wannavegtour.historical_lookup import HistoricalLookup
+
+            wc_client = WCClient(load_config())
+            line_config = load_line_config()
+            self._wc_line_client = WC_LineClient(line_config)
+            self._wc_router = LineRouter(
+                line_config=line_config,
+                availability=AvailabilityChecker(wc_client),
+                historical=HistoricalLookup(wc_client),
+            )
+            self._wc_line_event_cls = WC_LineEvent
+            self._wc_dispatch_action_cls = DispatchAction
+            logger.info("OP-FORK-DETERMINISTIC: wannavegtour LineRouter initialized")
+        except Exception as exc:
+            logger.warning(
+                "OP-FORK-DETERMINISTIC: wannavegtour state init failed; "
+                "falling back to Hermes agent path: %s",
+                exc,
+            )
+            self._wc_router = None
+            self._wc_line_client = None
+            self._wc_line_event_cls = None
+            self._wc_dispatch_action_cls = None
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
@@ -1010,7 +1070,121 @@ class LineAdapter(BasePlatformAdapter):
             invocation["kind"],
             message_id,
         )
+
+        # ──────────────────────────────────────────────────────────────────
+        # B1 redesign: Python-first deterministic routing.
+        # Reuse wannavegtour.LineRouter.dispatch() to handle the message
+        # without invoking Hermes agent. Only fall through to Hermes agent
+        # when LineRouter says it can't handle the message (e.g., future
+        # LLM-assisted actions or non-reply alert actions).
+        # ──────────────────────────────────────────────────────────────────
+        if self._wc_router is not None:
+            try:
+                wc_event = self._to_wc_line_event(msg, event, source, invocation)
+                result = self._wc_router.dispatch(wc_event)
+                logger.info(
+                    "OP-FORK-DETERMINISTIC: action=%s intent=%s worker=%s skip=%r",
+                    result.action.value,
+                    result.intent,
+                    result.worker,
+                    result.skip_reason,
+                )
+
+                if result.action == self._wc_dispatch_action_cls.SILENT:
+                    # Passive observe — already logged inbound, nothing else to do.
+                    return
+
+                if result.action == self._wc_dispatch_action_cls.REPLY:
+                    if result.reply_text and result.target_id:
+                        try:
+                            if result.reply_token:
+                                self._wc_line_client.reply_text(
+                                    result.reply_token,
+                                    result.reply_text,
+                                )
+                            else:
+                                self._wc_line_client.push_text(
+                                    result.target_id,
+                                    result.reply_text,
+                                )
+                            logger.info(
+                                "OP-FORK-DETERMINISTIC: reply sent (%d chars) to %s",
+                                len(result.reply_text),
+                                result.target_id,
+                            )
+                        except Exception as exc:
+                            logger.exception(
+                                "OP-FORK-DETERMINISTIC: reply send failed: %s",
+                                exc,
+                            )
+                        return
+                    logger.warning(
+                        "OP-FORK-DETERMINISTIC: REPLY but missing text/target; "
+                        "falling through to Hermes agent"
+                    )
+                # ALERT_TELEGRAM and other actions fall through to Hermes agent.
+            except Exception as exc:
+                logger.exception(
+                    "OP-FORK-DETERMINISTIC: dispatch raised, falling back to "
+                    "Hermes agent: %s",
+                    exc,
+                )
+
+        # Fallback: invoke Hermes agent only for cases LineRouter could not handle.
+        event_obj.text = self._strip_invocation_token(text, invocation)
         await self.handle_message(event_obj)
+
+    def _to_wc_line_event(
+        self,
+        msg: dict,
+        event: dict,
+        source: dict,
+        mention_data,
+    ):
+        """Convert a Hermes LINE webhook event into wannavegtour LineEvent."""
+        mention = msg.get("mention") if isinstance(msg, dict) else None
+        mention_is_self = False
+        mention_self_index = None
+        mention_self_length = None
+
+        if isinstance(mention, dict):
+            for m in mention.get("mentionees") or []:
+                if isinstance(m, dict) and m.get("isSelf") is True:
+                    mention_is_self = True
+                    idx = m.get("index")
+                    length = m.get("length")
+                    if isinstance(idx, int) and isinstance(length, int) and idx >= 0 and length > 0:
+                        mention_self_index = idx
+                        mention_self_length = length
+                    break
+
+        if (
+            not mention_is_self
+            and isinstance(mention_data, dict)
+            and mention_data.get("kind") == "mention"
+        ):
+            mention_is_self = True
+            idx = mention_data.get("index")
+            length = mention_data.get("length")
+            if isinstance(idx, int) and isinstance(length, int) and idx >= 0 and length > 0:
+                mention_self_index = idx
+                mention_self_length = length
+
+        return self._wc_line_event_cls(
+            event_type=str(event.get("type", "")),
+            message_type=(str(msg.get("type")) if msg.get("type") else None),
+            text=(msg.get("text") if isinstance(msg, dict) else None),
+            source_type=str(source.get("type", "")),
+            group_id=source.get("groupId"),
+            user_id=source.get("userId"),
+            reply_token=event.get("replyToken"),
+            timestamp_ms=int(event.get("timestamp", 0) or 0),
+            message_id=(str(msg.get("id")) if isinstance(msg, dict) and msg.get("id") else None),
+            mention_is_self=mention_is_self,
+            mention_self_index=mention_self_index,
+            mention_self_length=mention_self_length,
+            raw=event,
+        )
 
     def _detect_invocation(self, text: str, msg: dict) -> dict | None:
         """Python deterministic check whether bot is being addressed.
