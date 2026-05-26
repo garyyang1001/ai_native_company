@@ -14,6 +14,26 @@
 
 **Gary 後續指示**(2026-05-26 14:xx): 不要繞路,**必須用 Hermes 原生 LINE 路徑** — 排除 β / γ,鎖定 **方案 α(Hermes 官方 LINE plugin)**。先把 Hermes ↔ LINE 串接起來,哪個 Agent 設定等會再處理。
 
+### 架構釐清(Gary 2026-05-26 後續補強)
+
+Gary 補了三條,影響命名 + 未來 Default 角色:
+
+1. **這台 DGX 只服務阿玩旅遊**(無 multi-tenant)— 之前提到 OHYA / Daguantech 全部不適用,文件提到的都忽略。Hermes Integration Assessment v0 的 Path A/B/C(8 客戶 framework)在本機不適用。
+2. **Default profile = supervisor(主腦)**:
+   - 擁有所有權限,**能讀取底下所有 sub-profile 的資料**(state / memories / sessions / kanban)
+   - 「能讀 sub-profile」這條 Hermes 沒原生機制,實作有 3 條路(α 直接讀檔 / β 走 closed_loop_kernel 中介 / γ MCP)
+   - **此項暫緩**,等 OP Assistant 跑起來再回來討論
+3. **Sub-profile 資料對 Default 開放讀取**(資料流向上,Default 不會被 sub-profile 讀)
+
+**命名簡化**:既然單一公司,profile 從 `wannavegtour-op-assistant` rename 為 **`op-assistant`**(2026-05-26 已執行 `hermes profile rename` 完成,alias 同步 → `/home/wannavegtour/.local/bin/op-assistant`)。未來 4 隻待處理 bot 命名同理:`marketing-assistant` / `customer-listener` / `ceo-assistant` / `oa-bot`(不再加 `wannavegtour-` 前綴)。
+
+**Default profile 暫不動**(Gary 指示),目前狀態維持:
+- 接 `@skimm3r918_bot` Telegram(personal chat)
+- 模型 GPT-5.5 / Codex OAuth
+- 不接 LINE,沒任何 sub-profile 監督功能
+
+當下焦點 = **op-assistant profile 6 個 tool 實作 + cutover**。Default 的 supervisor 能力等之後再設計。
+
 ### 進度更新(2026-05-26)— Hermes 已升 v0.14.0,LINE plugin 已串接 ✓
 
 Gary 在這次討論之間把 Hermes 從 v0.8.0 升到 **v0.14.0 (release 2026.5.16)**,**LINE plugin 內建上線了**(原本我記的「DGX 沒 LINE adapter」已過時)。實際在 `/home/wannavegtour/.hermes/hermes-agent/plugins/platforms/line/`:
@@ -45,7 +65,7 @@ Gary 在這次討論之間把 Hermes 從 v0.8.0 升到 **v0.14.0 (release 2026.5
 - ❌ Telegram 還沒設(default profile 接 Gary 個人 Telegram)— **blocked on Gary 提供 bot token + 個人 user ID**
 
 **已做的事(2026-05-26 15:xx,Codex 執行 + Claude 驗證)**:
-- ✅ **建好 `wannavegtour-op-assistant` 專屬 profile** (`~/.hermes/profiles/wannavegtour-op-assistant/`)
+- ✅ **建好 `op-assistant` 專屬 profile** (`~/.hermes/profiles/op-assistant/`)
 - ✅ Default profile + wannavegtour profile 兩邊 model 都設成 `openai/gpt-5.5`,provider `OpenAI Codex` (OAuth)
 - ✅ 8 個 LINE_* env 從 default `.env` 搬到 wannavegtour profile `.env`,default 現在 0 個,wannaveg 8 個
 - ✅ LINE plugin: default profile **disabled**,wannavegtour profile **enabled**(避免 default 試圖搶 LINE 路徑)
@@ -143,7 +163,7 @@ LINE webhook
 - 在 `gateway/platforms/line.py` 寫新 adapter,繼承 `BasePlatformAdapter`
 - 照 `ADDING_A_PLATFORM.md` checklist 全部實作:`connect / disconnect / send / send_typing / send_image / send_document / get_chat_info` 等 7+ 個方法
 - 在 `gateway/config.py` 的 `Platform` enum 加 `LINE = "line"`
-- **跑法**:`hermes -p wannavegtour-op-assistant gateway` 整套接管 LINE webhook
+- **跑法**:`hermes -p op-assistant gateway` 整套接管 LINE webhook
 - **工作量**:中-大(~1-2 週,要做完整 platform 規格)
 - **優點**:跟 Hermes 100% 對齊,未來 LINE 圖片/語音/檔案功能跟其他平台共用
 - **缺點**:殺雞用牛刀,我們現階段只要文字回答;大改現有 listener
@@ -184,8 +204,8 @@ LINE webhook
 #### 步驟 1: 建 Hermes Profile
 
 ```bash
-hermes profile create wannavegtour-op-assistant
-# 會自動建立 ~/.hermes/profiles/wannavegtour-op-assistant/ 目錄,
+hermes profile create op-assistant
+# 會自動建立 ~/.hermes/profiles/op-assistant/ 目錄,
 # 含 config.yaml / .env / SOUL.md / memories/ / sessions/ / state.db 等
 ```
 
@@ -193,7 +213,7 @@ hermes profile create wannavegtour-op-assistant
 
 #### 步驟 2: 設定 config.yaml
 
-`~/.hermes/profiles/wannavegtour-op-assistant/config.yaml`:
+`~/.hermes/profiles/op-assistant/config.yaml`:
 
 ```yaml
 model:
@@ -223,7 +243,7 @@ compression:
 #### 步驟 3: Codex OAuth 登入
 
 ```bash
-hermes -p wannavegtour-op-assistant login --provider openai-codex
+hermes -p op-assistant login --provider openai-codex
 # 跳出瀏覽器 OAuth flow,完成後 token 存進 profile 的 auth.json
 ```
 
@@ -231,7 +251,7 @@ hermes -p wannavegtour-op-assistant login --provider openai-codex
 
 #### 步驟 4: 寫 SOUL.md(Agent 身分 + 約束)
 
-`~/.hermes/profiles/wannavegtour-op-assistant/SOUL.md` 草稿:
+`~/.hermes/profiles/op-assistant/SOUL.md` 草稿:
 
 ```markdown
 # OP Assistant — 阿玩旅遊 OP 部門助理
@@ -273,7 +293,7 @@ from hermes_cli.profiles import get_profile_dir
 from run_agent import AIAgent
 import json
 
-_HERMES_PROFILE = "wannavegtour-op-assistant"
+_HERMES_PROFILE = "op-assistant"
 _agent = None
 
 def _get_agent():

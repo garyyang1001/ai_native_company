@@ -95,7 +95,7 @@ sequenceDiagram
 
 ## SOUL.md 完整稿
 
-存於 `~/.hermes/profiles/wannavegtour-op-assistant/SOUL.md`(後續若 Gary 決定不分 profile,放 `~/.hermes/SOUL.md` 也可)。
+存於 `~/.hermes/profiles/op-assistant/SOUL.md`(後續若 Gary 決定不分 profile,放 `~/.hermes/SOUL.md` 也可)。
 
 ```markdown
 # OP Assistant — 阿玩旅遊 OP 部門助理「小弟」
@@ -501,7 +501,7 @@ escalate_to_gary(text, {drafts: [...], reasons: [...]})
 
 ## Memory Seed 內容
 
-### `~/.hermes/profiles/wannavegtour-op-assistant/memories/MEMORY.md`
+### `~/.hermes/profiles/op-assistant/memories/MEMORY.md`
 
 ```markdown
 # OP Assistant 長期記憶
@@ -525,7 +525,7 @@ escalate_to_gary(text, {drafts: [...], reasons: [...]})
 (從 audit log 累積,初始空)
 ```
 
-### `~/.hermes/profiles/wannavegtour-op-assistant/memories/USER.md`
+### `~/.hermes/profiles/op-assistant/memories/USER.md`
 
 ```markdown
 # 個別 OP 同事偏好
@@ -601,7 +601,7 @@ escalate_to_gary(text, {drafts: [...], reasons: [...]})
 4. **Escalate 後 OP 端怎麼處理**: bot 是否要回 OP「等等我喔,我問問 Gary」?還是完全靜音等 Gary 手動回?
 5. **Cost budget per message**: 每筆 LINE 訊息預算多少 token / 多少美元?Diana 講 "uncomfortably high API bill is fine",但要有上限免得失控。
 6. **Latency budget**: p95 多久內必須回 OP?LLM call x 3-5 次 + WC fetch + validate,合理範圍 2-10 秒。**>10s 應該觸發 LINE slow-response postback button**(LINE plugin 已有此機制,`LINE_SLOW_RESPONSE_THRESHOLD=45` 太鬆,建議調 5-8 秒)。
-7. **Profile 命名**: 用 default profile,還是建 `wannavegtour-op-assistant` 專屬 profile?專屬 profile 之後比較好遷移(別 channel / 別客戶複用 pattern)。我建議**建專屬**。
+7. **Profile 命名**: 用 default profile,還是建 `op-assistant` 專屬 profile?專屬 profile 之後比較好遷移(別 channel / 別客戶複用 pattern)。我建議**建專屬**。
 8. **Telegram bridge 時序**: escalate_to_gary 依賴 bridge。是先做 bridge 才上 Option E,還是 Option E 先上 + escalate 寫 jsonl(過渡)?我建議 **bridge 跟 Option E 並行做**,bridge 不上線前 jsonl + agent.log warning 也 OK。
 
 ---
