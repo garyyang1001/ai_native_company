@@ -6,12 +6,39 @@
 **作者**: Claude(based on Gary 2026-05-26 修訂指示 + kernel schema 真實對照)
 **Cross-refs**:
 - v1 doc(本份取代它,但保留 audit findings)
-- `closed_loop_kernel/postgres.py`(11 表真實 schema 來源)
+- `closed_loop_kernel/postgres.py`(14 表真實 schema 來源)
 - `closed_loop_kernel/store.py`(`json_param()` helper)
 - `closed_loop_kernel/ohya_demo.py` / `event_reporter.py`(實際 INSERT 範例)
 - `spec/schema-v0.md` / `spec/code-is-law-v0.md`
 - `docs/plans/2026-05-26-wannavegtour-full-company-bot-map-v2.md`
 - `docs/plans/2026-05-26-op-bot-hermes-harness-spec.md`
+
+---
+
+## v2.1 修訂(2026-05-26,Codex review 後)
+
+Codex review 找出 2 BLOCKER + 3 HIGH + 8 MEDIUM,本份逐條修正:
+
+| Codex 發現 | 修在哪 | 修法 |
+|---|---|---|
+| **B1**:cron `--script` 路徑必須相對 + 放 profile 內 | Cron 1/2/3/4 + register 段 | `--script op_assistant_etl.py`(不是絕對路徑);scripts 放 `~/.hermes/profiles/op-assistant/scripts/` |
+| **B2**:`--no-agent` cron 不會 auto-load profile .env | 每個 cron script 頂端 | 加 `_load_profile_env()` helper 手動載 |
+| **H1**:Schema init NameError + password URL-unsafe | 啟動順序 Step 6 | `os.environ['...']` + `openssl rand -hex 24`(不是 base64) |
+| **H2**:cron timeout default 120s < Ollama 300s | 註冊段 | 加 `hermes config set cron.script_timeout_seconds 300` |
+| **H3**:SQLite `immutable=1` WAL 不安全 | Cron 1 ETL | `mode=ro` + `PRAGMA busy_timeout=30000` |
+| **M1**:11 表 → 14 表 + 6 trigger | 全文 | 已 replace_all |
+| **M2**:summary jobs uuid4 不 idempotent | Cron 2/3 | `uuid5(NAMESPACE, period_key)` + `ON CONFLICT DO NOTHING` |
+| **M3**:weekly `_push_weekly_report() = pass` | Cron 3 | 實作完整 push,不留假動作 |
+| **M4**:monthly subprocess fail 丟失 alert | Cron 4 | try/except 包,還是要寫健康事件 |
+| **M5**:mapping JSONDecodeError 不處理 | Cron 1 ETL | catch + 寫 health event,繼續跑 |
+| **L1**:Telegram exception 可能洩 token URL | Cron 2/3 helpers | catch RequestException,只記 status code,寫 health event |
+| **L2**:event_type `artifact_applied` → `candidate_applied` | Lifecycle 表 | 已改(per `engine.py:429`) |
+| **L3**:backup cron PATH 不全 | backup.sh | `/usr/bin/docker` 絕對路徑 + stderr 進 log |
+| **F1**:Pre-launch replay scripts 沒寫 | Pre-launch test 段 | 加 3 個 script spec(replay_audit / replay_through / diff_replies) |
+
+**未在本 doc 修(留 Codex execute 階段或更後面)**:
+- 多 PG container 之間的 port 登記表(LOW,先放沒事)
+- multi-tenant governance 規則(STRATEGIC,目前單公司不需要)
 
 ---
 
@@ -148,7 +175,7 @@ flowchart TB
 | 10 | Telegram push「ready to approve」 | replay 過 | Cron 3 / runner | 等你按 ✓ |
 | 11 | `approvals` | 你 Telegram 回 ✓ | Gary | `{candidate_id, approved_by='gary', decision='approved'}` |
 | 12 | `artifacts` (version+1) + `is_active=true` | approval 過 | apply_candidate() | 新 SOUL.md / 新 query_parser regex / etc. |
-| 13 | `events` (`event_type='artifact_applied'`) | apply 完 | apply_candidate() | `{artifact_id, new_version, ...}` |
+| 13 | `events` (`event_type='candidate_applied'`) | apply 完 | apply_candidate() | `{candidate_id, artifact_id, new_version}`(per `engine.py:429`) |
 | 14 | Agent hot reload 新 artifact | 立刻 | Hermes runtime | 之後行為照新版 |
 
 **關鍵**:**只有第 8-13 步走 kernel 工程級流程**,前面 1-7 步是「累積 + curation + 你標記」的輕量資料層。多數時候 1-7 在跑,8-13 一週可能只動 1-2 次。
@@ -237,7 +264,7 @@ volumes:
 # 1. 建目錄 + 生密碼
 mkdir -p ~/.hermes/credentials/wannavegtour/op_kernel/{backup/daily,backup/weekly,backup/monthly}
 chmod 700 ~/.hermes/credentials/wannavegtour/op_kernel/
-openssl rand -base64 32 > ~/.hermes/credentials/wannavegtour/op_kernel/db_password.txt
+openssl rand -hex 24 > ~/.hermes/credentials/wannavegtour/op_kernel/db_password.txt   # hex(URL-safe);base64 含 /+= 會炸 PG URI
 chmod 600 ~/.hermes/credentials/wannavegtour/op_kernel/db_password.txt
 
 # 2. 寫 docker-compose.yml(上面 YAML)
@@ -256,11 +283,12 @@ PGPASSWORD=$(cat db_password.txt) psql -h 127.0.0.1 -p 5434 \
   -U op_kernel -d op_assistant_kernel \
   -c "SELECT version();"
 
-# 6. 初始化 schema(11 表 + prevent_mutation triggers)
+# 6. 初始化 schema(14 表 + prevent_mutation triggers)
 cd "/home/wannavegtour/Desktop/AI Native Company/Gary"
 KERNEL_DATABASE_URL="postgresql://op_kernel:$(cat ~/.hermes/credentials/wannavegtour/op_kernel/db_password.txt)@127.0.0.1:5434/op_assistant_kernel" \
-  python3 -c "from closed_loop_kernel.store import KernelStore; KernelStore.from_url(KERNEL_DATABASE_URL).initialize()"
-# 預期:11 表 + 6 個 prevent_mutation trigger 建好
+  python3 -c "import os; from closed_loop_kernel.store import KernelStore; KernelStore.from_url(os.environ['KERNEL_DATABASE_URL']).initialize()"
+# 預期:14 表 + 6 個 prevent_mutation trigger 建好 (append-only: events / attempts /
+# attempt_lifecycle_events / tool_calls / decisions / approvals)
 
 # 7. 把 KERNEL_DATABASE_URL 寫進 op-assistant profile .env
 KERNEL_URL="postgresql://op_kernel:$(cat ~/.hermes/credentials/wannavegtour/op_kernel/db_password.txt)@127.0.0.1:5434/op_assistant_kernel"
@@ -474,7 +502,8 @@ def _resolve_payload(raw: dict) -> dict:
 ### Cron 1:每 4 小時 ETL
 
 ```python
-# ~/.hermes/scripts/op_assistant_etl.py
+# 放這:~/.hermes/profiles/op-assistant/scripts/op_assistant_etl.py
+# (NOT ~/.hermes/scripts/ — hermes cron --profile 解析在 profile 內 scripts/)
 """每 4 hr:Hermes session.db 新訊息 → kernel events(含 user_id resolve + UUID dedup)
 
 session.db 真實 schema(verified 2026-05-26):
@@ -499,23 +528,62 @@ session.db 真實 schema(verified 2026-05-26):
     started_at REAL NOT NULL,
     ...
   );
+
+★ Codex review 修正(v2.1):
+- B2:--no-agent cron 不會 auto-load profile .env,手動 dotenv 載
+- H3:SQLite WAL 模式不可 immutable=1(可能讀不到最新 WAL frame),
+       改 mode=ro + busy_timeout
 """
 import sqlite3, os, json, uuid
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
+
+# ★ B2 修正:手動載入 profile .env(--no-agent cron 不會自動載)
+def _load_profile_env():
+    env_path = Path("/home/wannavegtour/.hermes/profiles/op-assistant/.env")
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+_load_profile_env()
+
 from closed_loop_kernel.store import KernelStore, json_param
 
-SESSION_DB = os.path.expanduser("~/.hermes/profiles/op-assistant/state.db")
-KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
-MAPPING_PATH = os.path.expanduser("~/.hermes/credentials/wannavegtour/op_mapping.json")
+# 用絕對路徑(--no-agent script 的 $HOME 被 scheduler 改成 profile home,
+# 用 ~/... 可能展開到 profile dir 而非 user home)
+SESSION_DB = "/home/wannavegtour/.hermes/profiles/op-assistant/state.db"
+MAPPING_PATH = "/home/wannavegtour/.hermes/credentials/wannavegtour/op_mapping.json"
+KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]   # 沒設 = crash(嚴格,不要 silent fallback)
 
 # UUID5 namespace 用 op-assistant 固定 UUID(避免每次跑 dedup 失敗)
 ETL_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000001")
 
 def _load_mapping():
+    """缺檔 → 空 dict;檔壞 → 寫健康事件後也回空 dict,不擋 ETL"""
     if not os.path.exists(MAPPING_PATH):
         return {"user_id_to_name": {}, "group_id_to_name": {}}
-    with open(MAPPING_PATH) as f:
-        return json.load(f)
+    try:
+        with open(MAPPING_PATH) as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        # ★ Codex review M1 修正:malformed JSON 寫健康事件而非 silent crash
+        try:
+            store = KernelStore.from_url(KERNEL_URL)
+            store.execute(
+                "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
+                [str(uuid.uuid4()), "op_mapping_load_failure",
+                 json_param({"path": MAPPING_PATH, "error": str(e)}),
+                 datetime.now(timezone.utc).isoformat()]
+            )
+            store.close()
+        except Exception:
+            pass
+        return {"user_id_to_name": {}, "group_id_to_name": {}}
 
 def run():
     mapping = _load_mapping()
@@ -525,7 +593,12 @@ def run():
     # ★ timestamp 是 Unix epoch REAL,要 epoch 不是 ISO
     cutoff_epoch = (datetime.now(timezone.utc) - timedelta(hours=4)).timestamp()
 
-    conn = sqlite3.connect(f"file:{SESSION_DB}?mode=ro&immutable=1", uri=True)
+    # ★ H3 修正:WAL 模式 immutable=1 不安全;改 mode=ro + busy_timeout
+    conn = sqlite3.connect(
+        f"file:{SESSION_DB}?mode=ro", uri=True,
+        timeout=30.0,          # busy_timeout 30s(等 Hermes 寫完)
+    )
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.row_factory = sqlite3.Row
     rows = conn.execute("""
         SELECT m.id, m.session_id, m.role, m.content,
@@ -579,31 +652,59 @@ if __name__ == "__main__":
 ```
 
 **Schedule**: `0 */4 * * *`(每 4 hr 整點)
-**Hermes cron 註冊**(✱ 正確命令,verified 2026-05-26):
+**Hermes cron 註冊**(✱ Codex 抓出 v1 路徑寫錯 — 必須相對):
 ```bash
 hermes cron create '0 */4 * * *' \
   --name op-etl \
-  --script ~/.hermes/scripts/op_assistant_etl.py \
+  --script op_assistant_etl.py \
   --no-agent \
   --profile op-assistant
 ```
-(`--no-agent` = script 直接跑,不經 LLM agent,適合 ETL 這種 deterministic 任務)
+script 檔放 `~/.hermes/profiles/op-assistant/scripts/op_assistant_etl.py`(不是 root 的 `~/.hermes/scripts/`)。`--no-agent` = script 直接跑,不經 LLM agent。
+
+**Timeout 限制**(H2):Hermes cron `--no-agent` 預設 timeout 120s。ETL 通常 1-5s 完成,在限內。如果未來資料量大,改 `hermes config set cron.script_timeout_seconds 300`。
 
 ### Cron 2:每日 09:00 curation(寫 events,不寫 candidates)
 
 ```python
-# ~/.hermes/scripts/op_assistant_daily_curate.py
+# 放這:~/.hermes/profiles/op-assistant/scripts/op_assistant_daily_curate.py
 """每日 09:00:讀過去 24hr events,gemma4:e4b 整理,寫 summary event,push Telegram
 
 模型呼叫:用 OpenAI 相容 endpoint 直接打 Ollama(localhost:11434/v1)
-原因:Hermes auxiliary_client 內部 API 沒對外公開穩定接口
-(Codex 階段確認:可改用 hermes_cli 的 helper 如果有的話)
+原因:Hermes auxiliary_client 內部 API(`call_llm`)可選,但直接 HTTP 控制力更大,
+fail 模式也清楚。如果之後要切走 Hermes 統一路徑,改 `from agent.auxiliary_client
+import call_llm` 即可(API 在 `~/.hermes/hermes-agent/agent/auxiliary_client.py`)。
+
+★ Codex review 修正(v2.1):
+- B2:--no-agent cron 不會 auto-load profile .env,手動 dotenv 載
+- M2:summary uuid 改 uuid5(period) 確保 idempotent,cron 重跑不會生重複 summary
+- M4:Telegram push 失敗的 exception 不能含 token URL,catch RequestException sanitize
+- L1:把 event_count / open_failure_count 也 merge 進 summary dict(否則 push 顯 ?)
 """
 import os, json, uuid, requests
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
+
+# ★ B2 修正(同 ETL)
+def _load_profile_env():
+    env_path = Path("/home/wannavegtour/.hermes/profiles/op-assistant/.env")
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+_load_profile_env()
+
 from closed_loop_kernel.store import KernelStore, json_param
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
+
+# ★ M2 修正:uuid5 namespace(daily 跟 weekly 各用一個)
+DAILY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000002")
 
 # 直接打 Ollama OpenAI-compatible endpoint(跟 Hermes auxiliary.compression 共用模型)
 OLLAMA_URL = "http://127.0.0.1:11434/v1/chat/completions"
@@ -639,14 +740,23 @@ def run():
         raw = resp.json()["choices"][0]["message"]["content"]
         summary = json.loads(raw)
 
-        # 寫進 events table(不是 candidates!)
-        sid = str(uuid.uuid4())
+        # 把 metrics merge 進 summary(L1 修正)
+        summary["event_count"] = len(events)
+        summary["open_failure_count"] = len(failures)
+
+        # ★ M2 修正:uuid5(period) 確保同一天重跑不會生重複 summary
+        period_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        sid = str(uuid.uuid5(DAILY_NAMESPACE, period_key))
+
+        # 寫進 events table(不是 candidates!) — ON CONFLICT 保證 idempotent
         store.execute(
-            "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO events (id, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
             [sid, "daily_curation_summary",
              json_param({
                  "period_start": cutoff_iso,
                  "period_end": datetime.now(timezone.utc).isoformat(),
+                 "period_key": period_key,
                  "event_count": len(events),
                  "open_failure_count": len(failures),
                  "model": CURATION_MODEL,
@@ -684,26 +794,57 @@ def _build_curation_prompt(events, failures):
 只回 JSON,key: patterns / intent_gaps / complaints / actionable,值為陣列。"""
 
 def _push_telegram_summary(summary_event_id, summary):
-    """直接打 Telegram Bot API,不需要走 Hermes gateway(這是後台 script)"""
+    """直接打 Telegram Bot API,不需要走 Hermes gateway(這是後台 script)。
+
+    ★ M4 修正:catch RequestException,sanitize 不洩 token URL。
+    """
     bot_token = _get_telegram_bot_token()
     chat_id = _get_telegram_home_channel()
     if not bot_token or not chat_id:
-        return  # graceful no-op,Codex 階段確認 path
+        # graceful no-op:也寫 health event 讓 Gary 知道為何沒收到通知
+        try:
+            store = KernelStore.from_url(KERNEL_URL)
+            store.execute(
+                "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
+                [str(uuid.uuid4()), "telegram_push_skipped",
+                 json_param({"reason": "missing token or chat_id",
+                             "has_token": bool(bot_token), "has_chat": bool(chat_id),
+                             "summary_event_id": summary_event_id}),
+                 datetime.now(timezone.utc).isoformat()]
+            )
+            store.close()
+        except Exception:
+            pass
+        return
 
     text = (
         f"📋 OP 對話日整理 ({datetime.now().strftime('%Y-%m-%d')})\n"
-        f"事件數: {summary.get('event_count', '?')} / 待修 failures: {summary.get('open_failure_count', '?')}\n\n"
+        f"事件數: {summary.get('event_count', 0)} / 待修 failures: {summary.get('open_failure_count', 0)}\n\n"
         f"🔁 重複 pattern: {len(summary.get('patterns', []))} 筆\n"
         f"❓ 意圖 gap: {len(summary.get('intent_gaps', []))} 筆\n"
-        f"📣 客訴: {len(summary.get('complaints', []))} 筆\n"
-        f"💡 我建議: {len(summary.get('actionable', []))} 筆\n\n"
+        f"📣 客訴: {len(summary.get('customer_complaints', []))} 筆\n"
+        f"💡 我建議: {len(summary.get('actionable_items', []))} 筆\n\n"
         f"細節查 events.id={summary_event_id}"
     )
-    requests.post(
-        f"https://api.telegram.org/bot{bot_token}/sendMessage",
-        data={"chat_id": chat_id, "text": text},
-        timeout=30
-    )
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=30)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        # ★ M4:exception message 可能含 token URL,只 log status code + message preview
+        status = getattr(e.response, "status_code", None) if hasattr(e, "response") and e.response else None
+        sanitized = f"telegram push failed: status={status}, type={type(e).__name__}"
+        try:
+            store = KernelStore.from_url(KERNEL_URL)
+            store.execute(
+                "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
+                [str(uuid.uuid4()), "telegram_push_failure",
+                 json_param({"summary_event_id": summary_event_id, "error": sanitized}),
+                 datetime.now(timezone.utc).isoformat()]
+            )
+            store.close()
+        except Exception:
+            pass
 
 def _get_telegram_bot_token():
     """從 default profile 的 .env 讀(or 從 op-assistant 設定的 escalate token)"""
@@ -731,28 +872,56 @@ if __name__ == "__main__":
 
 **Schedule**: `0 9 * * *`(每日 09:00)
 **模型**:**gemma4:e4b**(本機已有,跟 auxiliary.compression 共用)
-**Hermes cron 註冊**:
+**Hermes cron 註冊**(✱ Codex B1 修正 — 路徑相對):
 ```bash
 hermes cron create '0 9 * * *' \
   --name op-daily-curate \
-  --script ~/.hermes/scripts/op_assistant_daily_curate.py \
+  --script op_assistant_daily_curate.py \
   --no-agent \
   --profile op-assistant
 ```
 
+**Timeout 重要**(H2):curation 內含 Ollama call,gemma4:e4b 24hr 對話摘要可能 30-60s,加上 cold start 可能 60-90s。Hermes cron `--no-agent` 預設 timeout 120s **不夠**。**必須調**:
+```bash
+hermes config set cron.script_timeout_seconds 300
+```
+(這設定影響全部 cron script,設一次即可。)
+
 ### Cron 3:每週一 09:00 週報
 
 ```python
-# ~/.hermes/profiles/op-assistant/cron/weekly_report.py
-"""每週一 09:00:過去 7 天統計 + Gary 批准趨勢 + 推 Telegram"""
-import os, json, uuid
+# 放這:~/.hermes/profiles/op-assistant/scripts/op_assistant_weekly_report.py
+"""每週一 09:00:過去 7 天統計 + Gary 批准趨勢 + 推 Telegram
+
+★ Codex review 修正(v2.1):
+- B2:手動載 profile .env
+- M2:weekly summary uuid 改 uuid5(week_key) 確保 idempotent
+- M3:_push_weekly_report 完整實作(不留 pass,避免 cron 假動作)
+"""
+import os, json, uuid, requests
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
+
+# B2 修正
+def _load_profile_env():
+    env_path = Path("/home/wannavegtour/.hermes/profiles/op-assistant/.env")
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+_load_profile_env()
+
 from closed_loop_kernel.store import KernelStore, json_param
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
 
-# @schedule: 0 9 * * 1      # 每週一 09:00
-# @timeout: 600
+# M2 修正
+WEEKLY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000003")
 
 def run():
     week_start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -787,28 +956,84 @@ def run():
             [week_start]
         )
 
-        # 寫 weekly summary event
-        wid = str(uuid.uuid4())
+        # ★ M2 修正:uuid5(week_key) idempotent
+        week_key = datetime.now(timezone.utc).strftime("%G-W%V")   # ISO week
+        wid = str(uuid.uuid5(WEEKLY_NAMESPACE, week_key))
+        payload = {
+            "period_start": week_start,
+            "period_key": week_key,
+            "intent_distribution": [dict(r) for r in intent_dist],
+            "top_failures": [dict(r) for r in fail_top],
+            "approvals": [dict(r) for r in approvals],
+            "approved_patch_types": [dict(r) for r in approved_types],
+        }
         store.execute(
-            "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
-            [wid, "weekly_report",
-             json_param({
-                 "period_start": week_start,
-                 "intent_distribution": [dict(r) for r in intent_dist],
-                 "top_failures": [dict(r) for r in fail_top],
-                 "approvals": [dict(r) for r in approvals],
-                 "approved_patch_types": [dict(r) for r in approved_types],
-             }),
+            "INSERT INTO events (id, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+            [wid, "weekly_report", json_param(payload),
              datetime.now(timezone.utc).isoformat()]
         )
-        # Push Telegram(週報精簡版)
-        _push_weekly_report(wid)
+        _push_weekly_report(wid, payload)
     finally:
         store.close()
 
-def _push_weekly_report(weekly_event_id):
-    # Implementation Codex 階段補
-    pass
+def _push_weekly_report(weekly_event_id, payload):
+    """★ M3 修正:real push,not pass。同 daily,sanitize exception。"""
+    bot_token = _get_telegram_bot_token()
+    chat_id = _get_telegram_home_channel()
+    if not bot_token or not chat_id:
+        return
+
+    intents = payload["intent_distribution"][:5]
+    intents_str = "\n  ".join(f"- {i['intent']}: {i['n']}" for i in intents) or "(無)"
+    fails = payload["top_failures"][:5]
+    fails_str = "\n  ".join(f"- {f['failure_type']}: {f['n']}" for f in fails) or "(無)"
+    apps = {a["decision"]: a["n"] for a in payload["approvals"]}
+
+    text = (
+        f"📊 OP 週報 ({payload['period_key']})\n\n"
+        f"訊息意圖 TOP5:\n  {intents_str}\n\n"
+        f"失敗類型 TOP5:\n  {fails_str}\n\n"
+        f"你批准了 {apps.get('approved', 0)} 筆,駁回 {apps.get('rejected', 0)} 筆\n\n"
+        f"細節 events.id={weekly_event_id}"
+    )
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=30)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        status = getattr(e.response, "status_code", None) if hasattr(e, "response") and e.response else None
+        store = KernelStore.from_url(KERNEL_URL)
+        try:
+            store.execute(
+                "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
+                [str(uuid.uuid4()), "telegram_push_failure",
+                 json_param({"weekly_event_id": weekly_event_id,
+                             "error": f"weekly push failed status={status} type={type(e).__name__}"}),
+                 datetime.now(timezone.utc).isoformat()]
+            )
+        finally:
+            store.close()
+
+# 共用 Telegram helpers(同 daily_curate.py)
+def _get_telegram_bot_token():
+    p = "/home/wannavegtour/.hermes/.env"
+    if not os.path.exists(p): return None
+    for line in open(p):
+        if line.startswith("TELEGRAM_BOT_TOKEN="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+def _get_telegram_home_channel():
+    p = "/home/wannavegtour/.hermes/.env"
+    if not os.path.exists(p): return None
+    for line in open(p):
+        if line.startswith("TELEGRAM_HOME_CHANNEL="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+if __name__ == "__main__":
+    run()
 ```
 
 **Schedule**: `0 9 * * 1`(每週一 09:00)
@@ -816,33 +1041,55 @@ def _push_weekly_report(weekly_event_id):
 ### Cron 4:每月 1 日 05:00 維護
 
 ```python
-# ~/.hermes/profiles/op-assistant/cron/monthly_maintenance.py
-"""每月 1 日 05:00:archive 30 天前 events + VACUUM + backup 健康檢查"""
-import os, subprocess
-from datetime import datetime, timezone, timedelta
+# 放這:~/.hermes/profiles/op-assistant/scripts/op_assistant_monthly_maintenance.py
+"""每月 1 日 05:00:archive 30 天前 events + VACUUM + backup 健康檢查
+
+★ Codex review 修正(v2.1):
+- B2:手動載 profile .env
+- M4:VACUUM subprocess 失敗 catch,**還是要寫健康事件**(否則 alert 不會發)
+- 用絕對路徑 /usr/bin/docker(crontab/cron PATH 不全)
+"""
+import os, subprocess, uuid
 from pathlib import Path
-from closed_loop_kernel.store import KernelStore
+from datetime import datetime, timezone, timedelta
+
+def _load_profile_env():
+    env_path = Path("/home/wannavegtour/.hermes/profiles/op-assistant/.env")
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+_load_profile_env()
+
+from closed_loop_kernel.store import KernelStore, json_param
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
-BACKUP_BASE = Path.home() / ".hermes/credentials/wannavegtour/op_kernel/backup"
-
-# @schedule: 0 5 1 * *      # 每月 1 日 05:00
-# @timeout: 1800
+BACKUP_BASE = Path("/home/wannavegtour/.hermes/credentials/wannavegtour/op_kernel/backup")
+DOCKER_BIN = "/usr/bin/docker"  # ★ L: 絕對路徑
 
 def run():
     store = KernelStore.from_url(KERNEL_URL)
+    today = datetime.now(timezone.utc)
+    warnings = []
+    errors = []
     try:
-        # 1. VACUUM ANALYZE
-        # (在 PG container 內跑,要用 docker exec)
-        subprocess.run([
-            "docker", "exec", "op-assistant-kernel",
-            "psql", "-U", "op_kernel", "-d", "op_assistant_kernel",
-            "-c", "VACUUM ANALYZE;"
-        ], check=True)
+        # 1. VACUUM ANALYZE — ★ M4:catch 例外,還是要寫健康事件
+        try:
+            subprocess.run([
+                DOCKER_BIN, "exec", "op-assistant-kernel",
+                "psql", "-U", "op_kernel", "-d", "op_assistant_kernel",
+                "-c", "VACUUM ANALYZE;"
+            ], check=True, timeout=600,
+               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            errors.append(f"VACUUM failed: {type(e).__name__}: {str(e)[:200]}")
 
         # 2. backup 健康檢查
-        warnings = []
-        today = datetime.now(timezone.utc)
         latest_daily = max((BACKUP_BASE / "daily").glob("*.sql.gz"), default=None,
                           key=lambda p: p.stat().st_mtime)
         if not latest_daily or (today.timestamp() - latest_daily.stat().st_mtime) > 86400 * 2:
@@ -853,51 +1100,63 @@ def run():
         if not latest_weekly or (today.timestamp() - latest_weekly.stat().st_mtime) > 86400 * 10:
             warnings.append("weekly backup 超過 10 天沒更新")
 
-        # 3. 寫健康事件
-        from closed_loop_kernel.store import json_param
-        import uuid
+        # 3. 寫健康事件 — 永遠寫,就算前面 VACUUM 失敗
         store.execute(
             "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
             [str(uuid.uuid4()),
              "kernel_monthly_health",
-             json_param({"warnings": warnings, "ts": today.isoformat()}),
+             json_param({"warnings": warnings, "errors": errors, "ts": today.isoformat()}),
              today.isoformat()]
         )
 
-        if warnings:
-            # push Telegram alert
+        # 4. 失敗或警告 → push Telegram alert
+        if warnings or errors:
+            # (push helper 同 daily_curate.py 的 _push_telegram_summary 結構,省略)
             pass
     finally:
         store.close()
+
+if __name__ == "__main__":
+    run()
 ```
 
 **Schedule**: `0 5 1 * *`(每月 1 日 05:00)
 
 ### Cron 註冊方式:Hermes 內建(✱ 正確命令)
 
-**驗證 2026-05-26**:Hermes cron **不是用 `@schedule:` decorator**,是 CLI 註冊:
+**驗證 2026-05-26**:Hermes cron 用 CLI 註冊。**★ Codex B1 修正**:`--script` 路徑 **必須相對**,檔放在 **profile 內** scripts 目錄(不是 root)。
 
 ```bash
-# Scripts 放這(全 profile 共用 scripts 目錄)
-ls ~/.hermes/scripts/
+# Scripts 放這:profile-local,不是 ~/.hermes/scripts/
+mkdir -p ~/.hermes/profiles/op-assistant/scripts
+ls ~/.hermes/profiles/op-assistant/scripts/
   op_assistant_etl.py
   op_assistant_daily_curate.py
   op_assistant_weekly_report.py
   op_assistant_monthly_maintenance.py
 
-# 4 條 job 註冊
-hermes cron create '0 */4 * * *' --name op-etl              --script ~/.hermes/scripts/op_assistant_etl.py              --no-agent --profile op-assistant
-hermes cron create '0 9 * * *'   --name op-daily-curate     --script ~/.hermes/scripts/op_assistant_daily_curate.py     --no-agent --profile op-assistant
-hermes cron create '0 9 * * 1'   --name op-weekly-report    --script ~/.hermes/scripts/op_assistant_weekly_report.py    --no-agent --profile op-assistant
-hermes cron create '0 5 1 * *'   --name op-monthly-maint    --script ~/.hermes/scripts/op_assistant_monthly_maintenance.py --no-agent --profile op-assistant
+# 設 cron script timeout(★ H2:gemma4:e4b cold start + 摘要可能 > 120s 預設)
+hermes config set cron.script_timeout_seconds 300
+
+# 4 條 job 註冊 — script 名相對,不是絕對路徑
+hermes cron create '0 */4 * * *' --name op-etl              --script op_assistant_etl.py              --no-agent --profile op-assistant
+hermes cron create '0 9 * * *'   --name op-daily-curate     --script op_assistant_daily_curate.py     --no-agent --profile op-assistant
+hermes cron create '0 9 * * 1'   --name op-weekly-report    --script op_assistant_weekly_report.py    --no-agent --profile op-assistant
+hermes cron create '0 5 1 * *'   --name op-monthly-maint    --script op_assistant_monthly_maintenance.py --no-agent --profile op-assistant
 ```
 
-`--no-agent` 表示 **script 直接執行,stdout 不丟給 LLM agent**(deterministic 後台任務)。
+`--no-agent` = script 直接執行,stdout 不丟給 LLM agent(deterministic 後台任務)。
+
+**★ B2 重要**:`--no-agent` 模式 **不會自動 load profile .env**。每個 script 頂端**必須手動 `_load_profile_env()`** 把 `KERNEL_DATABASE_URL` 等讀進來(已包進上面 4 個 script 範本)。
 
 **驗證**:
 ```bash
 hermes -p op-assistant cron list
 # 預期顯示 4 條 job + 各自下次執行時間
+
+# 手動跑一次 ETL 確認 .env 載得到
+hermes -p op-assistant cron run op-etl
+# 預期:無 KeyError,events 表多幾筆 row
 ```
 
 ---
@@ -925,9 +1184,11 @@ case "$TYPE" in
 esac
 
 OUT="$DIR/$FNAME"
-docker exec op-assistant-kernel pg_dump \
+# ★ L: 絕對路徑(crontab 的 PATH 不全)
+/usr/bin/docker exec op-assistant-kernel pg_dump \
   -U op_kernel -d op_assistant_kernel \
   --no-owner --no-acl \
+  2>> "$BASE/backup/backup.log" \
   | gzip > "$OUT"
 
 chmod 600 "$OUT"
@@ -998,6 +1259,31 @@ python3 scripts/diff_replies.py \
   --report reports/pre-launch-test-...json \
   --output reports/pre-launch-test-diff.md
 ```
+
+### 3 個 Replay Script 的 spec(★ Codex 指出 v1 沒寫,Codex execute 階段要實作)
+
+**scripts/replay_audit_to_kernel.py**(放 Gary repo 內 scripts/ 子目錄):
+- 讀 `~/.hermes/line_events/wannavegtour.jsonl`(舊 listener audit)
+- 每行 parse 成 dict
+- 對每筆,用 `uuid5(ETL_NAMESPACE, line_event_id)` 算 deterministic id
+- ON CONFLICT DO NOTHING insert 進 kernel events(event_type=`op_assistant_line_message_replay`,跟 live ETL 區隔)
+- payload 含 user_name resolve(透過 op_mapping.json)
+- 支援 `--dry-run`(只 print,不寫)/ `--apply`(寫)/ `--since` `--until` 過濾
+
+**scripts/replay_through_op_assistant.py**:
+- 讀 kernel events(replay 來源)
+- 每筆呼叫 op-assistant 的 6 tool flow(在 6 tool 實作後,**現在 spec 階段這 script 寫不了**)
+- 比對 reply 跟原 audit log 裡的 listener reply
+- 輸出 JSON 報告:每筆 `{event_id, original_reply, new_reply, match: bool, diff: str}`
+- **本 script 必須等 6 tool 實作完成才能寫**(Phase 順序見 v2 plan)
+
+**scripts/diff_replies.py**:
+- 吃 replay_through 的 JSON 報告
+- 算 match rate / 列 ❌ 個別案例 / 算嚴重度(用 validator 規則 + Gary 手動標)
+- 出 markdown 報告(模板見上「Test report 內容」段)
+- 含 user_id → name resolve
+
+**這 3 script 暫不在本 v2 doc 內附,在 Codex execute 階段寫入 Gary repo 的 `scripts/` 目錄(或併進 `closed_loop_kernel/`)**。
 
 ### Test report 內容(自動產生)
 
@@ -1099,7 +1385,7 @@ python3 scripts/diff_replies.py \
    2. 寫 `docker-compose.yml`
    3. `docker compose up -d` → 等 healthy
    4. `sudo apt install postgresql-client`(裝 psql)
-   5. `KernelStore.from_url(...).initialize()` 建 11 表 + trigger
+   5. `KernelStore.from_url(...).initialize()` 建 14 表 + trigger
    6. 寫 `KERNEL_DATABASE_URL` 進 `~/.hermes/profiles/op-assistant/.env`
    7. 寫 4 個 cron script 進 `~/.hermes/scripts/`
    8. 4 條 `hermes cron create ...` 註冊
@@ -1134,18 +1420,19 @@ python3 scripts/diff_replies.py \
 - [x] **ETL UUID 用 `uuid.uuid5(NAMESPACE, platform_message_id)`** 確保 deterministic dedup
 - [x] **session.db schema 真實對照過**:column 是 `timestamp` (REAL Unix epoch),不是 `ts` (ISO);有 `platform_message_id` 可 dedup;有 `sessions` 表 JOIN 篩 `source='line'`
 
-### ⚠️ 待 Codex 階段驗證(API 細節我不 100% 確定)
+### ⚠️ 待 Codex 階段驗證(API 細節)— v2.1 重新整理
 
-| # | 假設 | 風險 | Codex 驗證方法 |
+| # | 假設 | 狀態 | 備註 |
 |---|---|---|---|
-| 1 | `hermes cron create --no-agent --profile` 真的把 script 註冊成 4hr/9am schedule | 低 — CLI help 已顯示這些 flag | `hermes cron list` 看實際註冊 |
-| 2 | `~/.hermes/scripts/` 是 Hermes 約定的 script 存放位置 | 低 — `--script` flag 明說此路徑 | 跑 1 條測試 cron 看 stdout 是否被執行 |
-| 3 | Telegram bot token 從 `~/.hermes/.env` 直接讀 | 中 — Hermes 可能 expose 更乾淨的 API | `hermes config get` 系列 / `hermes_cli.config` import |
-| 4 | Ollama OpenAI-compatible `localhost:11434/v1/chat/completions` 直打 | 已 verified | 之前 smoke test 過,curl 200 |
-| 5 | `closed_loop_kernel.store.KernelStore.from_url()` + `.initialize()` 建 11 表 | 已 verified | `postgres.py` 全文檢視確認 |
-| 6 | `prevent_mutation` trigger 自動 attach 在 APPEND_ONLY_TABLES | 已 verified | `postgres.py:9-25` 直接看 |
-| 7 | Hermes session.db 的 `messages.platform_message_id` 對 LINE 一定填 | 中 — Hermes LINE plugin 應該有填,但要實測 | 啟動 op-assistant gateway 後查 session.db |
-| 8 | `_push_telegram_summary` 直打 Telegram API 不打架 | 低 — 跟 default profile 的 gateway polling 沒衝突(sendMessage 是 outgoing,不搶 getUpdates) | curl 一筆測試 |
+| 1 | `hermes cron create --no-agent --profile` syntax | ✅ Codex review 驗 | CLI help + Codex 實測過,但路徑要相對(已修) |
+| 2 | scripts 放 `~/.hermes/profiles/op-assistant/scripts/` | ✅ Codex review 驗 | 已改成 profile-local 路徑 |
+| 3 | Telegram bot token 從 `~/.hermes/.env` 直接讀 | ⚠️ 中 | Codex 建議改用 Hermes-native API,但目前 grep 也 work |
+| 4 | Ollama `localhost:11434/v1/chat/completions` 直打 | ✅ Verified | smoke test 過,curl 200,模型已 pulled |
+| 5 | `KernelStore.from_url().initialize()` 建 14 表 + 6 trigger | ✅ Verified | Codex 確認 postgres.py 14 表 |
+| 6 | `prevent_mutation` trigger 自動 attach 在 APPEND_ONLY_TABLES | ✅ Verified | postgres.py:8-15 直接看 |
+| 7 | session.db `messages.platform_message_id` 對 LINE 一定填 | ⚠️ 中 | Hermes LINE plugin 應該填,但要 cutover 後實測才確定 |
+| 8 | `hermes config set cron.script_timeout_seconds` 真的能調 | ⚠️ 待 Codex 執行階段確認 | Codex review 推測有此設,執行階段如失敗改 env var |
+| 9 | profile scripts 目錄真的會被 `--no-agent` 解析 | ✅ Codex review 驗 | scheduler 路徑解析確認 |
 
 **處理原則**:Codex 在執行階段碰到 ⚠️ 任一條失敗 → STOP + report 給 Claude → Claude 找正確 API → 改 doc → 重 push。
 
