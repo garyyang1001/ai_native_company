@@ -20,9 +20,9 @@ class TestQueryIntent:
     def test_empty(self):
         result = load(tools.query_intent({"text": ""}))
 
-        assert result["intent"] == "unknown"
-        assert result["confidence"] == 0.0
-        assert result["source"] == "empty_input"
+        assert result["intent"] == "help_request"
+        assert result["confidence"] == 1.0
+        assert result["source"] == "deterministic_help"
 
     def test_deterministic_hit(self):
         result = load(tools.query_intent({"text": "9/15 日本還有嗎"}))
@@ -42,11 +42,53 @@ class TestQueryIntent:
         assert result["source"] == "llm_low_confidence"
 
 
+class TestQueryIntentHelpFastPath:
+    def test_empty_text_returns_help(self):
+        result = load(tools.query_intent({"text": ""}))
+
+        assert result["intent"] == "help_request"
+        assert result["confidence"] == 1.0
+        assert result["source"] == "deterministic_help"
+
+    def test_question_mark_only_returns_help(self):
+        result = load(tools.query_intent({"text": "?"}))
+
+        assert result["intent"] == "help_request"
+        assert result["confidence"] == 1.0
+        assert result["source"] == "deterministic_help"
+
+    def test_fullwidth_question_mark_returns_help(self):
+        result = load(tools.query_intent({"text": "？"}))
+
+        assert result["intent"] == "help_request"
+        assert result["confidence"] == 1.0
+        assert result["source"] == "deterministic_help"
+
+    def test_help_keyword_returns_help(self):
+        result = load(tools.query_intent({"text": "help"}))
+
+        assert result["intent"] == "help_request"
+        assert result["confidence"] == 1.0
+        assert result["source"] == "deterministic_help"
+
+    def test_existing_classification_still_works(self):
+        result = load(tools.query_intent({"text": "成團了嗎"}))
+
+        assert result["intent"] in ("historical", "availability")
+
+
 class TestFetchWcData:
     def test_help_static(self):
         result = load(tools.fetch_wc_data({"intent": "help"}))
 
         assert result["intent"] == "help"
+        assert result["source"] == "static"
+        assert "help_text" in result["data"]
+
+    def test_help_request_static(self):
+        result = load(tools.fetch_wc_data({"intent": "help_request", "entities": {}}))
+
+        assert result["intent"] == "help_request"
         assert result["source"] == "static"
         assert "help_text" in result["data"]
 
@@ -84,6 +126,19 @@ class TestComposeReply:
 
         assert result["source"] == "template"
         assert "可以查團" in result["draft_reply_body"]
+
+    def test_help_request_template_hits(self):
+        result = load(
+            tools.compose_reply(
+                {
+                    "intent": "help_request",
+                    "data": {"help_text": "可以查團 / 查歷史 / 查熱門..."},
+                }
+            )
+        )
+
+        assert result["source"] == "template"
+        assert result["draft_reply_body"]
 
     def test_price_edit_template_hits(self):
         result = load(

@@ -29,9 +29,55 @@ INTENT_ENUM = {
     "historical",
     "aggregate",
     "help",
+    "help_request",
     "price_edit_refuse",
     "unknown",
 }
+
+HELP_REQUEST_TRIGGERS = frozenset(
+    {
+        "?",
+        "？",
+        "??",
+        "？？",
+        "help",
+        "?help",
+        "？help",
+        "幫助",
+        "說明",
+        "指令",
+        "功能",
+        "怎麼用",
+        "教學",
+        "菜單",
+    }
+)
+
+HELP_TEXT = (
+    "🤖 小弟現在會做這幾件事：\n"
+    "\n"
+    "📋 1. 查名額 / 售價（最常用）\n"
+    "  • 小弟 12/27 江南還收嗎\n"
+    "  • 小弟 9/15 韓國首爾還剩多少\n"
+    "  → 回剩餘位置、售價、出發地、連結\n"
+    "\n"
+    "📊 2. 問歷史團（成團 / 額滿 / 關團 多少人）\n"
+    "  • 小弟 7/22 暑假成團多少人\n"
+    "  • 小弟 不丹有沒有成團\n"
+    "  • 小弟 過年那團最後額滿了嗎\n"
+    "\n"
+    "🏆 3. 賣最好排行（看 TOP 10）\n"
+    "  • 小弟 今年賣最好的團\n"
+    "  • 小弟 去年賣最多\n"
+    "\n"
+    "🙅 4. 改價 / 改網頁（還沒上線）\n"
+    "  偵測到會拒絕，請手動進 WordPress 後台改。\n"
+    "\n"
+    "📌 怎麼叫小弟出來：\n"
+    "  • 小弟 12/27 江南還有嗎\n"
+    "  • @小弟 不丹成團了嗎\n"
+    "  • 小弟 ?  顯示這份說明"
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -152,13 +198,14 @@ def _call_llm_for_intent(text: str) -> tuple[str | None, dict[str, Any], float]:
 
 def query_intent(args: dict, **kwargs) -> str:
     text = str((args or {}).get("text", "")).strip()
-    if not text:
+    # Step 0: mirror the old listener help gate before parser/LLM fallback.
+    if text == "" or text.lower() in HELP_REQUEST_TRIGGERS:
         return _json_dumps(
             {
-                "intent": "unknown",
-                "confidence": 0.0,
+                "intent": "help_request",
                 "entities": {},
-                "source": "empty_input",
+                "confidence": 1.0,
+                "source": "deterministic_help",
             }
         )
 
@@ -327,13 +374,11 @@ def fetch_wc_data(args: dict, **kwargs) -> str:
     intent = args.get("intent")
     entities = args.get("entities") if isinstance(args.get("entities"), dict) else {}
 
-    if intent == "help":
+    if intent in ("help", "help_request"):
         return _json_dumps(
             {
-                "data": {
-                    "help_text": "可以查團、查歷史成團/額滿、查熱門排行；改價或修改資料請 Gary/OP 手動處理。"
-                },
-                "intent": "help",
+                "data": {"help_text": HELP_TEXT},
+                "intent": intent,
                 "source": "static",
             }
         )
@@ -469,7 +514,7 @@ def _template_reply(intent: str, data: dict[str, Any]) -> str | None:
         from wannavegtour.response_formatter import format_historical
 
         return format_historical(_historical_result_from_data(payload))
-    if intent == "help":
+    if intent in ("help", "help_request"):
         help_text = payload.get("help_text") or "可以查團、查歷史成團/額滿、查熱門排行。"
         return str(help_text)
     if intent == "price_edit_refuse" and payload.get("refusal"):
