@@ -429,6 +429,56 @@ class KernelEngine:
         self._record_event("candidate_applied", {"candidate_id": candidate_id, "artifact_id": new_artifact_id})
         return new_artifact_id
 
+    def register_python_pattern(self, pattern_signature: str, artifact_id: str) -> str:
+        """Register an active artifact as the deterministic Python handler for a pattern.
+
+        Call after apply_candidate succeeds. Any prior active route for the same
+        pattern_signature is deactivated, preserving route history for audit.
+        """
+        artifact = self.store.fetch_one("SELECT id, is_active FROM artifacts WHERE id = ?", [artifact_id])
+        if not artifact:
+            raise ValueError(f"artifact {artifact_id} not found")
+        if not artifact["is_active"]:
+            raise ValueError(f"artifact {artifact_id} is not active; cannot register as route")
+
+        route_id = self.generate_id()
+        with self.store.transaction() as conn:
+            conn.execute(
+                "UPDATE pattern_routes SET is_active = FALSE "
+                "WHERE pattern_signature = ? AND is_active = TRUE",
+                [pattern_signature],
+            )
+            conn.execute(
+                """
+                INSERT INTO pattern_routes (id, pattern_signature, artifact_id, is_active, created_at)
+                VALUES (?, ?, ?, TRUE, ?)
+                """,
+                [route_id, pattern_signature, artifact_id, _now()],
+            )
+            conn.execute(
+                "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
+                [
+                    self.generate_id(),
+                    "python_pattern_registered",
+                    _json({"pattern_signature": pattern_signature, "artifact_id": artifact_id, "route_id": route_id}),
+                    _now(),
+                ],
+            )
+        return route_id
+
+    def lookup_python_route(self, pattern_signature: str) -> dict[str, str] | None:
+        """Return the active Python handler route for a pattern, if one exists."""
+        row = self.store.fetch_one(
+            """
+            SELECT pr.id AS route_id, pr.artifact_id, a.name AS artifact_name
+            FROM pattern_routes pr
+            JOIN artifacts a ON a.id = pr.artifact_id
+            WHERE pr.pattern_signature = ? AND pr.is_active = TRUE AND a.is_active = TRUE
+            """,
+            [pattern_signature],
+        )
+        return dict(row) if row else None
+
     def force_replace_active_artifact_for_test(self, name: str, artifact_type: str, content: str) -> str:
         active = self.store.fetch_one("SELECT * FROM artifacts WHERE name = ? AND is_active = TRUE", [name])
         next_version = (active["version"] if active else 0) + 1

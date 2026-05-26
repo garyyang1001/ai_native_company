@@ -1456,3 +1456,36 @@ Codex 看 doc 時請至少 cross-check 這些:
 - [ ] 任何 hardcoded path 是否該抽出成 config
 
 ---
+
+## 2026-05-26 增補 — pattern_routes 表(LLM 退場機制)
+
+### 為什麼補
+
+原 14 表能 cover 自我學習 9 步,**缺第 10 步**:即使 Gary 批准 Python 規則升級成 artifact 並過 sandbox,LLM 仍會每次被呼叫,因為沒有「pattern → artifact」的查找表。LLM 呼叫量不會降,「LLM 退場」這條核心願景做不到。
+
+### Schema
+
+```sql
+CREATE TABLE pattern_routes (
+    id UUID PRIMARY KEY,
+    pattern_signature VARCHAR(255),   -- e.g., "intent=availability+entities_schema=tour_name"
+    artifact_id UUID REFERENCES artifacts(id),
+    is_active BOOLEAN,
+    created_at TIMESTAMPTZ
+);
+```
+
+不加 prevent_mutation trigger,因為 route 需要可被更新/停用(新 candidate 取代舊的)。
+
+### 使用流程
+
+1. candidate 通過 sandbox → `engine.apply_candidate()` 成功 → artifact 已活躍
+2. 自動呼叫 `engine.register_python_pattern(pattern_signature, artifact_id)`,寫一筆 pattern_routes
+3. 同 signature 之前的 route 自動 deactivate
+4. Tool 1 `query_intent` 啟動時先查 `lookup_python_route(signature)`:
+   - 有 → 直接走 artifact 內的 deterministic code,return `{source: "pattern_route"}`
+   - 沒 → fallback LLM 分類
+
+### 量化驗收
+
+跑一週後,weekly_report 該能看到 `python_pattern_registered` 事件數遞增,LLM 路徑事件數遞減。

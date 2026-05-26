@@ -74,6 +74,20 @@ CREATE TABLE IF NOT EXISTS artifacts (
     UNIQUE (name, version)
 );
 
+CREATE TABLE IF NOT EXISTS pattern_routes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pattern_signature VARCHAR(255) NOT NULL,
+    artifact_id UUID NOT NULL REFERENCES artifacts(id),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pattern_routes_active_unique
+    ON pattern_routes (pattern_signature) WHERE is_active = TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_pattern_routes_signature
+    ON pattern_routes (pattern_signature) WHERE is_active = TRUE;
+
 CREATE TABLE IF NOT EXISTS policy_gates (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(100) NOT NULL UNIQUE,

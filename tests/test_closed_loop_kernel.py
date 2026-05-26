@@ -89,6 +89,50 @@ class ClosedLoopKernelTests(unittest.TestCase):
         self.assertEqual(self.store.scalar("SELECT status FROM improvement_candidates WHERE id = ?", [candidate_id]), "applied")
         self.assertEqual(self.store.scalar("SELECT status FROM failures WHERE id = ?", [failure_id]), "resolved")
 
+    def test_register_python_pattern_replaces_active_route_and_preserves_history(self):
+        pattern_signature = "intent=availability+entities_schema=tour_name,month"
+        first_artifact_id = self.engine.create_artifact("skills.query_intent.availability", "python", "def handle(): return 1")
+        second_artifact_id = self.engine.create_artifact("skills.query_intent.availability", "python", "def handle(): return 2")
+
+        first_route_id = self.engine.register_python_pattern(pattern_signature, first_artifact_id)
+        second_route_id = self.engine.register_python_pattern(pattern_signature, second_artifact_id)
+
+        self.assertNotEqual(first_route_id, second_route_id)
+        route = self.engine.lookup_python_route(pattern_signature)
+        self.assertEqual(
+            route,
+            {
+                "route_id": second_route_id,
+                "artifact_id": second_artifact_id,
+                "artifact_name": "skills.query_intent.availability",
+            },
+        )
+        self.assertEqual(
+            self.store.scalar(
+                "SELECT COUNT(*) FROM pattern_routes WHERE pattern_signature = ? AND is_active = TRUE",
+                [pattern_signature],
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.store.scalar(
+                "SELECT COUNT(*) FROM pattern_routes WHERE pattern_signature = ? AND is_active = FALSE",
+                [pattern_signature],
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.store.scalar("SELECT COUNT(*) FROM events WHERE event_type = 'python_pattern_registered'"),
+            2,
+        )
+
+    def test_register_python_pattern_rejects_inactive_artifact(self):
+        artifact_id = self.engine.create_artifact("skills.inactive", "python", "def handle(): return 1")
+        self.store.execute("UPDATE artifacts SET is_active = FALSE WHERE id = ?", [artifact_id])
+
+        with self.assertRaisesRegex(ValueError, "is not active"):
+            self.engine.register_python_pattern("intent=availability", artifact_id)
+
     def test_artifact_hash_mismatch_blocks_apply_and_keeps_candidate_draft(self):
         artifact_id = self.engine.create_artifact("prompts.search", "prompt", "v1")
         failure_id = self.engine.create_failure_for_test("logic_fault")
