@@ -61,6 +61,28 @@ SESSION_DB = "/home/wannavegtour/.hermes/profiles/op-assistant/state.db"
 MAPPING_PATH = "/home/wannavegtour/.hermes/credentials/wannavegtour/op_mapping.json"
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
 
+def _validate_kernel_dsn(url: str) -> None:
+    """★ Wave 2 HIGH#K1:防止 cron 誤打 CRM 或別的 PG。
+    Parse DSN,要求 host/port/db/user 都跟 op-assistant-kernel 一致,不對立刻 raise。
+    """
+    from urllib.parse import urlparse
+    EXPECTED = {"host": "127.0.0.1", "port": 5434, "db": "op_assistant_kernel", "user": "op_kernel"}
+    try:
+        p = urlparse(url)
+        actual = {"host": p.hostname, "port": p.port, "db": p.path.lstrip("/"), "user": p.username}
+    except Exception as e:
+        raise RuntimeError(f"KERNEL_DATABASE_URL parse failed: {type(e).__name__}: {e}") from e
+    if actual != EXPECTED:
+        # 不 print actual 完整值(防洩漏);只 print 哪幾欄不符
+        diff = {k: f"got={actual.get(k)!r} want={EXPECTED[k]!r}" for k in EXPECTED if actual.get(k) != EXPECTED[k]}
+        raise RuntimeError(
+            f"KERNEL_DATABASE_URL points at wrong target — refusing to run. "
+            f"Mismatch: {diff}. "
+            f"This guard exists to prevent op-assistant cron from accidentally writing to wannavegtourcrm-postgres-audit (port 5433) or other PG instances."
+        )
+
+_validate_kernel_dsn(KERNEL_URL)
+
 # UUID5 namespace 用 op-assistant 固定 UUID(deterministic dedup)
 ETL_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000001")
 HEALTH_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-00000000000a")
@@ -95,6 +117,8 @@ def _load_mapping():
             raise ValueError(f"expected dict, got {type(data).__name__}")
         return data
     except (json.JSONDecodeError, ValueError, OSError) as e:
+        # ★ Wave 2.1:try/finally 保 connection close
+        store = None
         try:
             store = KernelStore.from_url(KERNEL_URL)
             # 失敗事件也 deterministic(防同一錯誤 重複健康噪音)
@@ -107,9 +131,14 @@ def _load_mapping():
                  json_param({"path": MAPPING_PATH, "error_class": err_class, "error": str(e)[:200]}),
                  datetime.now(timezone.utc).isoformat()]
             )
-            store.close()
         except Exception:
             pass
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    pass
         return {"user_id_to_name": {}, "group_id_to_name": {}}
 
 
@@ -207,11 +236,29 @@ def run():
             dedup_key = r["platform_message_id"] or f"hermes_msg_{r['id']}"
             event_id = str(uuid.uuid5(ETL_NAMESPACE, dedup_key))
 
+            # ★ Wave 2 HIGH#A1:per-row 容錯,壞 JSON 不阻擋後面 row
+            parsed_tool_calls = None
+            if r["tool_calls"]:
+                try:
+                    parsed_tool_calls = json.loads(r["tool_calls"])
+                except (json.JSONDecodeError, TypeError) as e:
+                    # 寫一筆 deterministic health event(per session_id + r.id key)
+                    try:
+                        _write_health_event(store, f"etl_tool_calls_parse_{r['session_id']}_{r['id']}", {
+                            "session_id": r["session_id"],
+                            "message_id": r["id"],
+                            "error_class": type(e).__name__,
+                            "error": str(e)[:200],
+                        })
+                    except Exception:
+                        pass
+                    parsed_tool_calls = {"_parse_error": type(e).__name__}
+
             uid = r["user_id"]
             payload = {
                 "role": r["role"],
                 "content": r["content"],
-                "tool_calls": json.loads(r["tool_calls"]) if r["tool_calls"] else None,
+                "tool_calls": parsed_tool_calls,
                 "tool_name": r["tool_name"],
                 "platform_message_id": r["platform_message_id"],
                 "session_id": r["session_id"],

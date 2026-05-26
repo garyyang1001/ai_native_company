@@ -26,6 +26,29 @@ _load_profile_env()
 from closed_loop_kernel.store import KernelStore, json_param
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
+
+def _validate_kernel_dsn(url: str) -> None:
+    """★ Wave 2 HIGH#K1:防止 cron 誤打 CRM 或別的 PG。
+    Parse DSN,要求 host/port/db/user 都跟 op-assistant-kernel 一致,不對立刻 raise。
+    """
+    from urllib.parse import urlparse
+    EXPECTED = {"host": "127.0.0.1", "port": 5434, "db": "op_assistant_kernel", "user": "op_kernel"}
+    try:
+        p = urlparse(url)
+        actual = {"host": p.hostname, "port": p.port, "db": p.path.lstrip("/"), "user": p.username}
+    except Exception as e:
+        raise RuntimeError(f"KERNEL_DATABASE_URL parse failed: {type(e).__name__}: {e}") from e
+    if actual != EXPECTED:
+        # 不 print actual 完整值(防洩漏);只 print 哪幾欄不符
+        diff = {k: f"got={actual.get(k)!r} want={EXPECTED[k]!r}" for k in EXPECTED if actual.get(k) != EXPECTED[k]}
+        raise RuntimeError(
+            f"KERNEL_DATABASE_URL points at wrong target — refusing to run. "
+            f"Mismatch: {diff}. "
+            f"This guard exists to prevent op-assistant cron from accidentally writing to wannavegtourcrm-postgres-audit (port 5433) or other PG instances."
+        )
+
+_validate_kernel_dsn(KERNEL_URL)
+
 BACKUP_BASE = Path("/home/wannavegtour/.hermes/credentials/wannavegtour/op_kernel/backup")
 DOCKER_BIN = "/usr/bin/docker"  # ★ L: 絕對路徑
 

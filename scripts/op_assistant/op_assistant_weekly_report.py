@@ -28,6 +28,28 @@ from closed_loop_kernel.store import KernelStore, json_param
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
 
+def _validate_kernel_dsn(url: str) -> None:
+    """★ Wave 2 HIGH#K1:防止 cron 誤打 CRM 或別的 PG。
+    Parse DSN,要求 host/port/db/user 都跟 op-assistant-kernel 一致,不對立刻 raise。
+    """
+    from urllib.parse import urlparse
+    EXPECTED = {"host": "127.0.0.1", "port": 5434, "db": "op_assistant_kernel", "user": "op_kernel"}
+    try:
+        p = urlparse(url)
+        actual = {"host": p.hostname, "port": p.port, "db": p.path.lstrip("/"), "user": p.username}
+    except Exception as e:
+        raise RuntimeError(f"KERNEL_DATABASE_URL parse failed: {type(e).__name__}: {e}") from e
+    if actual != EXPECTED:
+        # 不 print actual 完整值(防洩漏);只 print 哪幾欄不符
+        diff = {k: f"got={actual.get(k)!r} want={EXPECTED[k]!r}" for k in EXPECTED if actual.get(k) != EXPECTED[k]}
+        raise RuntimeError(
+            f"KERNEL_DATABASE_URL points at wrong target — refusing to run. "
+            f"Mismatch: {diff}. "
+            f"This guard exists to prevent op-assistant cron from accidentally writing to wannavegtourcrm-postgres-audit (port 5433) or other PG instances."
+        )
+
+_validate_kernel_dsn(KERNEL_URL)
+
 # M2 修正
 WEEKLY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000003")
 HEALTH_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-00000000000a")
@@ -37,11 +59,14 @@ def run():
     store = KernelStore.from_url(KERNEL_URL)
     try:
         # 1. 訊息總數 / 各意圖分佈
+        # ★ Wave 2 MEDIUM-bug-B 修:intent 在 attempts.output(6 tool 實作後才會寫),
+        # 不是 events.payload。本 query 在 6 tool 上線前會回空 — 那是 expected。
         intent_dist = store.fetch_all(
-            "SELECT payload->>'intent' AS intent, COUNT(*) AS n "
-            "FROM events JOIN attempts ON attempts.event_id = events.id "
-            "WHERE events.created_at > ? GROUP BY payload->>'intent' "
-            "ORDER BY n DESC",
+            "SELECT output->>'intent' AS intent, COUNT(*) AS n "
+            "FROM attempts "
+            "WHERE created_at > ? AND status = 'success' AND output IS NOT NULL "
+            "GROUP BY output->>'intent' "
+            "ORDER BY n DESC NULLS LAST",
             [week_start]
         )
         # 2. 失敗 top types
@@ -94,7 +119,8 @@ def _push_weekly_report(weekly_event_id, payload):
     bot_token = _get_telegram_bot_token()
     chat_id = _get_telegram_home_channel()
     if not bot_token or not chat_id:
-        # ★ Codex M5:跟 daily 一致,寫 skipped 健康事件,deterministic uuid 防噪音
+        # ★ Wave 1 LOW + Wave 2 重整:try/finally 保 connection close
+        store = None
         try:
             store = KernelStore.from_url(KERNEL_URL)
             week_key = payload.get("period_key", "?")
@@ -109,9 +135,14 @@ def _push_weekly_report(weekly_event_id, payload):
                              "period_key": week_key}),
                  datetime.now(timezone.utc).isoformat()]
             )
-            store.close()
         except Exception:
             pass
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    pass
         return
 
     intents = payload["intent_distribution"][:5]
@@ -133,8 +164,9 @@ def _push_weekly_report(weekly_event_id, payload):
         r.raise_for_status()
     except requests.RequestException as e:
         status = getattr(e.response, "status_code", None) if hasattr(e, "response") and e.response else None
-        store = KernelStore.from_url(KERNEL_URL)
+        store = None
         try:
+            store = KernelStore.from_url(KERNEL_URL)
             store.execute(
                 "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
                 [str(uuid.uuid4()), "telegram_push_failure",
@@ -142,8 +174,14 @@ def _push_weekly_report(weekly_event_id, payload):
                              "error": f"weekly push failed status={status} type={type(e).__name__}"}),
                  datetime.now(timezone.utc).isoformat()]
             )
+        except Exception:
+            pass
         finally:
-            store.close()
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    pass
 
 # 共用 Telegram helpers(同 daily_curate.py)
 def _get_telegram_bot_token():

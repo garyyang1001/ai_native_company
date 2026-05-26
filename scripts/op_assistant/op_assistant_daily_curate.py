@@ -34,6 +34,28 @@ from closed_loop_kernel.store import KernelStore, json_param
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
 
+def _validate_kernel_dsn(url: str) -> None:
+    """★ Wave 2 HIGH#K1:防止 cron 誤打 CRM 或別的 PG。
+    Parse DSN,要求 host/port/db/user 都跟 op-assistant-kernel 一致,不對立刻 raise。
+    """
+    from urllib.parse import urlparse
+    EXPECTED = {"host": "127.0.0.1", "port": 5434, "db": "op_assistant_kernel", "user": "op_kernel"}
+    try:
+        p = urlparse(url)
+        actual = {"host": p.hostname, "port": p.port, "db": p.path.lstrip("/"), "user": p.username}
+    except Exception as e:
+        raise RuntimeError(f"KERNEL_DATABASE_URL parse failed: {type(e).__name__}: {e}") from e
+    if actual != EXPECTED:
+        # 不 print actual 完整值(防洩漏);只 print 哪幾欄不符
+        diff = {k: f"got={actual.get(k)!r} want={EXPECTED[k]!r}" for k in EXPECTED if actual.get(k) != EXPECTED[k]}
+        raise RuntimeError(
+            f"KERNEL_DATABASE_URL points at wrong target — refusing to run. "
+            f"Mismatch: {diff}. "
+            f"This guard exists to prevent op-assistant cron from accidentally writing to wannavegtourcrm-postgres-audit (port 5433) or other PG instances."
+        )
+
+_validate_kernel_dsn(KERNEL_URL)
+
 # ★ M2 修正:uuid5 namespace(daily 跟 weekly 各用一個)
 DAILY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000002")
 HEALTH_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-00000000000a")  # 共用 health key
@@ -70,9 +92,25 @@ def run():
                 "temperature": 0.2,
             }, timeout=300)
             resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"]
+            body = resp.json()
+            # ★ Wave 2 HIGH#A2 + Wave 2.1 強化:驗 response shape,每一層 isinstance 檢查再 access
+            choices = body.get("choices", []) if isinstance(body, dict) else []
+            if not choices:
+                raise ValueError("ollama returned empty choices")
+            first = choices[0]
+            if not isinstance(first, dict):
+                raise ValueError(f"ollama choices[0] not dict, got {type(first).__name__}")
+            message = first.get("message")
+            if not isinstance(message, dict):
+                raise ValueError(f"ollama message not dict, got {type(message).__name__}")
+            raw = message.get("content") or ""
+            if not raw:
+                raise ValueError("ollama returned empty content")
             summary = json.loads(raw)
-        except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
+            if not isinstance(summary, dict):
+                raise ValueError(f"ollama summary not dict, got {type(summary).__name__}")
+        except (requests.RequestException, json.JSONDecodeError, KeyError,
+                IndexError, TypeError, ValueError, AttributeError) as e:
             # Deterministic health event(M5 噪音控制:同一天同樣的 cold-start fail 只寫一筆)
             err_class = type(e).__name__
             period_key_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -89,7 +127,13 @@ def run():
             )
             return
 
-        # 把 metrics merge 進 summary(L1 修正)
+        # ★ Wave 2 MEDIUM-bug-A 修:統一 key name,讓 DB + Telegram 用同一份
+        summary = {
+            "patterns": summary.get("patterns", []),
+            "intent_gaps": summary.get("intent_gaps", []),
+            "customer_complaints": summary.get("complaints", []) or summary.get("customer_complaints", []),
+            "actionable_items": summary.get("actionable", []) or summary.get("actionable_items", []),
+        }
         summary["event_count"] = len(events)
         summary["open_failure_count"] = len(failures)
 
@@ -106,13 +150,13 @@ def run():
                  "period_start": cutoff_iso,
                  "period_end": datetime.now(timezone.utc).isoformat(),
                  "period_key": period_key,
-                 "event_count": len(events),
-                 "open_failure_count": len(failures),
+                 "event_count": summary["event_count"],
+                 "open_failure_count": summary["open_failure_count"],
                  "model": CURATION_MODEL,
-                 "patterns": summary.get("patterns", []),
-                 "intent_gaps": summary.get("intent_gaps", []),
-                 "customer_complaints": summary.get("complaints", []),
-                 "actionable_items": summary.get("actionable", []),
+                 "patterns": summary["patterns"],
+                 "intent_gaps": summary["intent_gaps"],
+                 "customer_complaints": summary["customer_complaints"],
+                 "actionable_items": summary["actionable_items"],
              }),
              datetime.now(timezone.utc).isoformat()]
         )
@@ -153,6 +197,8 @@ def _push_telegram_summary(summary_event_id, summary):
     chat_id = _get_telegram_home_channel()
     if not bot_token or not chat_id:
         # graceful no-op:也寫 health event 讓 Gary 知道為何沒收到通知
+        # ★ Wave 2.1:try/finally 保 connection close(原本 close 在 try 內,execute fail 會洩)
+        store = None
         try:
             store = KernelStore.from_url(KERNEL_URL)
             store.execute(
@@ -163,9 +209,14 @@ def _push_telegram_summary(summary_event_id, summary):
                              "summary_event_id": summary_event_id}),
                  datetime.now(timezone.utc).isoformat()]
             )
-            store.close()
         except Exception:
             pass
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    pass
         return
 
     text = (
@@ -185,6 +236,8 @@ def _push_telegram_summary(summary_event_id, summary):
         # ★ M4:exception message 可能含 token URL,只 log status code + message preview
         status = getattr(e.response, "status_code", None) if hasattr(e, "response") and e.response else None
         sanitized = f"telegram push failed: status={status}, type={type(e).__name__}"
+        # ★ Wave 2.1:try/finally 保 connection close
+        store = None
         try:
             store = KernelStore.from_url(KERNEL_URL)
             store.execute(
@@ -193,9 +246,14 @@ def _push_telegram_summary(summary_event_id, summary):
                  json_param({"summary_event_id": summary_event_id, "error": sanitized}),
                  datetime.now(timezone.utc).isoformat()]
             )
-            store.close()
         except Exception:
             pass
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    pass
 
 def _get_telegram_bot_token():
     """從 default profile 的 .env 讀(or 從 op-assistant 設定的 escalate token)"""
