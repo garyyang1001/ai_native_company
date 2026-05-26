@@ -139,13 +139,21 @@ def _attempt_columns(store: KernelStore) -> set[str]:
     return {str(row["column_name"]) for row in rows}
 
 
-def _attempt_join_filter(columns: set[str]) -> str:
+def _attempt_join_filter(columns: set[str], replay_version: str | None = None) -> str:
+    """Build the WHERE clause that identifies replay attempts.
+
+    When replay_version is given (e.g. "v2"), require attempts.input.replay_version
+    to match — this excludes earlier replay batches with stale logic. Pass None
+    to fall back to the legacy marker-detection that allows any historical batch.
+    """
+    if replay_version:
+        # v2 (and later) explicitly marks replay_version in attempts.input.
+        # This excludes v1 attempts that ran before the invocation filter existed.
+        return f"a.input->>'replay_version' = '{replay_version}'"
     if "agent_id" in columns:
         return "a.agent_id = 'op-assistant-replay'"
     if "profile_id" in columns:
         return "a.profile_id = 'op-assistant-replay'"
-    # Current v0 attempts schema has no agent/profile column. Agent B replay output is
-    # identified by deterministic replay fields rather than by modifying the schema.
     return (
         "(a.output->>'final_action' IS NOT NULL "
         "OR a.output->>'final_draft' IS NOT NULL "
@@ -156,8 +164,8 @@ def _attempt_join_filter(columns: set[str]) -> str:
     )
 
 
-def _fetch_pairs(store: KernelStore, limit: int | None) -> list[dict[str, Any]]:
-    attempt_filter = _attempt_join_filter(_attempt_columns(store))
+def _fetch_pairs(store: KernelStore, limit: int | None, replay_version: str | None = None) -> list[dict[str, Any]]:
+    attempt_filter = _attempt_join_filter(_attempt_columns(store), replay_version=replay_version)
     sql = (
         "SELECT e.id AS event_id, e.payload AS audit_payload, "
         "       a.id AS attempt_id, a.status AS attempt_status, a.output AS replay_output "
@@ -325,11 +333,18 @@ def main() -> int:
         help="Min text similarity to count as similar for matched reply pairs",
     )
     parser.add_argument("--show-fails", type=int, default=10, help="Top N fail cases to print")
+    parser.add_argument(
+        "--replay-version",
+        default="v2",
+        help="Only compare against attempts marked with this replay_version (default: v2). "
+             "Pass empty string to fall back to legacy any-batch detection.",
+    )
     args = parser.parse_args()
 
     store = KernelStore.from_url(KERNEL_URL)
     try:
-        rows = _fetch_pairs(store, args.limit)
+        rv = args.replay_version.strip() or None
+        rows = _fetch_pairs(store, args.limit, replay_version=rv)
         report = _compare_rows(rows, args.threshold, args.show_fails)
     finally:
         store.close()

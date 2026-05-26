@@ -61,9 +61,44 @@ from closed_loop_kernel.store import KernelStore, json_param  # noqa: E402
 
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
-REPLAY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000005")
+REPLAY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000005")  # legacy v1 — kept for record
+REPLAY_V2_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000007")  # v2 with invocation filter
+INBOUND_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000006")  # mirrors fork plugin
 MAX_RETRY = 3
 AGENT_ID = "op-assistant-replay"
+REPLAY_VERSION = "v2"
+DEFAULT_INVOCATION_PREFIXES = ("小弟", "@小弟", "/小弟")
+
+
+def _detect_invocation(text: str, mention_is_self: bool, prefixes: tuple = DEFAULT_INVOCATION_PREFIXES) -> dict | None:
+    """Mirrors plugins/op-assistant-line/adapter.py LineAdapter._detect_invocation.
+
+    Keep this in sync with the fork plugin. Pure deterministic — Code is Law.
+    """
+    if mention_is_self:
+        return {"kind": "mention"}
+    text_stripped = (text or "").strip()
+    for prefix in prefixes:
+        if text_stripped.startswith(prefix):
+            after = text_stripped[len(prefix):]
+            if (
+                not after
+                or after[0].isspace()
+                or after.startswith("?")
+                or after.startswith("？")
+            ):
+                return {"kind": f"prefix:{prefix}", "token": prefix}
+    return None
+
+
+def _strip_invocation_token(text: str, invocation: dict) -> str:
+    """Mirror fork plugin _strip_invocation_token. Length=0 for mention case = remove prefix entirely."""
+    if invocation["kind"] == "mention":
+        return text.strip()
+    token = invocation.get("token", "")
+    if token and text.lstrip().startswith(token):
+        return text.lstrip()[len(token):].strip()
+    return text.strip()
 
 
 def _validate_kernel_dsn(url: str) -> None:
@@ -107,7 +142,41 @@ def _tool_call(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _attempt_id_for_event(event_id: str) -> str:
-    return str(uuid.uuid5(REPLAY_NAMESPACE, str(event_id)))
+    """v2 attempt_id — uses REPLAY_V2_NAMESPACE so it doesn't collide with v1 escalate rows."""
+    return str(uuid.uuid5(REPLAY_V2_NAMESPACE, str(event_id)))
+
+
+def _write_inbound_event(store: KernelStore, event_id: str, payload: dict[str, Any]) -> bool:
+    """Mirrors fork plugin _log_inbound_to_kernel. Always log inbound for learning data.
+
+    Called for silent observations (no invocation) — we still record the message
+    in events table so weekly_curate / failure analyzer can see the full conversation.
+    """
+    msg_id = payload.get("message_id") or f"no-msg-id-{event_id}"
+    inbound_id = str(uuid.uuid5(INBOUND_NAMESPACE, str(msg_id)))
+    inbound_payload = {
+        "message_id": msg_id,
+        "text": payload.get("text", ""),
+        "message_type": payload.get("message_type"),
+        "chat_type": "group",
+        "group_id": payload.get("group_id", ""),
+        "user_id": payload.get("user_id", ""),
+        "mention_is_self": payload.get("mention_is_self", False),
+        "received_at": payload.get("ts") or datetime.now(timezone.utc).isoformat(),
+        "source_event_id": event_id,
+        "via": "replay_v2",
+    }
+    row = store.fetch_one(
+        "INSERT INTO events (id, event_type, payload, created_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING RETURNING id",
+        [
+            inbound_id,
+            "op_assistant_line_inbound",
+            json_param(inbound_payload),
+            datetime.now(timezone.utc).isoformat(),
+        ],
+    )
+    return row is not None
 
 
 def _insert_attempt(
@@ -141,14 +210,16 @@ def _insert_attempt(
     return row is not None
 
 
-def _base_input_payload(event_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _base_input_payload(event_id: str, payload: dict[str, Any], cleaned_text: str | None = None) -> dict[str, Any]:
     return {
         "agent_id": AGENT_ID,
+        "replay_version": REPLAY_VERSION,
         "tool_name": "hermes_6_tool_chain",
         "source": "op_assistant_line_audit_replay",
         "original_event_id": event_id,
         "message_id": payload.get("message_id"),
         "text": payload.get("text", ""),
+        "cleaned_text": cleaned_text if cleaned_text is not None else payload.get("text", ""),
         "group_id": payload.get("group_id", "TEST_GROUP_DRYRUN"),
         "user_id": payload.get("user_id", "unknown"),
         "legacy_intent": payload.get("intent"),
@@ -244,12 +315,38 @@ def replay_one(store: KernelStore, audit_event: dict[str, Any], *, write: bool =
             store,
             attempt_id=attempt_id,
             event_id=event_id,
-            input_payload=input_payload,
+            input_payload=_base_input_payload(event_id, payload, cleaned_text=""),
             output_payload=output_payload,
             status="success",
             write=write,
         )
         return {"skipped": True, "attempt_id": attempt_id, "inserted": inserted, "reason": "empty text"}
+
+    # ──────────────────────────────────────────────────────────────────
+    # Invocation filter (Code is Law) — mirrors fork plugin behavior:
+    #   plugins/op-assistant-line/adapter.py _detect_invocation
+    # Silent observations: write op_assistant_line_inbound event, do NOT run 6-tool chain,
+    #   do NOT write attempts. Matches what production fork plugin will do.
+    # ──────────────────────────────────────────────────────────────────
+    mention_is_self = bool(payload.get("mention_is_self"))
+    invocation = _detect_invocation(text, mention_is_self)
+    if invocation is None:
+        inserted_inbound = False
+        if write:
+            inserted_inbound = _write_inbound_event(store, event_id, payload)
+        return {
+            "silent_observe": True,
+            "attempt_id": None,
+            "event_id": event_id,
+            "inserted_inbound": inserted_inbound,
+            "reason": "no_invocation",
+        }
+    cleaned_text = _strip_invocation_token(text, invocation)
+    text = cleaned_text  # downstream sees cleaned text only
+
+    # Update input payload to include invocation + cleaned_text for audit trail.
+    input_payload = _base_input_payload(event_id, payload, cleaned_text=cleaned_text)
+    input_payload["invocation"] = invocation
 
     t0 = time.monotonic()
     chain_log: list[dict[str, Any]] = []
