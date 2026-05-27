@@ -4,19 +4,42 @@ This repository is the working space for turning 好事發生數位有限公司 
 
 The current priority is not to build a generic SEO agent and not to copy the OHYA architecture. The priority is to define a small, durable company kernel that lets real agents work while leaving structured records that can be reviewed, verified, cleaned, and reused.
 
-## How To Talk With Gary (2026-05-27 起)
+## How To Talk With Gary (2026-05-27 起,2026-05-27 強化)
 
-When the recipient of a reply is Gary, default to **plain language paired with a concrete scenario and a step-by-step flow**. Technical terms, function names, file paths, table names, and command snippets are allowed, but they belong in parentheses or short footnotes — not as the backbone of the explanation.
+**強制規則,不是 default**。所有要給 Gary 看的訊息、回覆、對話、報告、提案,**一律先用白話文 + 情境**,技術詞只能當註解,不能當主幹。
 
-Concretely:
+### 必做
 
-- Lead with the scenario in everyday Chinese (繁體). 例: 「OP 同事在 LINE 群打了一句話,bot 沒聽懂...」
-- Then walk the flow step by step. 一條訊息從哪裡進、經過誰、最後做什麼。
-- 技術名詞放括號內. e.g. 「資料先存到一張表(technical: `closed_loop_kernel.events`)」
-- 引用程式碼時用 file:line 加一句白話說明那段在幹嘛, 不直接貼大段 code.
-- 不要堆 acronym 或 schema 縮寫 (e.g. CRUD, FK, SoT) 不解釋就丟過來.
+1. **先講情境**(everyday 繁體中文)。例:「OP 同事美鳳在 LINE 群打『小弟有國內團嗎?』,bot 沒聽懂 ...」
+2. **走流程**:一條訊息 / 一個動作從哪裡進 → 經過誰 → 最後做什麼。
+3. **技術詞註解三件套**(同一個括號或註腳寫齊):
+   - **使用的程式**:具體的 module / file / table / command,有 `file:line` 最好
+   - **關聯性**:跟其他元件什麼關係(e.g. 「跟 Hermes session.db 是兩回事」、「會被 cron 2 讀」)
+   - **用途**:這個東西為什麼存在、用來做什麼
 
-This rule applies to all agents (Claude, Codex, Antigravity) when writing replies, summaries, or proposals destined for Gary. Internal review / agent-to-agent prompts may stay technical.
+   範例:
+   > 「資料先存到一張紀錄表(**使用**:`closed_loop_kernel.events`;**關聯**:跟 Hermes 對話歷史 `state.db` 是兩個獨立 DB,前者 PostgreSQL 後者 SQLite;**用途**:給每日 09:00 那條 gemma4 cron 抓 pattern 用)」
+
+4. **引用程式碼用 `file:line` + 一句白話說明那段在做什麼**,不直接貼大段 code。
+5. **每個 acronym / schema 縮寫第一次出現要解釋一次**(FK、SoT、CRUD、ETL ...)。
+
+### 不可做
+
+- ❌ 把 function name 或 table name 當句子主詞(「`apply_candidate` 更新 artifacts 表 ...」)
+- ❌ 整段技術名詞不解釋就丟過來
+- ❌ 引用程式碼貼大段 code 不寫做什麼
+- ❌ 用 `default to` / 「視情況」這類軟性語氣 — 本規則是硬規則
+- ❌ 認為「Gary 應該看得懂這個」就跳過情境段。看得懂跟需要重新建立 context 是兩件事
+
+### 範圍
+
+- 適用於:**所有 agent**(Claude, Codex, Antigravity)寫給 Gary 看的任何輸出 — 回覆、摘要、提案、commit message body、PR description、Telegram 推播、文件、註解。
+- 不適用於:純 agent-to-agent prompt(例如 `/codex consult` 給 codex 的 brief)— 內部溝通可以技術。
+- 但 agent-to-agent 的**最終輸出**如果會給 Gary 看(例如 codex review report 要 forward 給 Gary),整段 forward 之前要由 forwarder agent 改寫成符合本規則的格式。
+
+### 違反處理
+
+Gary 看到回覆**第一句不是情境** / **技術詞當主幹** 時,可直接回「白話」二字 → 收到的 agent 必須重寫該回覆,並把這次違規記到 `closed_loop_kernel.events` event_type=`agent_communication_violation`(將來可以做 retro)。
 
 ## Current Direction
 
