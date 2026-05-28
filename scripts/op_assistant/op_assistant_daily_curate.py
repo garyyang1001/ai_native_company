@@ -1,23 +1,39 @@
-# 放這:~/.hermes/profiles/op-assistant/scripts/op_assistant_daily_curate.py
-"""每日 09:00:讀過去 24hr events,gemma4:e4b 整理,寫 summary event,push Telegram
+"""Daily 09:00 — gemma4 curates past 24hr OP traffic + pushes Telegram summary.
 
-模型呼叫:用 OpenAI 相容 endpoint 直接打 Ollama(localhost:11434/v1)
-原因:Hermes auxiliary_client 內部 API(`call_llm`)可選,但直接 HTTP 控制力更大,
-fail 模式也清楚。如果之後要切走 Hermes 統一路徑,改 `from agent.auxiliary_client
-import call_llm` 即可(API 在 `~/.hermes/hermes-agent/agent/auxiliary_client.py`)。
+V0.2 era (2026-05-28+):data shape comes from attempt_envelopes + failures,
+not the V0.1 `events.op_assistant_line_message` placeholder.
 
-★ Codex review 修正(v2.1):
-- B2:--no-agent cron 不會 auto-load profile .env,手動 dotenv 載
-- M2:summary uuid 改 uuid5(period) 確保 idempotent,cron 重跑不會生重複 summary
-- M4:Telegram push 失敗的 exception 不能含 token URL,catch RequestException sanitize
-- L1:把 event_count / open_failure_count 也 merge 進 summary dict(否則 push 顯 ?)
+Reads:
+- events 'op_assistant_line_inbound' for raw inbound count
+- attempt_envelopes JOIN attempts for decision distribution (task / intent / reply_kind)
+- failures for trigger-hit cases
+
+Writes:
+- events 'daily_curation_summary' (one per period_key, idempotent uuid5)
+- events 'telegram_push_failure' if push fails (sanitized)
+
+Pushes:
+- Telegram via Bot API directly (not via Hermes gateway — this is post-process)
+
+★ B2:--no-agent cron 不會 auto-load profile .env
+★ M2:uuid5(period_key) idempotency
+★ M4:Telegram error sanitization (no token leak in logs)
+★ Karpathy 原則 2:gemma4 prompt 只送 redacted_preview,不送 raw text
 """
-import os, json, uuid, requests
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from __future__ import annotations
 
-# ★ B2 修正(同 ETL)
-def _load_profile_env():
+import json
+import os
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+
+# ★ B2 — manual dotenv load
+def _load_profile_env() -> None:
     env_path = Path("/home/wannavegtour/.hermes/profiles/op-assistant/.env")
     if not env_path.exists():
         return
@@ -28,252 +44,302 @@ def _load_profile_env():
         key, _, val = line.partition("=")
         os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
 
-_load_profile_env()
 
-from closed_loop_kernel.store import KernelStore, json_param
+def _load_hermes_env() -> None:
+    """Load Telegram creds from Hermes default-profile .env."""
+    env_path = Path.home() / ".hermes" / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+_load_profile_env()
+_load_hermes_env()
+
+REPO_PATH = os.environ.get(
+    "WANNAVEGTOUR_REPO_PATH",
+    "/home/wannavegtour/Desktop/AI Native Company/Gary",
+)
+if REPO_PATH not in sys.path:
+    sys.path.insert(0, REPO_PATH)
+
+from closed_loop_kernel.store import KernelStore, json_param  # noqa: E402
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
-
-def _validate_kernel_dsn(url: str) -> None:
-    """★ Wave 2 HIGH#K1:防止 cron 誤打 CRM 或別的 PG。
-    Parse DSN,要求 host/port/db/user 都跟 op-assistant-kernel 一致,不對立刻 raise。
-    """
-    from urllib.parse import urlparse
-    EXPECTED = {"host": "127.0.0.1", "port": 5434, "db": "op_assistant_kernel", "user": "op_kernel"}
-    try:
-        p = urlparse(url)
-        actual = {"host": p.hostname, "port": p.port, "db": p.path.lstrip("/"), "user": p.username}
-    except Exception as e:
-        raise RuntimeError(f"KERNEL_DATABASE_URL parse failed: {type(e).__name__}: {e}") from e
-    if actual != EXPECTED:
-        # 不 print actual 完整值(防洩漏);只 print 哪幾欄不符
-        diff = {k: f"got={actual.get(k)!r} want={EXPECTED[k]!r}" for k in EXPECTED if actual.get(k) != EXPECTED[k]}
-        raise RuntimeError(
-            f"KERNEL_DATABASE_URL points at wrong target — refusing to run. "
-            f"Mismatch: {diff}. "
-            f"This guard exists to prevent op-assistant cron from accidentally writing to wannavegtourcrm-postgres-audit (port 5433) or other PG instances."
-        )
-
-_validate_kernel_dsn(KERNEL_URL)
-
-# ★ M2 修正:uuid5 namespace(daily 跟 weekly 各用一個)
 DAILY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000002")
-HEALTH_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-00000000000a")  # 共用 health key
-
-# 直接打 Ollama OpenAI-compatible endpoint(跟 Hermes auxiliary.compression 共用模型)
 OLLAMA_URL = "http://127.0.0.1:11434/v1/chat/completions"
-CURATION_MODEL = "gemma4:e4b"  # 跟 auxiliary.compression 同一個 — 不需額外 pull
+CURATION_MODEL = "gemma4:e4b"
+PROFILE_ID = "op-assistant-line"
+MAX_PROMPT_INBOUND = 50      # cap prompt tokens
+MAX_PROMPT_FAILURES = 30
 
-def run():
-    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    store = KernelStore.from_url(KERNEL_URL)
-    try:
-        events = store.fetch_all(
-            "SELECT id, payload, created_at FROM events "
-            "WHERE event_type = ? AND created_at > ? ORDER BY created_at",
-            ["op_assistant_line_message", cutoff_iso]
-        )
-        failures = store.fetch_all(
-            "SELECT id, attempt_id, failure_type, context FROM failures "
-            "WHERE status='open' AND created_at > ?",
-            [cutoff_iso]
-        )
 
-        if not events and not failures:
-            return
+def _read_window(store: KernelStore) -> tuple[list, list, list]:
+    inbound = store.fetch_all(
+        "SELECT id, payload, created_at FROM events "
+        "WHERE event_type = 'op_assistant_line_inbound' "
+        "AND created_at > NOW() - INTERVAL '24 hours' "
+        "ORDER BY created_at"
+    )
+    envelopes = store.fetch_all(
+        "SELECT e.task_id, e.run_id, e.machine_record, a.status, a.created_at "
+        "FROM attempt_envelopes e JOIN attempts a ON a.id = e.attempt_id "
+        "WHERE e.profile_id = ? "
+        "AND a.created_at > NOW() - INTERVAL '24 hours' "
+        "ORDER BY a.created_at",
+        [PROFILE_ID],
+    )
+    failures = store.fetch_all(
+        "SELECT f.id, f.failure_type, f.context, f.created_at "
+        "FROM failures f "
+        "WHERE f.created_at > NOW() - INTERVAL '24 hours' "
+        "AND f.status = 'open' "
+        "ORDER BY f.created_at"
+    )
+    return inbound, envelopes, failures
 
-        # ★ Wave 1 HIGH#3:Ollama call 包 try/except,timeout/network fail 寫 health event
-        prompt = _build_curation_prompt(events, failures)
-        try:
-            resp = requests.post(OLLAMA_URL, json={
-                "model": CURATION_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.2,
-            }, timeout=300)
-            resp.raise_for_status()
-            body = resp.json()
-            # ★ Wave 2 HIGH#A2 + Wave 2.1 強化:驗 response shape,每一層 isinstance 檢查再 access
-            choices = body.get("choices", []) if isinstance(body, dict) else []
-            if not choices:
-                raise ValueError("ollama returned empty choices")
-            first = choices[0]
-            if not isinstance(first, dict):
-                raise ValueError(f"ollama choices[0] not dict, got {type(first).__name__}")
-            message = first.get("message")
-            if not isinstance(message, dict):
-                raise ValueError(f"ollama message not dict, got {type(message).__name__}")
-            raw = message.get("content") or ""
-            if not raw:
-                raise ValueError("ollama returned empty content")
-            summary = json.loads(raw)
-            if not isinstance(summary, dict):
-                raise ValueError(f"ollama summary not dict, got {type(summary).__name__}")
-        except (requests.RequestException, json.JSONDecodeError, KeyError,
-                IndexError, TypeError, ValueError, AttributeError) as e:
-            # Deterministic health event(M5 噪音控制:同一天同樣的 cold-start fail 只寫一筆)
-            err_class = type(e).__name__
-            period_key_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            hid = str(uuid.uuid5(HEALTH_NAMESPACE, f"curate_llm_{err_class}_{period_key_today}"))
-            store.execute(
-                "INSERT INTO events (id, event_type, payload, created_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
-                [hid, "daily_curation_llm_failure",
-                 json_param({"model": CURATION_MODEL, "endpoint": OLLAMA_URL,
-                             "error_class": err_class, "error": str(e)[:200],
-                             "period_key": period_key_today,
-                             "event_count": len(events), "open_failure_count": len(failures)}),
-                 datetime.now(timezone.utc).isoformat()]
-            )
-            return
 
-        # ★ Wave 2 MEDIUM-bug-A 修:統一 key name,讓 DB + Telegram 用同一份
-        summary = {
-            "patterns": summary.get("patterns", []),
-            "intent_gaps": summary.get("intent_gaps", []),
-            "customer_complaints": summary.get("complaints", []) or summary.get("customer_complaints", []),
-            "actionable_items": summary.get("actionable", []) or summary.get("actionable_items", []),
-        }
-        summary["event_count"] = len(events)
-        summary["open_failure_count"] = len(failures)
-
-        # ★ M2 修正:uuid5(period) 確保同一天重跑不會生重複 summary
-        period_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        sid = str(uuid.uuid5(DAILY_NAMESPACE, period_key))
-
-        # ★ Wave 1 HIGH#4:RETURNING id — 只在真正 INSERT 時才 push Telegram
-        result = store.fetch_one(
-            "INSERT INTO events (id, event_type, payload, created_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING RETURNING id",
-            [sid, "daily_curation_summary",
-             json_param({
-                 "period_start": cutoff_iso,
-                 "period_end": datetime.now(timezone.utc).isoformat(),
-                 "period_key": period_key,
-                 "event_count": summary["event_count"],
-                 "open_failure_count": summary["open_failure_count"],
-                 "model": CURATION_MODEL,
-                 "patterns": summary["patterns"],
-                 "intent_gaps": summary["intent_gaps"],
-                 "customer_complaints": summary["customer_complaints"],
-                 "actionable_items": summary["actionable_items"],
-             }),
-             datetime.now(timezone.utc).isoformat()]
-        )
-        if result:
-            # 真插入 → 第一次跑,push Telegram
-            _push_telegram_summary(sid, summary)
-        # else: cron 重跑 / 補跑 — 同一天 summary 已存在,不再 push(防 spam)
-    finally:
-        store.close()
-
-def _build_curation_prompt(events, failures):
-    sample = []
-    for e in events[:50]:   # 控制 token
-        p = e['payload'] if isinstance(e['payload'], dict) else json.loads(e['payload'])
-        sample.append({
-            "role": p.get('role'),
-            "name": p.get('user_name'),
-            "text": (p.get('content') or '')[:200]
+def _build_prompt(envelopes: list, failures: list) -> str:
+    samples = []
+    for env in envelopes[-MAX_PROMPT_INBOUND:]:
+        mr = env.get("machine_record")
+        if isinstance(mr, str):
+            try:
+                mr = json.loads(mr)
+            except Exception:
+                mr = {}
+        mr = mr or {}
+        samples.append({
+            "intent": mr.get("parser_intent"),
+            "reply_kind": mr.get("reply_kind"),
+            "fallback_path": mr.get("fallback_path"),
+            "msg_preview": (mr.get("message_preview_redacted") or "")[:120],
+            "task_continuation": mr.get("task_continuation"),
         })
-    fail_list = [{"type": f["failure_type"], "context": f["context"]} for f in failures]
-    return f"""你是 wannavegtour OP 助理的「整理員」。讀過去 24hr 對話 + 失敗紀錄,找出:
-- patterns: 重複出現的問句或話題
-- intent_gaps: 我們的規則表沒抓到的意圖(列原文)
-- complaints: 疑似客訴或不滿(列原文)
-- actionable: 你建議要修的事(具體建議)
 
-對話:{json.dumps(sample, ensure_ascii=False)}
-失敗:{json.dumps(fail_list, ensure_ascii=False)}
+    fail_summary = []
+    for f in failures[:MAX_PROMPT_FAILURES]:
+        ctx = f.get("context") or {}
+        if isinstance(ctx, str):
+            try:
+                ctx = json.loads(ctx)
+            except Exception:
+                ctx = {}
+        fail_summary.append({
+            "type": f.get("failure_type"),
+            "domain_code": ctx.get("domain_failure_code"),
+            "trigger_reason": ctx.get("trigger_reason"),
+            "msg_preview": (ctx.get("message_preview_redacted") or "")[:120],
+        })
 
-只回 JSON,key: patterns / intent_gaps / complaints / actionable,值為陣列。"""
+    return f"""你是阿玩旅遊 OP bot 的「整理員」。讀過去 24hr 的 bot 決策樣本 + 失敗紀錄,找出:
 
-def _push_telegram_summary(summary_event_id, summary):
-    """直接打 Telegram Bot API,不需要走 Hermes gateway(這是後台 script)。
+- patterns: 重複出現的問句或話題類型(列關鍵字 + 預估次數)
+- intent_gaps: parser 沒抓到但訊息預覽看起來有意圖的 case(列 msg_preview)
+- actionable: 你建議要改 query_parser.py 加什麼 keyword / regex / intent
 
-    ★ M4 修正:catch RequestException,sanitize 不洩 token URL。
+決策樣本(最多 {MAX_PROMPT_INBOUND} 筆):
+{json.dumps(samples, ensure_ascii=False, indent=2)}
+
+失敗紀錄(最多 {MAX_PROMPT_FAILURES} 筆):
+{json.dumps(fail_summary, ensure_ascii=False, indent=2)}
+
+只回 JSON object,key 必須是: patterns / intent_gaps / actionable,值為陣列(可空)。"""
+
+
+def _call_gemma4(prompt: str) -> dict:
+    resp = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": CURATION_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+        },
+        timeout=300,
+    )
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"]
+    return json.loads(raw)
+
+
+_TYPE_ZH = {"keyword": "關鍵字", "regex": "句型", "intent": "意圖"}
+
+
+def _render_telegram_text(summary: dict, summary_event_id: str) -> str:
+    """Compose the human-readable Telegram daily report.
+
+    Gary 在路上滑手機看,所以:不寫 attempt/failure/intent_gap 這類技術詞,
+    講「客人發了幾句、bot 處理幾通、沒聽懂哪幾句」。末段保留 8 字短編號,
+    Gary 回家可丟給 agent 查 events.id。
     """
-    bot_token = _get_telegram_bot_token()
-    chat_id = _get_telegram_home_channel()
+    date_str = datetime.now().strftime("%-m/%-d")
+    inbound = int(summary.get("inbound_count") or 0)
+    attempts = int(summary.get("attempt_count") or 0)
+    fail_count = int(summary.get("open_failure_count") or 0)
+    fail_previews = summary.get("fail_previews") or []
+    patterns = summary.get("patterns") or []
+    actionable = summary.get("actionable") or []
+
+    lines = [f"📋 阿玩 OP 助手日報 {date_str}", ""]
+    if inbound == 0 and attempts == 0:
+        lines.append("今天沒收到客人訊息。")
+    else:
+        lines.append(f"今天客人發 {inbound} 句話進來,bot 處理 {attempts} 通。")
+    lines.append("")
+
+    if fail_count > 0:
+        lines.append(f"❓ 有 {fail_count} 通 bot 沒聽懂:")
+        for p in fail_previews[:3]:
+            lines.append(f"「{p}」")
+        lines.append("")
+
+    if patterns:
+        top = patterns[0]
+        kw = (top.get("keyword") or "").strip()
+        cnt = int(top.get("estimated_count") or 0)
+        if cnt >= 2 and kw:
+            lines.append(f"💡 看完今天的對話,「{kw}」這個詞被問 {cnt} 次,")
+            lines.append("bot 還不會認。")
+            lines.append("")
+
+    if actionable:
+        lines.append(f"我建議讓 bot 學 {len(actionable)} 招:")
+        for i, a in enumerate(actionable[:5], 1):
+            kind_zh = _TYPE_ZH.get(a.get("type") or "", a.get("type") or "規則")
+            val = (a.get("value") or "").strip()
+            reason = (a.get("reason") or "").strip()
+            if reason:
+                lines.append(f"{i}. {kind_zh}「{val}」— {reason}")
+            else:
+                lines.append(f"{i}. {kind_zh}「{val}」")
+        lines.append("")
+        lines.append("你 OK 我就改。")
+        lines.append("")
+
+    short_id = summary_event_id.split("-", 1)[0] if "-" in summary_event_id else summary_event_id[:8]
+    lines.append(f"(技術細節編號:{short_id} — 給 agent 查用)")
+    return "\n".join(lines)
+
+
+def _push_telegram(store: KernelStore, summary_event_id: str, summary: dict) -> None:
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_HOME_CHANNEL")
+
     if not bot_token or not chat_id:
-        # graceful no-op:也寫 health event 讓 Gary 知道為何沒收到通知
-        # ★ Wave 2.1:try/finally 保 connection close(原本 close 在 try 內,execute fail 會洩)
-        store = None
-        try:
-            store = KernelStore.from_url(KERNEL_URL)
-            store.execute(
-                "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
-                [str(uuid.uuid4()), "telegram_push_skipped",
-                 json_param({"reason": "missing token or chat_id",
-                             "has_token": bool(bot_token), "has_chat": bool(chat_id),
-                             "summary_event_id": summary_event_id}),
-                 datetime.now(timezone.utc).isoformat()]
-            )
-        except Exception:
-            pass
-        finally:
-            if store is not None:
-                try:
-                    store.close()
-                except Exception:
-                    pass
+        store.execute(
+            "INSERT INTO events (id, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                str(uuid.uuid4()), "telegram_push_skipped",
+                json_param({
+                    "reason": "missing token or chat_id",
+                    "has_token": bool(bot_token),
+                    "has_chat": bool(chat_id),
+                    "summary_event_id": summary_event_id,
+                }),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
         return
 
-    text = (
-        f"📋 OP 對話日整理 ({datetime.now().strftime('%Y-%m-%d')})\n"
-        f"事件數: {summary.get('event_count', 0)} / 待修 failures: {summary.get('open_failure_count', 0)}\n\n"
-        f"🔁 重複 pattern: {len(summary.get('patterns', []))} 筆\n"
-        f"❓ 意圖 gap: {len(summary.get('intent_gaps', []))} 筆\n"
-        f"📣 客訴: {len(summary.get('customer_complaints', []))} 筆\n"
-        f"💡 我建議: {len(summary.get('actionable_items', []))} 筆\n\n"
-        f"細節查 events.id={summary_event_id}"
-    )
+    text = _render_telegram_text(summary, summary_event_id)
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
         r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=30)
         r.raise_for_status()
-    except requests.RequestException as e:
-        # ★ M4:exception message 可能含 token URL,只 log status code + message preview
-        status = getattr(e.response, "status_code", None) if hasattr(e, "response") and e.response else None
-        sanitized = f"telegram push failed: status={status}, type={type(e).__name__}"
-        # ★ Wave 2.1:try/finally 保 connection close
-        store = None
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        sanitized = f"telegram push failed: status={status}, type={type(exc).__name__}"
+        store.execute(
+            "INSERT INTO events (id, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                str(uuid.uuid4()), "telegram_push_failure",
+                json_param({"summary_event_id": summary_event_id, "error": sanitized}),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+
+
+def run() -> None:
+    store = KernelStore.from_url(KERNEL_URL)
+    try:
+        inbound, envelopes, failures = _read_window(store)
+
+        if not inbound and not envelopes and not failures:
+            print("daily curate: no traffic in past 24hr, skip")
+            return
+
         try:
-            store = KernelStore.from_url(KERNEL_URL)
-            store.execute(
-                "INSERT INTO events (id, event_type, payload, created_at) VALUES (?, ?, ?, ?)",
-                [str(uuid.uuid4()), "telegram_push_failure",
-                 json_param({"summary_event_id": summary_event_id, "error": sanitized}),
-                 datetime.now(timezone.utc).isoformat()]
-            )
-        except Exception:
-            pass
-        finally:
-            if store is not None:
+            summary = _call_gemma4(_build_prompt(envelopes, failures))
+        except Exception as exc:
+            summary = {
+                "patterns": [],
+                "intent_gaps": [],
+                "actionable": [],
+                "_gemma_error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+
+        summary["inbound_count"] = len(inbound)
+        summary["attempt_count"] = len(envelopes)
+        summary["open_failure_count"] = len(failures)
+        summary["model"] = CURATION_MODEL
+
+        fail_previews: list[str] = []
+        for f in failures[:5]:
+            ctx = f.get("context") or {}
+            if isinstance(ctx, str):
                 try:
-                    store.close()
+                    ctx = json.loads(ctx)
                 except Exception:
-                    pass
+                    ctx = {}
+            preview = (ctx.get("message_preview_redacted") or "").strip()
+            if preview:
+                fail_previews.append(preview[:120])
+        summary["fail_previews"] = fail_previews
 
-def _get_telegram_bot_token():
-    """從 default profile 的 .env 讀(or 從 op-assistant 設定的 escalate token)"""
-    # Codex 階段確認讀法
-    env_path = os.path.expanduser("~/.hermes/.env")
-    if not os.path.exists(env_path):
-        return None
-    for line in open(env_path):
-        if line.startswith("TELEGRAM_BOT_TOKEN="):
-            return line.split("=", 1)[1].strip()
-    return None
+        period_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        summary_event_id = str(uuid.uuid5(DAILY_NAMESPACE, period_key))
 
-def _get_telegram_home_channel():
-    env_path = os.path.expanduser("~/.hermes/.env")
-    if not os.path.exists(env_path):
-        return None
-    for line in open(env_path):
-        if line.startswith("TELEGRAM_HOME_CHANNEL="):
-            return line.split("=", 1)[1].strip()
-    return None
+        store.execute(
+            "INSERT INTO events (id, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+            [
+                summary_event_id, "daily_curation_summary",
+                json_param({
+                    "period_key": period_key,
+                    "period_end": datetime.now(timezone.utc).isoformat(),
+                    "inbound_count": summary["inbound_count"],
+                    "attempt_count": summary["attempt_count"],
+                    "open_failure_count": summary["open_failure_count"],
+                    "model": CURATION_MODEL,
+                    "patterns": summary.get("patterns", []),
+                    "intent_gaps": summary.get("intent_gaps", []),
+                    "actionable": summary.get("actionable", []),
+                    "fail_previews": summary.get("fail_previews", []),
+                    "gemma_error": summary.get("_gemma_error"),
+                }),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+
+        _push_telegram(store, summary_event_id, summary)
+
+        print(
+            f"daily curate {period_key}: inbound={summary['inbound_count']} "
+            f"attempts={summary['attempt_count']} failures={summary['open_failure_count']} "
+            f"patterns={len(summary.get('patterns', []))} gaps={len(summary.get('intent_gaps', []))}"
+        )
+    finally:
+        store.close()
+
 
 if __name__ == "__main__":
     run()
