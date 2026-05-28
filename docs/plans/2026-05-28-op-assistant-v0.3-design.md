@@ -403,6 +403,10 @@ ALTER TABLE approvals ADD COLUMN IF NOT EXISTS replay_result_hash TEXT;
 | R7 | 新 keyword 太貪 — sandbox 三 metric 沒抓到「把過多無關 unclear 一網打盡」這種 over-greedy 行為 | Phase 6 加第 4 metric `over_greedy_rate`,新規則在 30d unclear corpus 命中率 ≥ 50% 直接 replay_failed |
 | R8 | wannavegtour 流量低,canary 百分比 spec 沒樣本 → 永遠湊不齊判斷 | Canary 改成**絕對通數 + 超時保護**(5 通 OR 8hr 先到先算);流量再低也有 ground 收結論 |
 | R9 | gemma4 自己提的 actionable 本身就爛(LLM hallucination) | (V0.3 部分緩解)gemma4 prompt 帶 confidence score,只 high 進 candidate;V0.4 評估 double-LLM(claude haiku 二意見)|
+| R10 | Webhook DB 寫入失敗導致 Telegram retry 處理不一致(dedupe bit 已 mark 但 events row 沒寫) | Phase 1 接受;Phase 4 改用 PostgreSQL unique constraint on `update_id` 取代 in-memory dedupe,寫入+mark 變 atomic |
+| R11 | In-memory dedupe 無法跨 process restart / 多 worker process | Phase 1 接受(Telegram retry window 數分鐘,restart 罕見);Phase 4 同 R10 改 DB |
+| R12 | Webhook secret 只證明「知道 secret」,public URL 暴露後 attacker spam 401 會產生 audit noise | V0.3 不修;部署層 Cloudflare / tailscale ACL + 後續 Phase 加 rate limit。記為 ops risk |
+| R13 | `raw_update` 含 Telegram user profile(name / username),retention 邊界沒定 | events 表 30 天 retention 已涵蓋(Phase 4 Gary Q5);但若 events 表延長 retention,要回頭加 redaction。Phase 4 dispatcher 寫 approvals 時要 redact user fields(只留 user_id_suffix) |
 
 ## 10. 施工順序 + success criteria
 
@@ -440,6 +444,13 @@ ALTER TABLE approvals ADD COLUMN IF NOT EXISTS replay_result_hash TEXT;
   - codex 沒提到 `improvement_candidate_rejected` event 保留 V0.3 reject 的 actionable(我加進去,V0.4 開放後不丟失)
   - codex 沒提到 R2(候選 payload 被 gemma4 下一輪改寫),我加入
   - codex 沒提到 R7 over-greedy / R8 流量過低 canary 失效 / R9 LLM 自身錯誤,Gary 對話後加入
+
+### 2026-05-29 codex Phase 1 post-hoc review
+
+- Codex CLI execution 被 DGX bubblewrap sandbox 擋住(`kernel.unprivileged_userns_clone=0`);Claude 直接寫 Phase 1。Codex 改做 **LLM-only post-hoc review**(session 含於 `.claude/jobs/1d06a75b/`)。
+- Codex 找到 4 個實質 bug,全在同一個 patch commit 修掉(`4ae81e2`):token-leak via traceback、sync DB write 卡 event loop、dedupe 在 allowlist 之前讓未授權 retry 無 audit、X-Forwarded-For 可偽造。
+- Codex D 點 4 條風險(webhook persistence、in-memory dedupe restart、rate limit、PII retention)併入本 doc §9 R10-R13。
+- Codex skip 點:`raw_update` 預提冗餘欄位(YAGNI 過早 optimize);`TELEGRAM_ALLOWED_CHATS` 從 optional 提到 required(description 已寫 fail-closed,語意清楚)。
 
 ### 2026-05-29 dial framework 拍板對話紀錄
 
