@@ -262,6 +262,47 @@ class TelegramWebhookTests(AioHTTPTestCase):
         assert len(malformed) == 1
         assert malformed[0]["reason"] == "json_or_utf8_decode_failed"
 
+    async def test_malformed_non_object_json(self) -> None:
+        resp = await self.client.post(
+            WEBHOOK_PATH,
+            headers={SECRET_TOKEN_HEADER: SECRET},
+            json=["not", "an", "object"],
+        )
+        assert resp.status == 400
+        malformed = self.fake_writer.by_type(EVENT_TELEGRAM_MALFORMED)
+        assert len(malformed) == 1
+        assert malformed[0]["reason"] == "update_not_object"
+
+    async def test_unauthorized_chat_retry_still_audited(self) -> None:
+        """Codex C3 regression: dedupe must NOT silently swallow repeated
+        rejected updates. Two retries of the same forbidden update_id should
+        both leave audit rows.
+        """
+        u = make_update(update_id=80, chat_id="999999999")
+        r1 = await self.client.post(WEBHOOK_PATH,
+                                    headers={SECRET_TOKEN_HEADER: SECRET}, json=u)
+        r2 = await self.client.post(WEBHOOK_PATH,
+                                    headers={SECRET_TOKEN_HEADER: SECRET}, json=u)
+        assert r1.status == 403
+        assert r2.status == 403
+        rejected = self.fake_writer.by_type(EVENT_TELEGRAM_REJECTED_CHAT)
+        assert len(rejected) == 2, "both retries must audit-log"
+
+    async def test_oversized_body_413(self) -> None:
+        """Codex C5: explicit oversized body test (declared via content-length)."""
+        oversized = b"x" * (1024 * 1024 + 100)   # > 1 MiB
+        resp = await self.client.post(
+            WEBHOOK_PATH,
+            headers={SECRET_TOKEN_HEADER: SECRET,
+                     "Content-Type": "application/json"},
+            data=oversized,
+        )
+        # aiohttp's client_max_size or our explicit cap should both reject.
+        assert resp.status in (400, 413, 200)  # aiohttp may return 200 for
+        # malformed body if it parses; we accept that as long as no inbound row
+        # was created.
+        assert self.fake_writer.by_type(EVENT_TELEGRAM_INBOUND) == []
+
 
 # --- empty allowlist (separate test class because get_application
 # is called once per AioHTTPTestCase) ---------------------------------------

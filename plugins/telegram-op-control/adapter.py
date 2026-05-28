@@ -32,6 +32,7 @@ There is no LLM import in this file.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -227,31 +228,39 @@ class EventWriter:
 async def webhook_handler(request: web.Request) -> web.Response:
     """POST /telegram/webhook — single deterministic pipeline.
 
-    Order matters:
+    Order (post codex review 2026-05-29):
 
     1. Signature verify (else 401 + audit ``telegram_unauthorized``).
     2. Body size cap (else 413).
     3. JSON parse (else 400 + audit ``telegram_malformed``).
     4. ``update_id`` presence (else 400 + audit ``telegram_malformed``).
-    5. Dedupe by ``update_id`` (duplicate => 200 OK, no new row — Telegram
-       retries should look like success on our end).
-    6. Chat extraction (unknown shape => 400 + audit ``telegram_malformed``).
-    7. Allowlist check (else 403 + audit ``telegram_rejected_chat``).
+    5. Chat extraction (unknown shape => 400 + audit ``telegram_malformed``).
+    6. Allowlist check (else 403 + audit ``telegram_rejected_chat``).
+    7. Dedupe by ``update_id`` — *after* allowlist so unauthorized retries
+       always audit, never get silently swallowed (codex C3).
     8. Happy path => 200 OK + ``telegram_inbound`` row.
+
+    All writes go through ``asyncio.to_thread`` so a slow / blocked Postgres
+    cannot stall the aiohttp event loop past Telegram's 5 s timeout (codex B1).
     """
     config: AdapterConfig = request.app["config"]
     dedupe: UpdateIdDedupe = request.app["dedupe"]
     writer = request.app["writer"]
 
-    remote_ip = request.headers.get(
-        "X-Forwarded-For", request.remote or "unknown",
-    )
+    # We deliberately do *not* trust X-Forwarded-For — without an explicit
+    # trusted-proxy contract any caller can forge it. request.remote is the
+    # connection peer, which is what we actually audit (codex A4).
+    remote_ip = request.remote or "unknown"
+
+    def _audit(event_type: str, payload: dict[str, Any]) -> Any:
+        """Run the (sync) writer.write off-loop so DB latency cannot stall us."""
+        return asyncio.to_thread(writer.write, event_type, payload)
 
     # 1. Signature verify
     received_token = request.headers.get(SECRET_TOKEN_HEADER, "")
     if not hmac.compare_digest(received_token, config.webhook_secret):
         # Never echo the received token or the expected secret.
-        writer.write(EVENT_TELEGRAM_UNAUTHORIZED, {
+        await _audit(EVENT_TELEGRAM_UNAUTHORIZED, {
             "remote_ip": remote_ip,
             "path": request.path,
             "received_token_len": len(received_token),
@@ -263,45 +272,44 @@ async def webhook_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "body too large"}, status=413)
 
     body = await request.read()
-    if len(body) > BODY_MAX_BYTES:
+    body_bytes = len(body)
+    if body_bytes > BODY_MAX_BYTES:
         return web.json_response({"error": "body too large"}, status=413)
 
     # 3. JSON parse
     try:
         update = json.loads(body.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        writer.write(EVENT_TELEGRAM_MALFORMED, {
+        await _audit(EVENT_TELEGRAM_MALFORMED, {
             "reason": "json_or_utf8_decode_failed",
             "error_type": type(exc).__name__,
             "remote_ip": remote_ip,
+            "body_bytes": body_bytes,
         })
         return web.json_response({"error": "malformed"}, status=400)
 
     if not isinstance(update, dict):
-        writer.write(EVENT_TELEGRAM_MALFORMED, {
+        await _audit(EVENT_TELEGRAM_MALFORMED, {
             "reason": "update_not_object",
             "remote_ip": remote_ip,
+            "body_bytes": body_bytes,
         })
         return web.json_response({"error": "update not object"}, status=400)
 
     # 4. update_id presence
     update_id = update.get("update_id")
     if not isinstance(update_id, int):
-        writer.write(EVENT_TELEGRAM_MALFORMED, {
+        await _audit(EVENT_TELEGRAM_MALFORMED, {
             "reason": "missing_or_non_int_update_id",
             "update_keys": list(update.keys())[:10],
             "remote_ip": remote_ip,
         })
         return web.json_response({"error": "missing update_id"}, status=400)
 
-    # 5. Dedupe — Telegram retries should look like success on our end.
-    if dedupe.seen_then_mark(update_id):
-        return web.json_response({"status": "duplicate"}, status=200)
-
-    # 6. Chat extraction
+    # 5. Chat extraction
     chat_id, kind = extract_chat_id(update)
     if chat_id is None:
-        writer.write(EVENT_TELEGRAM_MALFORMED, {
+        await _audit(EVENT_TELEGRAM_MALFORMED, {
             "reason": "no_extractable_chat_id",
             "update_kind": kind,
             "update_id": update_id,
@@ -309,17 +317,24 @@ async def webhook_handler(request: web.Request) -> web.Response:
         })
         return web.json_response({"error": "unknown update shape"}, status=400)
 
-    # 7. Allowlist check — fail-closed when allowlist is empty.
+    # 6. Allowlist check — fail-closed when allowlist is empty.
+    # Done BEFORE dedupe so unauthorized retries always leave an audit row
+    # (otherwise the first reject sets the dedupe bit and silences the rest).
     if not config.allowed_chats or chat_id not in config.allowed_chats:
-        writer.write(EVENT_TELEGRAM_REJECTED_CHAT, {
+        await _audit(EVENT_TELEGRAM_REJECTED_CHAT, {
             "update_id": update_id,
             "chat_id_suffix": chat_id[-4:],   # debug-only suffix, never full id
             "update_kind": kind,
         })
         return web.json_response({"error": "chat not allowed"}, status=403)
 
+    # 7. Dedupe — only for *allowed* updates. Telegram retries an allowed
+    # update look like success on our end without double-logging.
+    if dedupe.seen_then_mark(update_id):
+        return web.json_response({"status": "duplicate"}, status=200)
+
     # 8. Happy path — record the inbound update.
-    writer.write(EVENT_TELEGRAM_INBOUND, {
+    await _audit(EVENT_TELEGRAM_INBOUND, {
         "update_id": update_id,
         "effective_chat_id": chat_id,
         "kind": kind,

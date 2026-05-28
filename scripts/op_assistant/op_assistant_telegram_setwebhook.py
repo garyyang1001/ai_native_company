@@ -29,10 +29,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 import requests
+
+
+# Bot tokens are baked into the Telegram API URL ("/bot<TOKEN>/setWebhook"),
+# so any exception that prints the URL (including default `requests` traceback)
+# would leak the token. We always go through this sanitizer before printing.
+_TOKEN_URL_RE = re.compile(r"/bot[^/]+/")
+
+
+def _sanitize(s: str) -> str:
+    return _TOKEN_URL_RE.sub("/bot<REDACTED>/", s)
 
 
 def _load_env_file(path: Path) -> None:
@@ -54,22 +65,36 @@ def _load_env() -> None:
 
 def _set_webhook(token: str, url: str, secret: str) -> dict:
     api = f"https://api.telegram.org/bot{token}/setWebhook"
-    r = requests.post(api, json={
-        "url": url,
-        "secret_token": secret,
-        "allowed_updates": ["message", "callback_query", "edited_message"],
-        "drop_pending_updates": True,
-        "max_connections": 40,
-    }, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.post(api, json={
+            "url": url,
+            "secret_token": secret,
+            "allowed_updates": ["message", "callback_query", "edited_message"],
+            "drop_pending_updates": True,
+            "max_connections": 40,
+        }, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as exc:
+        # `raise from None` drops the chained traceback so the unsanitized
+        # URL in `requests.exceptions.HTTPError(...)` never reaches stderr.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        raise RuntimeError(
+            f"setWebhook failed: status={status} type={type(exc).__name__}"
+        ) from None
 
 
 def _get_webhook_info(token: str) -> dict:
     api = f"https://api.telegram.org/bot{token}/getWebhookInfo"
-    r = requests.get(api, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(api, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        raise RuntimeError(
+            f"getWebhookInfo failed: status={status} type={type(exc).__name__}"
+        ) from None
 
 
 def run(dry_run: bool = False) -> int:
@@ -93,18 +118,28 @@ def run(dry_run: bool = False) -> int:
     if dry_run:
         print("--dry-run: skipping setWebhook call")
     else:
-        result = _set_webhook(token, webhook_url, secret)
+        try:
+            result = _set_webhook(token, webhook_url, secret)
+        except RuntimeError as exc:
+            print(_sanitize(str(exc)), file=sys.stderr)
+            return 1
         if not result.get("ok"):
-            print(f"setWebhook failed: {json.dumps(result, ensure_ascii=False)}",
-                  file=sys.stderr)
+            # `result` is parsed JSON from Telegram — no token here, but
+            # sanitize defensively in case Telegram echoes the URL back.
+            print(_sanitize(
+                f"setWebhook failed: {json.dumps(result, ensure_ascii=False)}"
+            ), file=sys.stderr)
             return 1
         print(f"setWebhook ok: {result.get('description')}")
 
-    info = _get_webhook_info(token)
-    # Strip secret-related fields before printing (defense-in-depth).
+    try:
+        info = _get_webhook_info(token)
+    except RuntimeError as exc:
+        print(_sanitize(str(exc)), file=sys.stderr)
+        return 1
     info_view = info.get("result", info)
     print("getWebhookInfo:")
-    print(json.dumps(info_view, ensure_ascii=False, indent=2))
+    print(_sanitize(json.dumps(info_view, ensure_ascii=False, indent=2)))
     return 0
 
 
