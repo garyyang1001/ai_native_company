@@ -887,29 +887,71 @@ class LineAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("OP-EVENT-LOG: outbox init failed: %s", exc)
 
+        # OP task episode state (Q2=B: TTL + count + status).
+        # In-memory dict keyed by (user_hash, conv_hash). First iteration —
+        # restart loses state, but TTL == 10min so impact bounded.
+        # See docs/plans/2026-05-28-learning-loop-design-v0.2.md.
+        self._op_task_episodes: dict[tuple[str, str], dict] = {}
+        self._op_task_ttl_seconds = 600
+        self._op_task_max_inbound = 3
+        self._op_task_closing_reply_kinds = frozenset({
+            "availability_reply", "historical_reply", "refusal", "help_text",
+        })
+
     # ------------------------------------------------------------------
-    # OP event log helpers (decision log + failure marker + outbox).
+    # OP event log helpers (Phase 3 — Q1=B contract-aligned + Q2=B task episode).
     # See docs/plans/2026-05-28-learning-loop-design-v0.2.md.
     # ------------------------------------------------------------------
 
-    def _op_kernel_write(self, event_type: str, payload: dict, idempotency_key: str) -> None:
-        """Write one row to closed_loop_kernel.events. On failure → enqueue outbox.
+    def _op_resolve_task_episode(self, user_hash: str, conv_hash: str) -> tuple[str, str, bool]:
+        """Return (task_id, run_id, is_continuation) for this inbound.
 
-        Never raises (catch-warn). Q4=B simplified outbox semantics:
-        enqueue + best-effort flush_once at end of caller. No daemon.
+        Q2=B rule: same user/conv + 10 min TTL + previous task still open +
+        inbound_count < 3 → continue; otherwise new task. Status open/closed
+        is set by ``_op_finalize_task`` after reply is decided.
         """
-        import uuid
-        from datetime import datetime, timezone
+        import time, uuid
+        now = time.time()
+        key = (user_hash, conv_hash)
+        state = self._op_task_episodes.get(key)
+        continue_existing = (
+            state is not None
+            and state["status"] == "open"
+            and (now - state["last_seen_ts"]) <= self._op_task_ttl_seconds
+            and state["inbound_count"] < self._op_task_max_inbound
+        )
+        if continue_existing:
+            state["last_seen_ts"] = now
+            state["inbound_count"] += 1
+            return state["task_id"], "run_" + str(uuid.uuid4())[:13], True
 
+        task_id = "task_" + str(uuid.uuid4())[:16]
+        run_id = "run_" + str(uuid.uuid4())[:13]
+        self._op_task_episodes[key] = {
+            "task_id": task_id,
+            "last_seen_ts": now,
+            "inbound_count": 1,
+            "status": "open",
+        }
+        return task_id, run_id, False
+
+    def _op_finalize_task(self, user_hash: str, conv_hash: str, reply_kind: str) -> None:
+        """Mark task closed if bot gave a concrete answer; otherwise leave open."""
+        state = self._op_task_episodes.get((user_hash, conv_hash))
+        if state is None:
+            return
+        if reply_kind in self._op_task_closing_reply_kinds:
+            state["status"] = "closed"
+
+    def _op_write_pg(self, attempt_input: dict, envelope: dict, failure: dict | None) -> bool:
+        """Write attempts + attempt_envelopes (+ failures) to PG via KernelEngine.
+
+        Returns True on success, False on any PG failure (caller enqueues outbox).
+        """
         kernel_url = os.environ.get("KERNEL_DATABASE_URL")
         if not kernel_url:
-            logger.debug("OP-EVENT-LOG: KERNEL_DATABASE_URL not set; skip kernel write")
-            return
-
-        ns = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000008")
-        event_id = str(uuid.uuid5(ns, idempotency_key))
-        created_iso = datetime.now(timezone.utc).isoformat()
-
+            logger.debug("OP-EVENT-LOG: KERNEL_DATABASE_URL not set; skip PG write")
+            return False
         repo = os.environ.get(
             "WANNAVEGTOUR_REPO_PATH",
             "/home/wannavegtour/Desktop/AI Native Company/Gary",
@@ -919,23 +961,60 @@ class LineAdapter(BasePlatformAdapter):
 
         try:
             from closed_loop_kernel.store import KernelStore, json_param
+            from closed_loop_kernel.engine import KernelEngine
+            from datetime import datetime, timezone
+
             store = KernelStore.from_url(kernel_url)
             try:
-                store.execute(
-                    "INSERT INTO events (id, event_type, payload, created_at) "
-                    "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
-                    [event_id, event_type, json_param(payload), created_iso],
+                engine = KernelEngine(store)
+                attempt_id = engine.create_attempt_with_envelope(
+                    event_id=None,
+                    status="success",  # bot replied; failure 是 quality issue 不是 crash
+                    input_payload=attempt_input,
+                    output_payload=envelope.get("output_payload"),
+                    task_id=envelope["task_id"],
+                    run_id=envelope["run_id"],
+                    profile_id=envelope["profile_id"],
+                    output_type=envelope["output_type"],
+                    machine_record=envelope["machine_record"],
+                    source_refs=envelope["source_refs"],
+                    confidence=envelope["confidence"],
+                    retention_policy=envelope["retention_policy"],
+                    review_required=bool(failure),
                 )
+                if failure is not None:
+                    store.execute(
+                        "INSERT INTO failures (id, attempt_id, failure_type, context, status, created_at)"
+                        " VALUES (?, ?, ?, ?, 'open', ?)",
+                        [
+                            engine.generate_id(),
+                            attempt_id,
+                            failure["failure_type"],
+                            json_param(failure["context"]),
+                            datetime.now(timezone.utc).isoformat(),
+                        ],
+                    )
             finally:
                 store.close()
+            return True
         except Exception as exc:
-            # PG write failed → enqueue outbox (Q4=B).
-            logger.warning("OP-EVENT-LOG: kernel write failed (%s); enqueueing outbox", exc)
-            if self._op_outbox is not None:
-                try:
-                    self._op_outbox.enqueue(event_type, payload, idempotency_key)
-                except Exception as exc2:
-                    logger.warning("OP-EVENT-LOG: outbox enqueue also failed: %s", exc2)
+            logger.warning("OP-EVENT-LOG: PG write failed (%s); will enqueue outbox", exc)
+            return False
+
+    def _op_outbox_writer(self, payload: dict) -> str:
+        """Outbox flush_once callback. Replays a buffered payload back to PG.
+
+        Raises on PG failure so outbox keeps row pending. Returns kernel ack id
+        (we use attempt_id) on success.
+        """
+        ok = self._op_write_pg(
+            attempt_input=payload["attempt_input"],
+            envelope=payload["envelope"],
+            failure=payload.get("failure"),
+        )
+        if not ok:
+            raise RuntimeError("PG write still failing")
+        return payload["envelope"]["run_id"]
 
     def _write_op_event_logs(
         self,
@@ -947,28 +1026,23 @@ class LineAdapter(BasePlatformAdapter):
         result,            # DispatchResult OR None when router unavailable / dispatch raised
         fallback_path: str,
     ) -> None:
-        """Write outbound_decision event + maybe failure marker. Never raises.
+        """Write attempts + attempt_envelopes (+ failures if trigger hit).
 
-        Q1=B partial: failure marker is interim — written as events row with
-        event_type='op_failure_marker' carrying contract §9 failure_type in
-        payload. When attempts/failures FK chain is reconciled (v0.2 open #1),
-        migrate to proper failures table writes.
+        Q1=B: contract §6 envelope sidecar; Q2=B: task episode TTL+count+status;
+        Q3=B: domain_failure_code STRICT 4 enum; Q4=B: no follow-up detector;
+        Q5=B: retention_policy '30d' so daily cleanup cron can prune.
+        Never raises (catch-warn).
         """
         try:
             import uuid
-            from datetime import datetime, timezone
             from wannavegtour.redact import redact_text, hash_user_id, hash_message
 
-            # Three-layer IDs (Q3=B). First iteration: task_id derived from
-            # inbound message — episode tracking via same-task-id grouping is
-            # added later (v0.2 open #2).
+            # Inbound event id (links back to op_assistant_line_inbound row).
             message_id = (msg.get("id") if isinstance(msg, dict) else None) or f"no-msg-{uuid.uuid4()}"
             ns = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000007")
             inbound_event_id = str(uuid.uuid5(ns, message_id))
-            task_id = "task_" + inbound_event_id[:16]
-            run_id = "run_" + str(uuid.uuid4())[:13]
 
-            # Redacted fields (Q2 + Karpathy: no raw text in DB).
+            # Redacted fields (no raw text in DB).
             msg_text = (msg.get("text") if isinstance(msg, dict) else None) or ""
             redacted_preview, message_hash = redact_text(msg_text)
             uid = (source.get("userId") if isinstance(source, dict) else None) or ""
@@ -977,16 +1051,19 @@ class LineAdapter(BasePlatformAdapter):
             user_hash = hash_user_id(uid) if uid else "user:anon"
             conv_hash = ("conv:" + hash_user_id(gid)[5:]) if gid else "conv:dm"
 
+            # Task episode (Q2=B).
+            task_id, run_id, is_continuation = self._op_resolve_task_episode(user_hash, conv_hash)
+
             # Result-derived fields.
             intent = getattr(result, "intent", None) if result is not None else None
             worker = getattr(result, "worker", None) if result is not None else None
             action_obj = getattr(result, "action", None) if result is not None else None
-            router_action = action_obj.value if action_obj is not None else "FALLBACK"
+            router_action = action_obj.value if action_obj is not None else "fallback"
             reply_text = (getattr(result, "reply_text", None) if result is not None else None) or ""
             reply_hash = hash_message(reply_text) if reply_text else None
             reply_preview = redact_text(reply_text[:200])[0] if reply_text else ""
 
-            # Reply kind heuristic for first iteration.
+            # Reply kind classification.
             if fallback_path in ("dispatch_exception", "router_unavailable",
                                  "other_action_fallback", "reply_empty_fallback"):
                 reply_kind = "fallback"
@@ -998,114 +1075,103 @@ class LineAdapter(BasePlatformAdapter):
                 reply_kind = "historical_reply"
             elif intent == "price_edit_hint":
                 reply_kind = "refusal"
-            elif intent == "unclear" and router_action == "REPLY":
+            elif intent == "unclear" and router_action == "reply":
                 reply_kind = "unclear_ack"
-            elif router_action == "SILENT":
+            elif router_action == "silent":
                 reply_kind = "none"
             else:
                 reply_kind = "unknown"
 
-            now_iso = datetime.now(timezone.utc).isoformat()
-
-            # Decision log payload (Q1=B → events table, event_type='outbound_decision').
-            decision_payload = {
-                "contract_version": "v0",
-                "profile_id": "op-assistant-line",
-                "task_id": task_id,
-                "run_id": run_id,
-                "inbound_event_id": inbound_event_id,
-                "source_refs": [inbound_event_id],
-                "sensitivity_level": "confidential",
-                "retention_policy": "365d",
+            machine_record = {
                 "router_action": router_action,
                 "reply_kind": reply_kind,
                 "reply_hash": reply_hash,
                 "reply_preview_redacted": reply_preview,
-                "parser_result": {
-                    "intent": intent,
-                    "worker": worker,
-                    "fallback_path": fallback_path,
-                },
-                "context": {
-                    "user_hash": user_hash,
-                    "conversation_hash": conv_hash,
-                    "message_hash": message_hash,
-                    "message_preview_redacted": redacted_preview,
-                    "invocation_kind": (invocation or {}).get("kind"),
-                },
-                "ts": now_iso,
+                "parser_intent": intent,
+                "parser_worker": worker,
+                "fallback_path": fallback_path,
+                "invocation_kind": (invocation or {}).get("kind"),
+                "user_hash": user_hash,
+                "conversation_hash": conv_hash,
+                "message_hash": message_hash,
+                "message_preview_redacted": redacted_preview,
+                "task_continuation": is_continuation,
             }
 
-            # Failure marker (Q1=B partial: see method docstring for v1 cleanup).
-            failure_payload = None
+            envelope = {
+                "task_id": task_id,
+                "run_id": run_id,
+                "profile_id": "op-assistant-line",
+                "output_type": "outbound_decision",
+                "machine_record": machine_record,
+                "source_refs": [inbound_event_id],
+                "confidence": "unknown",
+                "retention_policy": "30d",
+                "output_payload": {"reply_kind": reply_kind, "reply_hash": reply_hash},
+            }
+
+            attempt_input = {
+                "inbound_event_id": inbound_event_id,
+                "message_hash": message_hash,
+                "message_preview_redacted": redacted_preview,
+                "invocation_kind": (invocation or {}).get("kind"),
+            }
+
+            # Failure trigger (Q3=B STRICT 4 domain codes; Q4=B no follow-up detector).
+            failure = None
             if intent == "unclear" and fallback_path in ("silent", "reply_sent"):
-                failure_payload = {
-                    **decision_payload,
-                    "failure_type": "outcome_failure",  # contract §9.1 enum
-                    "domain_failure_code": "missed_actionable_intent",
-                    "trigger_reason": "parser_returned_unclear",
-                    "severity": "low",
+                failure = {
+                    "failure_type": "outcome_failure",  # contract §9.1
+                    "context": {
+                        "domain_failure_code": "missed_actionable_intent",
+                        "trigger_reason": "parser_returned_unclear",
+                        "severity": "low",
+                        "inbound_event_id": inbound_event_id,
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "message_preview_redacted": redacted_preview,
+                    },
                 }
             elif fallback_path in ("dispatch_exception", "router_unavailable",
                                    "other_action_fallback", "reply_empty_fallback"):
                 contract_type = "hard_failure" if fallback_path == "dispatch_exception" else "quality_regression"
-                failure_payload = {
-                    **decision_payload,
+                failure = {
                     "failure_type": contract_type,
-                    "domain_failure_code": "fallback_path_used",
-                    "trigger_reason": "fallback_reply_sent",
-                    "severity": "medium",
+                    "context": {
+                        "domain_failure_code": "fallback_path_used",
+                        "trigger_reason": "fallback_reply_sent",
+                        "severity": "medium",
+                        "inbound_event_id": inbound_event_id,
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "message_preview_redacted": redacted_preview,
+                    },
                 }
 
-            # Writes.
-            self._op_kernel_write("outbound_decision", decision_payload, "op_dec_" + run_id)
-            if failure_payload is not None:
-                self._op_kernel_write("op_failure_marker", failure_payload, "op_fail_" + run_id)
+            # Try PG; on failure, enqueue outbox (Q4=B simplified).
+            ok = self._op_write_pg(attempt_input, envelope, failure)
+            if not ok and self._op_outbox is not None:
+                try:
+                    self._op_outbox.enqueue(
+                        "op_attempt_envelope",
+                        {"attempt_input": attempt_input, "envelope": envelope, "failure": failure},
+                        "op_run_" + run_id,
+                    )
+                except Exception as exc:
+                    logger.warning("OP-EVENT-LOG: outbox enqueue failed: %s", exc)
 
-            # Opportunistic outbox flush (Q4=B: no daemon, piggyback on writes).
+            # Opportunistic flush (no daemon).
             if self._op_outbox is not None:
                 try:
                     self._op_outbox.flush_once(self._op_outbox_writer)
                 except Exception as exc:
                     logger.debug("OP-EVENT-LOG: outbox flush_once skipped: %s", exc)
 
+            # Update task status based on outcome.
+            self._op_finalize_task(user_hash, conv_hash, reply_kind)
+
         except Exception as exc:
             logger.warning("OP-EVENT-LOG: write failed: %s", exc)
-
-    def _op_outbox_writer(self, payload: dict) -> str:
-        """Outbox flush_once callback. Writes one buffered payload back to PG.
-
-        Raises on PG failure so outbox keeps row pending. Returns kernel ack id
-        (we use event_id) on success.
-        """
-        import uuid
-        from datetime import datetime, timezone
-
-        kernel_url = os.environ.get("KERNEL_DATABASE_URL")
-        if not kernel_url:
-            raise RuntimeError("KERNEL_DATABASE_URL not set")
-        ns = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000008")
-        idem = payload.get("run_id") or payload.get("task_id") or str(uuid.uuid4())
-        event_id = str(uuid.uuid5(ns, "outbox_flush_" + idem))
-        repo = os.environ.get(
-            "WANNAVEGTOUR_REPO_PATH",
-            "/home/wannavegtour/Desktop/AI Native Company/Gary",
-        )
-        if repo not in sys.path:
-            sys.path.insert(0, repo)
-        from closed_loop_kernel.store import KernelStore, json_param
-        event_type = "outbound_decision" if "failure_type" not in payload else "op_failure_marker"
-        store = KernelStore.from_url(kernel_url)
-        try:
-            store.execute(
-                "INSERT INTO events (id, event_type, payload, created_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
-                [event_id, event_type, json_param(payload),
-                 datetime.now(timezone.utc).isoformat()],
-            )
-        finally:
-            store.close()
-        return event_id
 
     async def disconnect(self) -> None:
         self._mark_disconnected()

@@ -124,6 +124,96 @@ class KernelEngine:
                     ],
                 )
 
+    def create_attempt_with_envelope(
+        self,
+        *,
+        event_id: str | None,
+        status: str,                          # "success" | "failed"
+        input_payload: dict[str, Any],
+        output_payload: dict[str, Any] | None = None,
+        error_message: str | None = None,
+        # envelope fields (§6 required)
+        task_id: str,
+        run_id: str,
+        profile_id: str,
+        output_type: str,
+        machine_record: dict[str, Any],
+        source_refs: list[Any],
+        confidence: str,                      # "low" | "medium" | "high" | "unknown"
+        retention_policy: str,
+        # envelope fields (§6 optional)
+        human_artifact_path: str | None = None,
+        recommended_next_actions: list[Any] | None = None,
+        verification_required: bool = False,
+        review_required: bool = False,
+        content_hash: str | None = None,
+    ) -> str:
+        """Insert `attempts` + `attempt_envelopes` rows in one transaction.
+
+        Sidecar envelope (per docs/company-data-contract-v0.md §6) carries the
+        contract-required fields. Old `attempts` consumers see no schema change.
+
+        Returns the new attempt_id (UUID string).
+        """
+        if status not in {"success", "failed"}:
+            raise ValueError("status must be success or failed")
+        if confidence not in {"low", "medium", "high", "unknown"}:
+            raise ValueError("confidence must be one of low/medium/high/unknown")
+
+        attempt_id = self.generate_id()
+        if content_hash is None:
+            hash_input = json.dumps(
+                {"input": input_payload, "output": output_payload},
+                sort_keys=True, ensure_ascii=False, default=str,
+            )
+            content_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+
+        with self.store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO attempts (id, event_id, status, input, output, error_message, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    attempt_id,
+                    event_id,
+                    status,
+                    _json(input_payload),
+                    _json(output_payload) if output_payload is not None else None,
+                    error_message,
+                    _now(),
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO attempt_envelopes (
+                    id, attempt_id, task_id, run_id, profile_id, output_type,
+                    human_artifact_path, machine_record, source_refs, confidence,
+                    recommended_next_actions, verification_required, review_required,
+                    retention_policy, content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    self.generate_id(),
+                    attempt_id,
+                    task_id,
+                    run_id,
+                    profile_id,
+                    output_type,
+                    human_artifact_path,
+                    _json(machine_record),
+                    _json(source_refs),
+                    confidence,
+                    _json(recommended_next_actions or []),
+                    verification_required,
+                    review_required,
+                    retention_policy,
+                    content_hash,
+                    _now(),
+                ],
+            )
+        return attempt_id
+
     def create_artifact(self, name: str, artifact_type: str, content: str) -> str:
         version = (self.store.scalar("SELECT MAX(version) FROM artifacts WHERE name = ?", [name]) or 0) + 1
         artifact_id = self.generate_id()

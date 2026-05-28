@@ -324,5 +324,81 @@ class SandboxLintTests(unittest.TestCase):
                 engine.validate_sql_patch(sql)
 
 
+class AttemptEnvelopeTests(unittest.TestCase):
+    """Test create_attempt_with_envelope sidecar helper (Phase 3, Q1=B)."""
+
+    def setUp(self):
+        self.store = build_postgres_store()
+        self.addCleanup(self.store.close)
+        self.engine = KernelEngine(self.store)
+
+    def test_writes_both_tables_in_one_transaction(self):
+        attempt_id = self.engine.create_attempt_with_envelope(
+            event_id=None,
+            status="success",
+            input_payload={"query": "test"},
+            output_payload={"reply": "hi"},
+            task_id="task_test_1",
+            run_id="run_test_1",
+            profile_id="op-assistant-line",
+            output_type="outbound_decision",
+            machine_record={"router_action": "REPLY"},
+            source_refs=["evt_1"],
+            confidence="unknown",
+            retention_policy="30d",
+        )
+
+        attempts = self.store.fetch_all(
+            "SELECT * FROM attempts WHERE id = ?", [attempt_id]
+        )
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]["status"], "success")
+
+        envelopes = self.store.fetch_all(
+            "SELECT * FROM attempt_envelopes WHERE attempt_id = ?", [attempt_id]
+        )
+        self.assertEqual(len(envelopes), 1)
+        env = envelopes[0]
+        self.assertEqual(env["task_id"], "task_test_1")
+        self.assertEqual(env["run_id"], "run_test_1")
+        self.assertEqual(env["profile_id"], "op-assistant-line")
+        self.assertEqual(env["confidence"], "unknown")
+        self.assertEqual(env["retention_policy"], "30d")
+        self.assertIsNotNone(env["content_hash"])
+        self.assertEqual(len(env["content_hash"]), 64)  # sha256 hex
+
+    def test_rejects_invalid_confidence(self):
+        with self.assertRaisesRegex(ValueError, "confidence"):
+            self.engine.create_attempt_with_envelope(
+                event_id=None, status="success",
+                input_payload={}, task_id="t", run_id="r", profile_id="p",
+                output_type="x", machine_record={}, source_refs=[],
+                confidence="invalid", retention_policy="30d",
+            )
+
+    def test_rejects_invalid_status(self):
+        with self.assertRaisesRegex(ValueError, "status"):
+            self.engine.create_attempt_with_envelope(
+                event_id=None, status="weird",
+                input_payload={}, task_id="t", run_id="r", profile_id="p",
+                output_type="x", machine_record={}, source_refs=[],
+                confidence="unknown", retention_policy="30d",
+            )
+
+    def test_envelope_is_append_only(self):
+        attempt_id = self.engine.create_attempt_with_envelope(
+            event_id=None, status="success",
+            input_payload={"q": "a"},
+            task_id="t1", run_id="r1", profile_id="p",
+            output_type="x", machine_record={}, source_refs=[],
+            confidence="low", retention_policy="30d",
+        )
+        with self.assertRaisesRegex(Exception, "IMPERMISSIBLE"):
+            self.store.execute(
+                "UPDATE attempt_envelopes SET profile_id = 'hacked' WHERE attempt_id = ?",
+                [attempt_id],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
