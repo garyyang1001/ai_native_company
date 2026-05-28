@@ -5,8 +5,12 @@ def render_postgres_schema() -> str:
     return POSTGRES_SCHEMA.strip() + "\n"
 
 
+# `events` is NOT append-only — it's a sensor log that may be pruned by
+# retention cron (Gary 2026-05-28 Phase 4 decision; see
+# docs/plans/2026-05-28-learning-loop-design-v0.2.md Q5).
+# attempts / attempt_envelopes / failures / approvals / artifacts remain
+# append-only because they carry contract-level facts.
 APPEND_ONLY_TABLES = [
-    "events",
     "attempt_lifecycle_events",
     "attempts",
     "attempt_envelopes",
@@ -17,13 +21,17 @@ APPEND_ONLY_TABLES = [
 
 
 def _append_only_triggers() -> str:
-    return "\n\n".join(
+    sql = "\n\n".join(
         f"""DROP TRIGGER IF EXISTS trg_protect_{table} ON {table};
 CREATE TRIGGER trg_protect_{table}
 BEFORE UPDATE OR DELETE ON {table}
 FOR EACH ROW EXECUTE FUNCTION prevent_mutation();"""
         for table in APPEND_ONLY_TABLES
     )
+    # Explicitly drop any historical trigger on `events` left over from
+    # earlier deployments that listed it as append-only.
+    sql += "\n\nDROP TRIGGER IF EXISTS trg_protect_events ON events;"
+    return sql
 
 
 POSTGRES_SCHEMA = f"""
