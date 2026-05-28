@@ -42,9 +42,9 @@ context.trigger_reason
 | Bot violates a documented company/kernel contract. | `contract_violation` | matching domain code |
 | Runtime hard error prevents normal handling. | `hard_failure` | matching domain code |
 
-## `domain_failure_code` enum
+## `domain_failure_code` enum (STRICT — 2026-05-28 Gary 鎖定)
 
-First version:
+**Fixed 4 values. No `other` catchall. New values require explicit doc review (v0.2 → v0.3 governance flow).**
 
 ```text
 missed_actionable_intent
@@ -55,21 +55,22 @@ unexpected_silent
 
 These are OP domain observations. They are not canonical company `failure_type` values.
 
-## `trigger_reason` enum
+Adapter writers MUST reject `domain_failure_code` values outside this set. If a new failure mode is observed in production, the writer should fall back to `failure_type` enum from contract §9 with no `domain_failure_code`, and the case escalates to Gary via `manual_review` trigger for the next governance round.
 
-First version:
+## `trigger_reason` enum (2026-05-28 Gary 鎖定 — 移除自動糾正偵測)
 
 ```text
 parser_returned_unclear
 fallback_reply_sent
-negative_followup_pattern
 gary_marked_bad
 manual_review
 ```
 
 `trigger_reason` explains why the detector wrote or suggested a failure.
 
-It does not replace contract fields such as `detected_by` or `detection_timing`.
+`negative_followup_pattern` was **removed** per Gary 2026-05-28: 糾正信號改由定時 events audit + manual_review 處理,不寫自動 detector。
+
+`trigger_reason` does not replace contract fields such as `detected_by` or `detection_timing`.
 
 ## Outbound Decision Event
 

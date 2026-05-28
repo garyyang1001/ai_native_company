@@ -328,14 +328,32 @@ journalctl --user -u hermes-gateway-op-assistant.service -n 100
 
 ---
 
-## 開放問題(待 Gary 對齊或之後決定)
+## 開放問題(2026-05-28 Gary 拍板)
 
-1. **`attempts` schema 跟 contract §6 Agent Output Envelope 怎麼 reconcile?** — first iteration 用 attempts 表既有欄位,v1 再對齊。
-2. **`task_id` 開新 task 的精確規則** — 同 user/room + TTL 30-60 分鐘 + 看起來糾正/補充/追問 → 同 task。實作時要寫 `should_continue_task()` 函式。
-3. **`domain_failure_code` 字串可擴充嗎?** — 首版 4 個,實際資料可能會出現新類型。要不要由 Gary 標時動態加,還是只允許這 4 個 + `other`?
-4. **`negative_followup_pattern` detector 用什麼判**? — 暫時用 keyword list(「不是」/「我問」/「沒回到」等)。要不要更聰明?LLM 判太貴。
-5. **`closed_loop_kernel.events` JSONB 之後 query 效率** — 假設 v0 階段資料量低 OK,但要不要先加 GIN index 在 payload?暫不加。
-6. **service restart 時機** — Step 6 重啟,但 LINE 訊息正在進來會掉嗎?Hermes 有 graceful shutdown 嗎?**這條 Codex 件 1 hidden assumption 提過,要驗**。
+Gary 2026-05-28 對 6 個開放問題逐項回覆 + Codex xhigh 諮詢 Q1/Q2 後鎖定:
+
+1. **`attempts` schema 對齊 contract §6** — ✅ **要做。策略 X(Codex 推薦):並排新表 `attempt_envelopes` FK 到舊 `attempts`,舊表不動,15+ downstream consumer 完全不斷**。實作在 Phase 2 DDL + Phase 3 helper + adapter rewrite。具體 schema 12 欄位含 `task_id / run_id / profile_id / output_type / human_artifact_path / machine_record / source_refs / confidence / recommended_next_actions / verification_required / review_required / retention_policy + content_hash`。append-only(prevent_mutation trigger)。舊 attempts row **不回填**,新寫入用 helper `create_attempt_with_envelope()` 同 transaction 寫兩張表。
+
+2. **`task_id` 開新 task 規則** — ✅ **方案 2(Codex 推薦):TTL + 訊息計數 + task 狀態**。具體:
+   - 同 user_hash + 同 room_hash + 前一個 task 還 open + 10 分鐘內 + 計數 < 3 → 同 task_id
+   - 否則 → 新 task_id
+   - task open/closed 判定:bot 回 `availability_reply / historical_reply` 等具體答案 → closed;回 fallback / unclear_ack / silent / failure-triggered → 仍 open
+   - 不需要糾正 detector(跟 Q4 一致)
+
+3. **`domain_failure_code` 嚴格鎖定** — ✅ **固定 4 個,新增要走 review**:
+   - `missed_actionable_intent` / `reply_mismatch` / `false_positive_reply` / `unexpected_silent`
+   - **不允許自由新增、沒有 `other` catchall**
+   - 真出現新類型 → 走 v0.2 → v0.3 文件 review 流程
+
+4. **糾正自動偵測** — ❌ **不做**。從 `trigger_reason` 拿掉 `negative_followup_pattern`。Gary 改成「定時撈 events 紀錄,人工 audit」處理糾正信號。保留 `parser_returned_unclear` / `fallback_reply_sent` / `gary_marked_bad` / `manual_review` 4 條 trigger。
+
+5. **資料保留** — ✅ **30 天 retention,學完就清**。Phase 4 寫一條 cron `scripts/op_assistant/op_assistant_retention_cleanup.py`:
+   - 每日 04:00 跑
+   - 刪 `events` 表 30 天前 row(`op_assistant_line_inbound / outbound_decision / op_failure_marker` 等)
+   - 刪 `attempt_envelopes` 表 30 天前 row(沿用 FK CASCADE 或同步刪)
+   - **不刪** `improvement_candidates / replays / approvals / artifacts / pattern_routes`(這些是「已學到的東西」,長期保留)
+
+6. **Service restart graceful shutdown** — ⏸️ **先擱,V1 階段再評**。Gary 認為 Hermes 應該自己處理,沒急。LINE webhook 有 `webhookEventId` 去重(adapter.py:1189 已有),重送可被擋。
 
 ---
 
