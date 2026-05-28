@@ -22,6 +22,7 @@ This index is updated whenever a plan is added, superseded, or archived. If you'
 
 | Plan | Status | 一行說明 |
 |---|---|---|
+| `2026-05-28-system-state-overview.md` | **snapshot canonical** | 2026-05-28 系統全局 snapshot:V0.2 已 LIVE 部分 + V1 設計部分 + 每元件對到的程式 + Mermaid 流程圖 + 色碼狀態。新 agent 一份看完 |
 | `2026-05-28-learning-loop-design-v0.2.md` | **v0.2 draft canonical** | Karpathy reframe 後的 learning loop:Q1=B failures 表對齊 contract §9 / Q3=B 三層 ID / Q4=B 簡化 outbox。**取代 v0.1** |
 | `../contracts/op_assistant_event_mapping_v0.md` | **mapping canonical** | OP scenario → contract §9 `failure_type` enum 映射;`domain_failure_code` / `trigger_reason` 字串約定。**不是新契約,是契約解讀** |
 | `2026-05-26-op-kernel-db-operations-v2.md` | **v2.1 canonical** | OP kernel DB schema + 4 cron + backup + 14-step lifecycle + pattern_routes 退場機制 |
