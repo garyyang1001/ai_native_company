@@ -9,6 +9,7 @@ APPEND_ONLY_TABLES = [
     "events",
     "attempt_lifecycle_events",
     "attempts",
+    "attempt_envelopes",
     "tool_calls",
     "decisions",
     "approvals",
@@ -111,6 +112,35 @@ CREATE TABLE IF NOT EXISTS attempts (
     input JSONB NOT NULL,
     output JSONB,
     error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Agent Output Envelope per docs/company-data-contract-v0.md §6.
+-- Sidecar to `attempts` so we can carry contract-required fields without
+-- breaking the 15+ existing consumers of `attempts`. See
+-- docs/plans/2026-05-28-learning-loop-design-v0.2.md (Phase 2, Q1=B).
+CREATE TABLE IF NOT EXISTS attempt_envelopes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    attempt_id UUID NOT NULL UNIQUE REFERENCES attempts(id) ON DELETE RESTRICT,
+
+    task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+
+    output_type TEXT NOT NULL,
+    human_artifact_path TEXT,
+    machine_record JSONB NOT NULL,
+    source_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+    confidence TEXT NOT NULL CHECK (
+        confidence IN ('low', 'medium', 'high', 'unknown')
+    ),
+    recommended_next_actions JSONB NOT NULL DEFAULT '[]'::jsonb,
+    verification_required BOOLEAN NOT NULL DEFAULT FALSE,
+    review_required BOOLEAN NOT NULL DEFAULT FALSE,
+    retention_policy TEXT NOT NULL,
+
+    content_hash TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
