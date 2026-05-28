@@ -1,0 +1,120 @@
+"""Register / verify the Telegram Bot webhook for telegram-op-control.
+
+V0.3 Phase 1 ops script. Not a runtime plugin — run manually after setting
+TELEGRAM_BOT_TOKEN / TELEGRAM_WEBHOOK_SECRET / TELEGRAM_PUBLIC_URL.
+
+Reads creds from:
+
+* ``~/.hermes/profiles/${HERMES_PROFILE:-op-assistant}/.env`` then
+* ``~/.hermes/.env``
+
+Calls Telegram Bot API ``setWebhook`` with:
+
+* ``url = ${TELEGRAM_PUBLIC_URL}/telegram/webhook``
+* ``secret_token = ${TELEGRAM_WEBHOOK_SECRET}``
+* ``allowed_updates = ["message", "callback_query", "edited_message"]``
+* ``drop_pending_updates = True``
+
+Then calls ``getWebhookInfo`` and pretty-prints the result.
+
+Usage::
+
+    /home/wannavegtour/.hermes/hermes-agent/venv/bin/python \\
+        scripts/op_assistant/op_assistant_telegram_setwebhook.py
+    # add --dry-run to skip the actual setWebhook call
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import requests
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+def _load_env() -> None:
+    profile = os.environ.get("HERMES_PROFILE", "op-assistant")
+    _load_env_file(Path.home() / ".hermes" / "profiles" / profile / ".env")
+    _load_env_file(Path.home() / ".hermes" / ".env")
+
+
+def _set_webhook(token: str, url: str, secret: str) -> dict:
+    api = f"https://api.telegram.org/bot{token}/setWebhook"
+    r = requests.post(api, json={
+        "url": url,
+        "secret_token": secret,
+        "allowed_updates": ["message", "callback_query", "edited_message"],
+        "drop_pending_updates": True,
+        "max_connections": 40,
+    }, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_webhook_info(token: str) -> dict:
+    api = f"https://api.telegram.org/bot{token}/getWebhookInfo"
+    r = requests.get(api, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def run(dry_run: bool = False) -> int:
+    _load_env()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+    public_url = os.environ.get("TELEGRAM_PUBLIC_URL", "").rstrip("/")
+
+    missing = [k for k, v in [
+        ("TELEGRAM_BOT_TOKEN", token),
+        ("TELEGRAM_WEBHOOK_SECRET", secret),
+        ("TELEGRAM_PUBLIC_URL", public_url),
+    ] if not v]
+    if missing:
+        print(f"missing env: {', '.join(missing)}", file=sys.stderr)
+        return 2
+
+    webhook_url = f"{public_url}/telegram/webhook"
+    print(f"target webhook url: {webhook_url}")
+
+    if dry_run:
+        print("--dry-run: skipping setWebhook call")
+    else:
+        result = _set_webhook(token, webhook_url, secret)
+        if not result.get("ok"):
+            print(f"setWebhook failed: {json.dumps(result, ensure_ascii=False)}",
+                  file=sys.stderr)
+            return 1
+        print(f"setWebhook ok: {result.get('description')}")
+
+    info = _get_webhook_info(token)
+    # Strip secret-related fields before printing (defense-in-depth).
+    info_view = info.get("result", info)
+    print("getWebhookInfo:")
+    print(json.dumps(info_view, ensure_ascii=False, indent=2))
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="skip setWebhook call, still print getWebhookInfo")
+    args = parser.parse_args()
+    sys.exit(run(dry_run=args.dry_run))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,52 @@
+name: telegram-op-control
+label: Telegram (OP control plane)
+version: 0.1.0
+description: >
+  Telegram Bot inbound webhook for OP Assistant V0.3 control plane.
+  Runs as a standalone aiohttp service (NOT a Hermes platform adapter):
+  receives Telegram updates, verifies the secret token, dedupes by
+  update_id, enforces a chat_id allowlist, and writes events.telegram_inbound
+  rows into op_assistant_kernel.
+
+  Phase 1 scope is webhook reception + audit logging only. Inline keyboard
+  pushes happen from daily_curate (Phase 3). Callback dispatch
+  (approve/reject/KILL) is added in Phase 4. Approval audit in Phase 5.
+
+  Reference design: docs/plans/2026-05-28-op-assistant-v0.3-design.md §5 Phase 1.
+author: Gary Yang (wannavegtour) + Claude
+# This plugin is NOT a Hermes platform or tools plugin — leaving
+# `provides_tools` empty and not exporting `register()` keeps Hermes
+# plugin discovery from treating us as a platform adapter. Runtime is
+# `python plugins/telegram-op-control/adapter.py` under systemd.
+provides_tools: []
+requires_env:
+  - name: TELEGRAM_BOT_TOKEN
+    description: "Telegram Bot API token from @BotFather (already used by daily_curate push)"
+    prompt: "Telegram bot token"
+    url: "https://core.telegram.org/bots#botfather"
+    password: true
+  - name: TELEGRAM_WEBHOOK_SECRET
+    description: "Random 32-char hex token shared with Telegram setWebhook — verifies inbound is really from Telegram (compare_digest)"
+    prompt: "Webhook secret"
+    password: true
+  - name: KERNEL_DATABASE_URL
+    description: "PostgreSQL DSN for closed_loop_kernel (op-assistant) — for events.telegram_inbound writes"
+    prompt: "Kernel DB URL"
+    password: true
+optional_env:
+  - name: TELEGRAM_WEBHOOK_PORT
+    description: "Webhook listen port (default 8647 — avoid 8646 used by op-assistant-line)"
+    prompt: "Webhook port"
+    password: false
+  - name: TELEGRAM_WEBHOOK_HOST
+    description: "Webhook bind host (default 0.0.0.0)"
+    prompt: "Webhook host"
+    password: false
+  - name: TELEGRAM_ALLOWED_CHATS
+    description: "Comma-separated chat IDs allowed to trigger control-plane actions. Empty = reject all (fail-closed)"
+    prompt: "Allowed chat IDs"
+    password: false
+  - name: TELEGRAM_PUBLIC_URL
+    description: "Public HTTPS base URL (e.g. https://wannavegtour.tail<...>.ts.net) used by setwebhook script"
+    prompt: "Public HTTPS URL"
+    password: false
