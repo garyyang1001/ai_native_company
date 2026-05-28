@@ -23,6 +23,7 @@ This index is updated whenever a plan is added, superseded, or archived. If you'
 | Plan | Status | 一行說明 |
 |---|---|---|
 | `2026-05-28-learning-loop-design-v0.2.md` | **v0.2 draft canonical** | Karpathy reframe 後的 learning loop:Q1=B failures 表對齊 contract §9 / Q3=B 三層 ID / Q4=B 簡化 outbox。**取代 v0.1** |
+| `../contracts/op_assistant_event_mapping_v0.md` | **mapping canonical** | OP scenario → contract §9 `failure_type` enum 映射;`domain_failure_code` / `trigger_reason` 字串約定。**不是新契約,是契約解讀** |
 | `2026-05-26-op-kernel-db-operations-v2.md` | **v2.1 canonical** | OP kernel DB schema + 4 cron + backup + 14-step lifecycle + pattern_routes 退場機制 |
 | `2026-05-26-op-kernel-c1-c4-execution-report.md` | **execution log** | C1-C4 cron + backup script 真實落地紀錄,Wave 1+2 fixes |
 
