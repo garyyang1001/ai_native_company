@@ -23,7 +23,8 @@ This index is updated whenever a plan is added, superseded, or archived. If you'
 | Plan | Status | 一行說明 |
 |---|---|---|
 | `2026-05-28-system-state-overview.md` | **snapshot canonical** | 2026-05-28 系統全局 snapshot:V0.2 已 LIVE 部分 + V1 設計部分 + 每元件對到的程式 + Mermaid 流程圖 + 色碼狀態。新 agent 一份看完 |
-| `2026-05-28-learning-loop-design-v0.2.md` | **v0.2 draft canonical** | Karpathy reframe 後的 learning loop:Q1=B failures 表對齊 contract §9 / Q3=B 三層 ID / Q4=B 簡化 outbox。**取代 v0.1** |
+| `2026-05-28-op-assistant-v0.3-design.md` | **v0.3 design canonical(2026-05-29 拍板)** | Telegram 雙向 + 學習迴圈生效。獨立 telegram-op-control plugin + improvement_candidates 擴充 + inline keyboard 按鈕 + sandbox 4-metric + canary 5 通/8hr/30% + KILL 按鈕 + append data list only。Dial D1-D5 全半自動有護欄 |
+| `2026-05-28-learning-loop-design-v0.2.md` | **v0.2 ship complete** | Karpathy reframe 後的 learning loop:Q1=B failures 表對齊 contract §9 / Q3=B 三層 ID / Q4=B 簡化 outbox。Phase 1-5 已 ship |
 | `../contracts/op_assistant_event_mapping_v0.md` | **mapping canonical** | OP scenario → contract §9 `failure_type` enum 映射;`domain_failure_code` / `trigger_reason` 字串約定。**不是新契約,是契約解讀** |
 | `2026-05-26-op-kernel-db-operations-v2.md` | **v2.1 canonical** | OP kernel DB schema + 4 cron + backup + 14-step lifecycle + pattern_routes 退場機制 |
 | `2026-05-26-op-kernel-c1-c4-execution-report.md` | **execution log** | C1-C4 cron + backup script 真實落地紀錄,Wave 1+2 fixes |
