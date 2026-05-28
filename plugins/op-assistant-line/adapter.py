@@ -875,6 +875,238 @@ class LineAdapter(BasePlatformAdapter):
             self._wc_line_event_cls = None
             self._wc_dispatch_action_cls = None
 
+        # OP event log outbox (Q4=B: SQLite enqueue + flush_once, no daemon).
+        # See docs/plans/2026-05-28-learning-loop-design-v0.2.md.
+        self._op_outbox = None
+        try:
+            from wannavegtour.outbox import KernelOutbox
+            outbox_dir = Path.home() / ".hermes" / "run" / "wannavegtour"
+            outbox_dir.mkdir(parents=True, exist_ok=True)
+            self._op_outbox = KernelOutbox(str(outbox_dir / "outbox.sqlite"))
+            logger.info("OP-EVENT-LOG: outbox initialized at %s", outbox_dir / "outbox.sqlite")
+        except Exception as exc:
+            logger.warning("OP-EVENT-LOG: outbox init failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # OP event log helpers (decision log + failure marker + outbox).
+    # See docs/plans/2026-05-28-learning-loop-design-v0.2.md.
+    # ------------------------------------------------------------------
+
+    def _op_kernel_write(self, event_type: str, payload: dict, idempotency_key: str) -> None:
+        """Write one row to closed_loop_kernel.events. On failure → enqueue outbox.
+
+        Never raises (catch-warn). Q4=B simplified outbox semantics:
+        enqueue + best-effort flush_once at end of caller. No daemon.
+        """
+        import uuid
+        from datetime import datetime, timezone
+
+        kernel_url = os.environ.get("KERNEL_DATABASE_URL")
+        if not kernel_url:
+            logger.debug("OP-EVENT-LOG: KERNEL_DATABASE_URL not set; skip kernel write")
+            return
+
+        ns = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000008")
+        event_id = str(uuid.uuid5(ns, idempotency_key))
+        created_iso = datetime.now(timezone.utc).isoformat()
+
+        repo = os.environ.get(
+            "WANNAVEGTOUR_REPO_PATH",
+            "/home/wannavegtour/Desktop/AI Native Company/Gary",
+        )
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+
+        try:
+            from closed_loop_kernel.store import KernelStore, json_param
+            store = KernelStore.from_url(kernel_url)
+            try:
+                store.execute(
+                    "INSERT INTO events (id, event_type, payload, created_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+                    [event_id, event_type, json_param(payload), created_iso],
+                )
+            finally:
+                store.close()
+        except Exception as exc:
+            # PG write failed → enqueue outbox (Q4=B).
+            logger.warning("OP-EVENT-LOG: kernel write failed (%s); enqueueing outbox", exc)
+            if self._op_outbox is not None:
+                try:
+                    self._op_outbox.enqueue(event_type, payload, idempotency_key)
+                except Exception as exc2:
+                    logger.warning("OP-EVENT-LOG: outbox enqueue also failed: %s", exc2)
+
+    def _write_op_event_logs(
+        self,
+        *,
+        msg: dict,
+        event: dict,
+        source: dict,
+        invocation: dict | None,
+        result,            # DispatchResult OR None when router unavailable / dispatch raised
+        fallback_path: str,
+    ) -> None:
+        """Write outbound_decision event + maybe failure marker. Never raises.
+
+        Q1=B partial: failure marker is interim — written as events row with
+        event_type='op_failure_marker' carrying contract §9 failure_type in
+        payload. When attempts/failures FK chain is reconciled (v0.2 open #1),
+        migrate to proper failures table writes.
+        """
+        try:
+            import uuid
+            from datetime import datetime, timezone
+            from wannavegtour.redact import redact_text, hash_user_id, hash_message
+
+            # Three-layer IDs (Q3=B). First iteration: task_id derived from
+            # inbound message — episode tracking via same-task-id grouping is
+            # added later (v0.2 open #2).
+            message_id = (msg.get("id") if isinstance(msg, dict) else None) or f"no-msg-{uuid.uuid4()}"
+            ns = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000007")
+            inbound_event_id = str(uuid.uuid5(ns, message_id))
+            task_id = "task_" + inbound_event_id[:16]
+            run_id = "run_" + str(uuid.uuid4())[:13]
+
+            # Redacted fields (Q2 + Karpathy: no raw text in DB).
+            msg_text = (msg.get("text") if isinstance(msg, dict) else None) or ""
+            redacted_preview, message_hash = redact_text(msg_text)
+            uid = (source.get("userId") if isinstance(source, dict) else None) or ""
+            gid = (source.get("groupId") if isinstance(source, dict) else None) \
+                  or (source.get("roomId") if isinstance(source, dict) else None) or ""
+            user_hash = hash_user_id(uid) if uid else "user:anon"
+            conv_hash = ("conv:" + hash_user_id(gid)[5:]) if gid else "conv:dm"
+
+            # Result-derived fields.
+            intent = getattr(result, "intent", None) if result is not None else None
+            worker = getattr(result, "worker", None) if result is not None else None
+            action_obj = getattr(result, "action", None) if result is not None else None
+            router_action = action_obj.value if action_obj is not None else "FALLBACK"
+            reply_text = (getattr(result, "reply_text", None) if result is not None else None) or ""
+            reply_hash = hash_message(reply_text) if reply_text else None
+            reply_preview = redact_text(reply_text[:200])[0] if reply_text else ""
+
+            # Reply kind heuristic for first iteration.
+            if fallback_path in ("dispatch_exception", "router_unavailable",
+                                 "other_action_fallback", "reply_empty_fallback"):
+                reply_kind = "fallback"
+            elif intent == "help_request":
+                reply_kind = "help_text"
+            elif intent == "availability_check":
+                reply_kind = "availability_reply"
+            elif intent == "historical_lookup":
+                reply_kind = "historical_reply"
+            elif intent == "price_edit_hint":
+                reply_kind = "refusal"
+            elif intent == "unclear" and router_action == "REPLY":
+                reply_kind = "unclear_ack"
+            elif router_action == "SILENT":
+                reply_kind = "none"
+            else:
+                reply_kind = "unknown"
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            # Decision log payload (Q1=B → events table, event_type='outbound_decision').
+            decision_payload = {
+                "contract_version": "v0",
+                "profile_id": "op-assistant-line",
+                "task_id": task_id,
+                "run_id": run_id,
+                "inbound_event_id": inbound_event_id,
+                "source_refs": [inbound_event_id],
+                "sensitivity_level": "confidential",
+                "retention_policy": "365d",
+                "router_action": router_action,
+                "reply_kind": reply_kind,
+                "reply_hash": reply_hash,
+                "reply_preview_redacted": reply_preview,
+                "parser_result": {
+                    "intent": intent,
+                    "worker": worker,
+                    "fallback_path": fallback_path,
+                },
+                "context": {
+                    "user_hash": user_hash,
+                    "conversation_hash": conv_hash,
+                    "message_hash": message_hash,
+                    "message_preview_redacted": redacted_preview,
+                    "invocation_kind": (invocation or {}).get("kind"),
+                },
+                "ts": now_iso,
+            }
+
+            # Failure marker (Q1=B partial: see method docstring for v1 cleanup).
+            failure_payload = None
+            if intent == "unclear" and fallback_path in ("silent", "reply_sent"):
+                failure_payload = {
+                    **decision_payload,
+                    "failure_type": "outcome_failure",  # contract §9.1 enum
+                    "domain_failure_code": "missed_actionable_intent",
+                    "trigger_reason": "parser_returned_unclear",
+                    "severity": "low",
+                }
+            elif fallback_path in ("dispatch_exception", "router_unavailable",
+                                   "other_action_fallback", "reply_empty_fallback"):
+                contract_type = "hard_failure" if fallback_path == "dispatch_exception" else "quality_regression"
+                failure_payload = {
+                    **decision_payload,
+                    "failure_type": contract_type,
+                    "domain_failure_code": "fallback_path_used",
+                    "trigger_reason": "fallback_reply_sent",
+                    "severity": "medium",
+                }
+
+            # Writes.
+            self._op_kernel_write("outbound_decision", decision_payload, "op_dec_" + run_id)
+            if failure_payload is not None:
+                self._op_kernel_write("op_failure_marker", failure_payload, "op_fail_" + run_id)
+
+            # Opportunistic outbox flush (Q4=B: no daemon, piggyback on writes).
+            if self._op_outbox is not None:
+                try:
+                    self._op_outbox.flush_once(self._op_outbox_writer)
+                except Exception as exc:
+                    logger.debug("OP-EVENT-LOG: outbox flush_once skipped: %s", exc)
+
+        except Exception as exc:
+            logger.warning("OP-EVENT-LOG: write failed: %s", exc)
+
+    def _op_outbox_writer(self, payload: dict) -> str:
+        """Outbox flush_once callback. Writes one buffered payload back to PG.
+
+        Raises on PG failure so outbox keeps row pending. Returns kernel ack id
+        (we use event_id) on success.
+        """
+        import uuid
+        from datetime import datetime, timezone
+
+        kernel_url = os.environ.get("KERNEL_DATABASE_URL")
+        if not kernel_url:
+            raise RuntimeError("KERNEL_DATABASE_URL not set")
+        ns = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000008")
+        idem = payload.get("run_id") or payload.get("task_id") or str(uuid.uuid4())
+        event_id = str(uuid.uuid5(ns, "outbox_flush_" + idem))
+        repo = os.environ.get(
+            "WANNAVEGTOUR_REPO_PATH",
+            "/home/wannavegtour/Desktop/AI Native Company/Gary",
+        )
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        from closed_loop_kernel.store import KernelStore, json_param
+        event_type = "outbound_decision" if "failure_type" not in payload else "op_failure_marker"
+        store = KernelStore.from_url(kernel_url)
+        try:
+            store.execute(
+                "INSERT INTO events (id, event_type, payload, created_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+                [event_id, event_type, json_param(payload),
+                 datetime.now(timezone.utc).isoformat()],
+            )
+        finally:
+            store.close()
+        return event_id
+
     async def disconnect(self) -> None:
         self._mark_disconnected()
 
@@ -1092,6 +1324,10 @@ class LineAdapter(BasePlatformAdapter):
 
                 if result.action == self._wc_dispatch_action_cls.SILENT:
                     # Passive observe — already logged inbound, nothing else to do.
+                    self._write_op_event_logs(
+                        msg=msg, event=event, source=source, invocation=invocation,
+                        result=result, fallback_path="silent",
+                    )
                     return
 
                 if result.action == self._wc_dispatch_action_cls.REPLY:
@@ -1117,11 +1353,18 @@ class LineAdapter(BasePlatformAdapter):
                                 "OP-FORK-DETERMINISTIC: reply send failed: %s",
                                 exc,
                             )
+                        self._write_op_event_logs(
+                            msg=msg, event=event, source=source, invocation=invocation,
+                            result=result, fallback_path="reply_sent",
+                        )
                         return
                     logger.warning(
                         "OP-FORK-DETERMINISTIC: REPLY but missing text/target; "
                         "falling through to Hermes agent"
                     )
+                    fallback_reason = "reply_empty_fallback"
+                else:
+                    fallback_reason = "other_action_fallback"
                 # ALERT_TELEGRAM and other actions fall through to Hermes agent.
             except Exception as exc:
                 logger.exception(
@@ -1129,8 +1372,17 @@ class LineAdapter(BasePlatformAdapter):
                     "Hermes agent: %s",
                     exc,
                 )
+                fallback_reason = "dispatch_exception"
+                result = None
+        else:
+            fallback_reason = "router_unavailable"
+            result = None
 
         # Fallback: invoke Hermes agent only for cases LineRouter could not handle.
+        self._write_op_event_logs(
+            msg=msg, event=event, source=source, invocation=invocation,
+            result=result, fallback_path=fallback_reason,
+        )
         event_obj.text = self._strip_invocation_token(text, invocation)
         await self.handle_message(event_obj)
 
