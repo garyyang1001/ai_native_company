@@ -41,6 +41,67 @@ The current priority is not to build a generic SEO agent and not to copy the OHY
 
 Gary 看到回覆**第一句不是情境** / **技術詞當主幹** 時,可直接回「白話」二字 → 收到的 agent 必須重寫該回覆,並把這次違規記到 `closed_loop_kernel.events` event_type=`agent_communication_violation`(將來可以做 retro)。
 
+## Doc Discovery Protocol (2026-05-28)
+
+This is a hard rule for Claude, Codex, Antigravity, and any future agent working in this repo.
+
+Before planning, editing, reviewing, or executing any non-trivial task, first read:
+
+```text
+docs/plans/INDEX.md
+```
+
+The index is the repo's current map. Do not rely on branch memory, old session summaries, or a plan file you happen to remember.
+
+Rules:
+
+- Do read `docs/plans/INDEX.md` before changing architecture, docs, plans, contracts, agent behavior, or department workflows.
+- Do state which current plan or contract you are using before making a design decision.
+- Do stop and surface the conflict if `docs/plans/INDEX.md` points to a document that contradicts another contract file.
+- Do not treat a feature branch plan as canonical unless it is listed in `docs/plans/INDEX.md`.
+- Do not create a new plan without updating `docs/plans/INDEX.md` in the same change.
+
+Violation handling:
+
+If Gary says any of the following:
+
+```text
+Doc Discovery
+最新版在哪
+你讀 INDEX 了嗎
+找不到最新
+```
+
+the agent must stop the current line of work, read `docs/plans/INDEX.md`, restate the relevant current plan files, and retry from that source of truth.
+
+This protocol has the same priority as `## How To Talk With Gary`: both are cross-agent behavior rules, not style suggestions.
+
+## Karpathy Behavioral Guidelines (2026-05-28)
+
+Source: https://github.com/multica-ai/andrej-karpathy-skills (MIT License)
+
+These guidelines apply to Claude, Codex, Antigravity, and any future agent working in this repo.
+
+For trivial tasks, use judgment. Do not turn a one-line answer into a ceremony.
+
+For non-trivial tasks involving architecture, code changes, production behavior, data contracts, branch cleanup, or multi-agent coordination, apply all four principles explicitly:
+
+1. **Think Before Coding** — 不要藏假設、不要藏困惑、surface tradeoffs
+2. **Simplicity First** — 50 行夠就別 200,no abstractions for single-use code
+3. **Surgical Changes** — 只動該動的,別「順手清掃」
+4. **Goal-Driven Execution** — 每步定義 verify check,弱 criteria = constant clarification
+
+Practical rules:
+
+- Before implementing, state the assumptions that could change the design.
+- Prefer the smallest useful implementation that can be verified.
+- Keep edits scoped to the requested files and behavior.
+- Define the verification check before claiming the task is done.
+- If the task touches docs or plans, apply `## Doc Discovery Protocol` first.
+- If the task changes how agents behave with Gary, also follow `## How To Talk With Gary`.
+
+These guidelines are guardrails. They do not replace the repository contracts in `docs/`; they force agents to read and respect them before acting.
+
 ## Current Direction
 
 - Start from real agents and profiles, then collect their traces into the Closed Loop Kernel.

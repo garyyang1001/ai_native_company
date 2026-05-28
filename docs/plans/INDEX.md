@@ -22,7 +22,7 @@ This index is updated whenever a plan is added, superseded, or archived. If you'
 
 | Plan | Status | 一行說明 |
 |---|---|---|
-| `2026-05-27-learning-loop-design-v0.md` | **v0.1 draft** | OP learning loop 4 元件設計:failure writer / candidate proposer / materializer / runtime SoT。含 Codex review 吸收的 PII 最小化、correlation id、sandbox allowlist |
+| `2026-05-28-learning-loop-design-v0.2.md` | **v0.2 draft canonical** | Karpathy reframe 後的 learning loop:Q1=B failures 表對齊 contract §9 / Q3=B 三層 ID / Q4=B 簡化 outbox。**取代 v0.1** |
 | `2026-05-26-op-kernel-db-operations-v2.md` | **v2.1 canonical** | OP kernel DB schema + 4 cron + backup + 14-step lifecycle + pattern_routes 退場機制 |
 | `2026-05-26-op-kernel-c1-c4-execution-report.md` | **execution log** | C1-C4 cron + backup script 真實落地紀錄,Wave 1+2 fixes |
 
@@ -45,6 +45,7 @@ This index is updated whenever a plan is added, superseded, or archived. If you'
 
 | Plan | Superseded by | Why |
 |---|---|---|
+| `2026-05-27-learning-loop-design-v0.md` | `2026-05-28-learning-loop-design-v0.2.md` | v0.2 把 Q1/Q3/Q4 三個鎖定答案改寫,對齊 `docs/company-data-contract-v0.md` §9 Failure Record。Karpathy 4 原則套用後發現 v0.1 自創 schema 違反公司契約 |
 | `2026-05-25-hermes-wannavegtour-integration-plan-v0.md` | `2026-05-26-hermes-wannavegtour-integration-plan-v1.md` | v1 fully replaces v0(基礎+能力 roadmap 修正) |
 | `2026-05-26-op-kernel-db-operations.md` | `2026-05-26-op-kernel-db-operations-v2.md` | v2.1 修了 3 個 schema drift(A/B/C),Codex review 後重寫 |
 | `2026-05-26-op-bot-hermes-harness-spec.md` | (B1 redesign 2026-05-27) | 6-tool harness 已 retire(`~/.hermes/plugins/op-assistant-tools/` 移到 retired-plugins),改 B1 Python-first 路由。spec 保留當 Layer-2 LLM fallback 實驗種子 |
@@ -66,7 +67,7 @@ This index is updated whenever a plan is added, superseded, or archived. If you'
 
 | Doc | 用途 |
 |---|---|
-| `AGENTS.md` | 跨 agent 工作偏好 + How To Talk With Gary 硬規則 |
+| `AGENTS.md` | 跨 agent 工作偏好 + How To Talk With Gary + **Doc Discovery Protocol + Karpathy Behavioral Guidelines**(2026-05-28 加) |
 | `docs/company-data-contract-v0.md` | L1 資料契約:8 種 canonical record + 7 種 failure_type + ... |
 | `docs/agent-profile-registry-v0.md` + `data/agent-profile-registry-v0.json` | L2 profile 登記 + 15 個 growth-intelligence 部門 profile |
 | `spec/closed-loop-kernel-v0.md` | L5 closed-loop kernel 主規格書 |
