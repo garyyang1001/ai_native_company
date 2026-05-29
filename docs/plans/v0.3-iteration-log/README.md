@@ -40,3 +40,4 @@ Gary chose "both" — process value (AI Native Company case study) **and** outco
 - [round-09.md](round-09.md) — Phase 4 dispatcher + Phase 5 audit chain wire-up(atomic claim → sandbox trigger → Telegram reply;21 dispatcher tests + production `vw` smoke test passed;110 tests total)
 - [round-10.md](round-10.md) — Phase 7 patch emitter + AST guard(13 tests / production smoke wrong_state path / V0.3 simple skips regex → patch_too_invasive)
 - [round-11.md](round-11.md) — Phase 8 simple apply + KILL switch + dispatcher full chain wire-up(139 tests total)
+- [round-12.md](round-12.md) — 1000-case sandbox sim + 4 DB self-maintenance scripts;closed-loop 7-layer mapping complete + 5 KPI proxy measured

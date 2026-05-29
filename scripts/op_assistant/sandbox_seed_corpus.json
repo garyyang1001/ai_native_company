@@ -1,0 +1,27 @@
+{
+  "normal": [
+    "{date} {destination} 還有空位嗎",
+    "{date} {destination} 那團剩多少位",
+    "{destination} {date} 還能報名嗎",
+    "{destination} 行程介紹一下",
+    "{date} 國內團還有哪些",
+    "{date} 那團還收嗎",
+    "{destination} {date} 多少錢",
+    "{date} {destination} 還有沒有賣完"
+  ],
+  "fuzzy": [
+    "下個月有沒有適合帶長輩的團",
+    "最近哪一團性價比最高",
+    "想找個輕鬆的行程",
+    "推薦親子團",
+    "想找小團"
+  ],
+  "edge": [
+    "",
+    "                ",
+    "1' OR '1'='1",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "🦄🌈🎉",
+    "test\n\n\n\nmultiline"
+  ]
+}
