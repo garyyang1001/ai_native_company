@@ -269,7 +269,7 @@ def _is_historical_query(normalized: str, lifecycle_hint: str | None, is_aggrega
 # shorter one strips first and orphans like "還" leak through.)
 _STRIP_TOKENS = [
     # 4-char combined phrases
-    "還剩多少", "還能不能", "有沒有位",
+    "還剩多少", "還能不能", "還能報名", "有沒有位",
     # 3-char phrases
     "問一下", "怎麼樣", "剩多少", "還能報",
     "有沒有", "是哪些", "賣最好", "賣最多", "賣得最",
