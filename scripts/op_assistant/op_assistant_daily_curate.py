@@ -72,11 +72,21 @@ from closed_loop_kernel.store import KernelStore, json_param  # noqa: E402
 
 KERNEL_URL = os.environ["KERNEL_DATABASE_URL"]
 DAILY_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000002")
+# Phase 2 candidate ids are deterministic from (source_event_id, proposal_index)
+# so a daily_curate re-run cannot double-write into improvement_candidates
+# (Round 4 codex review #2).
+CANDIDATE_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000003")
 OLLAMA_URL = "http://127.0.0.1:11434/v1/chat/completions"
 CURATION_MODEL = "gemma4:e4b"
 PROFILE_ID = "op-assistant-line"
 MAX_PROMPT_INBOUND = 50      # cap prompt tokens
 MAX_PROMPT_FAILURES = 30
+
+# Round 4 codex review #1: gemma4 may emit 'keywords' / 'availability_keyword' /
+# empty string / future new labels. Anything outside this whitelist is rejected
+# into events.improvement_candidate_rejected (not silently dropped, not written
+# as garbage candidates).
+ALLOWED_PROPOSAL_TYPES = frozenset({"keyword", "regex"})
 
 
 def _read_window(store: KernelStore) -> tuple[list, list, list]:
@@ -227,6 +237,89 @@ def _render_telegram_text(summary: dict, summary_event_id: str) -> str:
     return "\n".join(lines)
 
 
+def _persist_candidates(store: KernelStore, summary_event_id: str,
+                        actionables: list[dict], dry_run: bool = False) -> dict:
+    """Write each gemma4 actionable into improvement_candidates (V0.3 Phase 2).
+
+    Per Round 4 codex review:
+    * Type whitelist (``ALLOWED_PROPOSAL_TYPES``). Anything else → write
+      ``events.improvement_candidate_rejected``; do not pollute the
+      candidates table with unknown types.
+    * Idempotent INSERT via uuid5(CANDIDATE_NAMESPACE, "<summary>:<index>")
+      so cron reruns / partial retries can't double-write.
+    * Dry-run mode prints what would be written but executes nothing —
+      used to eyeball ``typed_payload`` shape before letting prod see it,
+      since Phase 3 Telegram approval UI is still pending and there's no
+      way to clean dirty candidates yet.
+
+    Returns a counter dict for the caller's audit print.
+    """
+    created_attempted = 0
+    rejected = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    for index, actionable in enumerate(actionables):
+        raw_type = (actionable.get("type") or "").strip().lower()
+        if raw_type not in ALLOWED_PROPOSAL_TYPES:
+            if dry_run:
+                print(f"[DRY-RUN] would reject actionable[{index}] "
+                      f"raw_type={raw_type!r}")
+            else:
+                # Same deterministic-id treatment as the candidate path so
+                # re-runs don't pile up duplicate audit rows.
+                reject_event_id = str(uuid.uuid5(
+                    CANDIDATE_NAMESPACE,
+                    f"reject:{summary_event_id}:{index}",
+                ))
+                store.execute(
+                    "INSERT INTO events (id, event_type, payload, created_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+                    [
+                        reject_event_id,
+                        "improvement_candidate_rejected",
+                        json_param({
+                            "reason": "proposal_type_not_in_whitelist",
+                            "raw_type": raw_type,
+                            "actionable": actionable,
+                            "source_event_id": summary_event_id,
+                            "proposal_index": index,
+                        }),
+                        now,
+                    ],
+                )
+            rejected += 1
+            continue
+
+        proposal_type = f"availability_{raw_type}"
+        candidate_id = str(uuid.uuid5(
+            CANDIDATE_NAMESPACE, f"{summary_event_id}:{index}",
+        ))
+
+        if dry_run:
+            preview = json.dumps(actionable, ensure_ascii=False)[:80]
+            print(f"[DRY-RUN] would INSERT candidate id={candidate_id[:8]} "
+                  f"type={proposal_type} preview={preview}")
+        else:
+            store.execute(
+                """INSERT INTO improvement_candidates
+                    (id, status, proposal_type, typed_payload,
+                     source_event_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (id) DO NOTHING""",
+                [
+                    candidate_id,
+                    "draft",
+                    proposal_type,
+                    json_param(actionable),
+                    summary_event_id,
+                    now,
+                ],
+            )
+        created_attempted += 1
+
+    return {"created_attempted": created_attempted, "rejected": rejected}
+
+
 def _push_telegram(store: KernelStore, summary_event_id: str, summary: dict) -> None:
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_HOME_CHANNEL")
@@ -330,12 +423,21 @@ def run() -> None:
             ],
         )
 
+        dry_run = os.environ.get("OP_PHASE2_DRY_RUN") == "1"
+        cand_counts = _persist_candidates(
+            store, summary_event_id, summary.get("actionable") or [],
+            dry_run=dry_run,
+        )
+
         _push_telegram(store, summary_event_id, summary)
 
+        dry_label = " [DRY-RUN]" if dry_run else ""
         print(
-            f"daily curate {period_key}: inbound={summary['inbound_count']} "
+            f"daily curate {period_key}{dry_label}: inbound={summary['inbound_count']} "
             f"attempts={summary['attempt_count']} failures={summary['open_failure_count']} "
-            f"patterns={len(summary.get('patterns', []))} gaps={len(summary.get('intent_gaps', []))}"
+            f"patterns={len(summary.get('patterns', []))} gaps={len(summary.get('intent_gaps', []))} "
+            f"candidates={cand_counts['created_attempted']} "
+            f"rejected={cand_counts['rejected']}"
         )
     finally:
         store.close()

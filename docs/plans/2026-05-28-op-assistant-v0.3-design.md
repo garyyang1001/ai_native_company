@@ -116,166 +116,91 @@ graph TD
 
 ### Phase 2: gemma4 actionable → improvement_candidates 寫入
 
-(**使用**:`op_assistant_kernel.improvement_candidates`;**關聯**:`scripts/op_assistant/op_assistant_daily_curate.py` 加寫入 + `closed_loop_kernel/postgres.py` schema migration;**用途**:把整理結果從「只存 events.payload」升級成「契約級 candidate row,可追、可批准、可測試、可套用」)
+(**使用**:`op_assistant_kernel.improvement_candidates`;**關聯**:`scripts/op_assistant/op_assistant_daily_curate.py` 加 `_persist_candidates` 函式 + `closed_loop_kernel/postgres.py` schema migration;**用途**:把 gemma4 整理出的每條建議變成一張可批准的候選紙條進 PostgreSQL,Gary 之後在 Telegram 按按鈕就能批准)
 
-**Round 2 spec collapsed 2026-05-29**(`v0.3-iteration-log/round-02.md` 完整 trail)。下面是 final spec,改自 Round 1 粗描述:codex xhigh Round 2 review 我 7 條反提案我全收。
+**🟢 Phase 2 SHIPPED**:2026-05-29 simple 版 production live(`v0.3-iteration-log/round-04.md` 收 spec,`round-05.md` 收 implement + verify)。
 
-#### 2.1 schema 變動(改 `closed_loop_kernel/postgres.py`)
+#### Scope 取捨
+
+Gary 2026-05-29 拍板 **simple 版**,理由「5-6 同事用,不需要大企業級防禦」。**Round 2 收的 full 版(`round-02.md` 完整保留)** — 12 個欄位 + 11 state 狀態機 + payload_hash envelope + TypedPayloadError validator + generator_metadata + candidate_sources JSONB array — **全部不做**。 future V0.3.5/V0.4 真有需要再回頭加。
+
+#### simple 版 final spec(Round 4 codex conditional GO)
+
+**schema 變動**:`improvement_candidates` 加 4 個 NULL-able 欄位 + 既有 10 個 NOT NULL 改 NULL-able(simple 版不走 V0.2 OHYA-style failure-driven artifact-patch 路線):
 
 ```sql
--- 既有 V0.2 schema 已有 status / target_artifact_id / patch_type /
--- validation_assertions / rollback_plan,本 phase 加 12 個 NULL-able 欄位:
-
 ALTER TABLE improvement_candidates
-  ADD COLUMN IF NOT EXISTS domain TEXT,                     -- 'op-assistant' (V0.3) / 'marketing-agent' (V0.4)
-  ADD COLUMN IF NOT EXISTS source_event_id UUID,            -- events.daily_curation_summary.id (one per period_key)
-  ADD COLUMN IF NOT EXISTS curation_run_id UUID,            -- daily_curate 每次跑 new uuid4 — Round 2 U2 dedupe key
-  ADD COLUMN IF NOT EXISTS proposal_index INT,              -- 該 run 內 actionable list index
-  ADD COLUMN IF NOT EXISTS proposal_type TEXT,              -- 'availability_keyword' / 'availability_regex'
-  ADD COLUMN IF NOT EXISTS schema_version TEXT,             -- 'v0.3.0' — Round 2 U1 hash envelope 包進
-  ADD COLUMN IF NOT EXISTS typed_payload JSONB,             -- structured slot data
-  ADD COLUMN IF NOT EXISTS payload_hash TEXT,               -- Round 2 U1 sha256 over envelope
-  ADD COLUMN IF NOT EXISTS generator_metadata JSONB,        -- Round 2 U37 — model / prompt_artifact_id / git_sha / corpus window
-  ADD COLUMN IF NOT EXISTS candidate_sources JSONB
-        NOT NULL DEFAULT '[]'::jsonb,                       -- Round 2 U39 — trace back to inbound events
-  ADD COLUMN IF NOT EXISTS approval_channel TEXT,           -- 留接口 (V0.4 Slack/email)
-  ADD COLUMN IF NOT EXISTS approved_by TEXT,
-  ADD COLUMN IF NOT EXISTS replay_result_hash TEXT;         -- Phase 6 後 backfill
+  ADD COLUMN IF NOT EXISTS proposal_type TEXT,    -- 'availability_keyword' | 'availability_regex'
+  ADD COLUMN IF NOT EXISTS typed_payload JSONB,   -- gemma4 actionable 物件直接寫進
+  ADD COLUMN IF NOT EXISTS source_event_id UUID,  -- events.daily_curation_summary.id
+  ADD COLUMN IF NOT EXISTS approved_by TEXT;      -- Phase 4 填,Phase 2 NULL
 
--- Round 2 U2 idempotency — 同 curation run 同 index 不能雙寫:
-ALTER TABLE improvement_candidates
-  ADD CONSTRAINT IF NOT EXISTS candidates_run_proposal_unique
-    UNIQUE (curation_run_id, proposal_index);
-
--- Round 2 U34 狀態 enum (PG 端硬擋):
-ALTER TABLE improvement_candidates
-  ADD CONSTRAINT IF NOT EXISTS candidates_status_check
-    CHECK (status IN ('created', 'pushed_to_telegram',
-                       'approved', 'rejected',
-                       'sandbox_pending', 'sandbox_verified', 'sandbox_failed',
-                       'patch_emitted', 'patch_too_invasive',
-                       'canary_running', 'applied', 'killed'));
+ALTER TABLE improvement_candidates ALTER COLUMN failure_id DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN target_artifact_id DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN target_artifact_name DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN target_artifact_type DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN target_artifact_version DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN base_artifact_hash DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN patch_type DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN proposed_content DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN validation_assertions DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN rollback_plan DROP NOT NULL;
 ```
 
-**Karpathy 3 surgical**:既有 `target_artifact_id` / `patch_type` / `validation_assertions` / `rollback_plan` 欄位保留不動;`status` 加 CHECK 但既有值('draft' 等)需 migration 對應(計畫:既有 row alter 成 'created')。15+ V0.2 consumers 全部讀既有欄位 → 不受影響。
+不加 lifecycle CHECK constraint;沿用既有 status enum(`'draft' / 'sandbox_verified' / 'approved' / 'rejected' / 'applied'`),新 candidate 寫入 `'draft'`,後續 Phase 4-8 update。
 
-#### 2.2 candidate lifecycle 狀態機(Round 2 U34)
-
-```
-created → pushed_to_telegram → approved | rejected
-                                    ↓ (approved)
-                              sandbox_pending → sandbox_verified | sandbox_failed
-                                                       ↓ (sandbox_verified)
-                                                 patch_emitted | patch_too_invasive
-                                                       ↓ (patch_emitted)
-                                                 canary_running → applied | killed
-```
-
-每次 status update 必同 transaction 寫 `events.candidate_status_changed`:`{candidate_id, from_status, to_status, by_phase, by_actor}` — append-only,可重建時間線。
-
-Python module-level `CandidateStatus(StrEnum)` + `_VALID_TRANSITIONS: dict[CandidateStatus, set[CandidateStatus]]` 拒絕非法 jump;PG CHECK 是第二道防線。
-
-#### 2.3 payload_hash 演算法(Round 2 U1)
+**daily_curate `_persist_candidates`**:
 
 ```python
-def compute_payload_hash(proposal_type: str, typed_payload: dict,
-                          schema_version: str = "v0.3.0") -> str:
-    envelope = {
-        "proposal_type": proposal_type,
-        "schema_version": schema_version,
-        "typed_payload": typed_payload,
-    }
-    canon = json.dumps(envelope, sort_keys=True,
-                       ensure_ascii=False, separators=(',', ':'))
-    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+ALLOWED_PROPOSAL_TYPES = frozenset({"keyword", "regex"})
+CANDIDATE_NAMESPACE = uuid.UUID("a1b2c3d4-0000-0000-0000-000000000003")
+
+for index, actionable in enumerate(summary["actionable"]):
+    raw_type = (actionable.get("type") or "").strip().lower()
+    if raw_type not in ALLOWED_PROPOSAL_TYPES:
+        # 寫 events.improvement_candidate_rejected (id 也是 deterministic)
+        reject_id = str(uuid.uuid5(CANDIDATE_NAMESPACE,
+                                    f"reject:{summary_event_id}:{index}"))
+        ... INSERT INTO events ... ON CONFLICT (id) DO NOTHING
+        continue
+    
+    candidate_id = str(uuid.uuid5(CANDIDATE_NAMESPACE,
+                                   f"{summary_event_id}:{index}"))
+    ... INSERT INTO improvement_candidates
+        (id, status, proposal_type, typed_payload, source_event_id, created_at)
+        VALUES (?, 'draft', f'availability_{raw_type}', json_param(actionable),
+                summary_event_id, now)
+        ON CONFLICT (id) DO NOTHING
 ```
 
-callback_data 用前 8 字。整個 approval/replay/audit chain 都以此為錨點。
+兩個 codex Round 4 要求的最小護欄:
 
-#### 2.4 typed_payload validator(Round 2 U3)
+- **type whitelist**(codex catch:gemma4 可能吐 `keywords` / `availability_keyword` / 空值)— 只 accept `{keyword, regex}`,其他全 reject
+- **deterministic id**(uuid5 from `(source_event_id, proposal_index)`)+ `ON CONFLICT DO NOTHING` — daily_curate 重跑不會雙寫,reject path 也一樣 deterministic(2026-05-29 production 跑兩次驗證過)
 
-```python
-class TypedPayloadError(ValueError): ...
+**dry-run mode**:`OP_PHASE2_DRY_RUN=1` env 啟,印 `[DRY-RUN]` 預覽不真寫,Phase 3 Telegram 批准 UI 還沒有時方便預演 typed_payload shape。
 
-_FORBIDDEN_KW_METACHARS = set(".^$*+?{}[]\\|()")
-_MAX_KEYWORD_LEN = 50
-_MAX_REGEX_LEN = 200
-_FORBIDDEN_REGEX_PATTERNS = [
-    r"(?:.+){2,}",         # nested quantifier (catastrophic backtracking)
-    r"\(\?\:[^)]*\)\+",    # (?:...) +
-]
+#### proposal_type 嚴格 enum
 
-def validate_typed_payload(proposal_type: str, payload: dict) -> None:
-    if proposal_type == "availability_keyword":
-        kw = payload.get("keyword")
-        if not isinstance(kw, str):
-            raise TypedPayloadError("keyword must be str")
-        if not (1 <= len(kw) <= _MAX_KEYWORD_LEN):
-            raise TypedPayloadError(f"keyword len must be 1-{_MAX_KEYWORD_LEN}")
-        if _FORBIDDEN_KW_METACHARS & set(kw):
-            raise TypedPayloadError("keyword contains regex metachars")
-    elif proposal_type == "availability_regex":
-        pat = payload.get("pattern")
-        if not isinstance(pat, str):
-            raise TypedPayloadError("pattern must be str")
-        if not (1 <= len(pat) <= _MAX_REGEX_LEN):
-            raise TypedPayloadError(f"pattern len must be 1-{_MAX_REGEX_LEN}")
-        for forbidden in _FORBIDDEN_REGEX_PATTERNS:
-            if re.search(forbidden, pat):
-                raise TypedPayloadError(f"pattern matches forbidden form: {forbidden}")
-        try:
-            re.compile(pat)
-        except re.error as exc:
-            raise TypedPayloadError(f"pattern not compilable: {exc}") from None
-    else:
-        raise TypedPayloadError(f"unsupported proposal_type: {proposal_type}")
-```
+V0.3 只開兩種:`availability_keyword`(append 進 `_AVAILABILITY_KEYWORDS`)+ `availability_regex`(append 進 `_DATE_PATTERNS` 或自訂 list)。
 
-**重點**:用 `raise TypedPayloadError`,不用 `assert`(`python -O` 會關 assert);regex 還禁 nested quantifier 防 catastrophic backtracking。V0.4 評估 RE2 取代 `re`。
+**V0.3 不開放** `new_intent`(連動 worker 複雜度跳一級)。gemma4 給 `intent` 或未知 type → 寫 `events.improvement_candidate_rejected` 保留 raw payload + `reason='proposal_type_not_in_whitelist'` + `raw_type`+`proposal_index` 上下文。V0.4 開放後可批次重 process。
 
-#### 2.5 generator_metadata 結構(Round 2 U37)
+#### 為什麼 simple 版 OK(rationale)
 
-```python
-generator_metadata = {
-    "generator_name": "op_assistant_daily_curate",
-    "generator_code_version": "<git rev-parse HEAD on daily_curate.py>",
-    "model": "gemma4:e4b",
-    "model_params": {"temperature": 0.2, "response_format": "json_object"},
-    "prompt_artifact_id": "<events.id of daily_curate_prompt_archive>",
-    "prompt_version": "v0.3.1",
-    "prompt_hash": "<sha256 of full prompt text>",
-    "schema_version": "v0.3.0",
-    "corpus_window_start_at": "ISO8601",
-    "corpus_window_end_at": "ISO8601",
-    "corpus_inbound_count": 0,
-    "corpus_failure_count": 0,
-}
-```
+- Daily cron 一天跑一次 — 不會 race
+- Telegram 按鈕批准跟系統真套用之間 < 1 分鐘 — gemma4 不會中間改 payload(full 版 payload_hash 緩解的問題不存在)
+- gemma4 自己 prompt 限定「只給 keyword 或 regex」— 出 catastrophic regex 概率低,真出我們手動清(events.daily_curation_summary 留完整 actionable list 可查)
+- 5-6 同事流量 — 跳關 / hash 串改 / Byzantine 都不在威脅模型
 
-完整 prompt 全文以 `events.daily_curate_prompt_archive` event 落地(uuid5 idempotent by `prompt_hash`);candidate 引用 `prompt_artifact_id`,Phase 6 replay 真正能找回當時 prompt。
+V0.3 後段 phase(3-8)還是按 V0.3 doc 原 spec;只有 Phase 2 走 simple。 Phase 3 起 callback_data 不依賴 payload_hash chain(原 spec 寫 `<short_id>:<payload_hash_prefix>` 改成只用 `candidate_id_short`),Phase 5 audit row 同樣不寫 `replay_result_hash`(該欄位仍存在但 V0.3 階段一律 NULL)。
 
-#### 2.6 candidate_sources 結構(Round 2 U39)
+#### 成果驗證(2026-05-29 production)
 
-```python
-# JSONB array, each entry:
-{
-    "source_type": "failure",            # | "inbound_event" | "manual"
-    "source_id": "<failures.id or events.id>",
-    "inbound_event_id": "<events.op_assistant_line_inbound.id>",
-    "match_reason": "curated_failure",   # | "substring_match" | "manual_pin"
-    "confidence": 1.0,                   # curated=1.0, heuristic<1.0
-}
-```
-
-**優先順序**:curated_failure(failures 表的 attempt_id → attempt_envelopes → events.inbound 鏈)> substring_match(fallback) > manual_pin。 **Round 3 必 spike** failures→inbound 鏈穩定性(R18)。
-
-#### 2.7 proposal_type 嚴格 enum
-
-V0.3 只開兩種:
-- `availability_keyword` — append 進 `_AVAILABILITY_KEYWORDS`
-- `availability_regex` — append 進 `_DATE_PATTERNS` 或自訂 list
-
-**V0.3 不開放** `new_intent`(連動 worker,複雜度跳一級)。gemma4 給 `intent` 類 actionable → Phase 2 寫 `events.improvement_candidate_rejected`(payload 完整保留 raw actionable + rejection_reason='intent_not_supported_v0.3')→ V0.4 開放後可回頭批次處理。
+- pytest 11/11 pass(`tests/test_op_assistant_phase2_candidates.py`)
+- production op_assistant_kernel.improvement_candidates 表 + 2 row(keyword「沒有賣完」+ regex「有哪些團.*?沒有賣完」)
+- events.improvement_candidate_rejected + 1 row(intent type 被擋)
+- daily_curate 連跑兩次 → candidates 維持 2 / reject_events 維持 1 ✅ idempotent
 
 ### Phase 3: Telegram daily 推 inline keyboard 按鈕
 

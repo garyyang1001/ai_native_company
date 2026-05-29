@@ -33,3 +33,4 @@ Gary chose "both" — process value (AI Native Company case study) **and** outco
 - [round-02.md](round-02.md) — 8 條 p0 spec collapse (Claude 1 ✓ + 7 ✗ codex 反提案,全採納)
 - [round-03.md](round-03.md) — R18 spike: production failures→inbound chain broken → Phase 2 U39 降階 substring fallback (R19 追蹤 V0.4 fix)
 - [round-04.md](round-04.md) — Phase 2 simple 版 brief + codex conditional GO(加 type whitelist + uuid5 deterministic id)
+- [round-05.md](round-05.md) — Phase 2 simple 版 SHIPPED production(schema migration / `_persist_candidates` / 11 tests pass / 2 candidates + 1 reject live;reject path idempotency bug caught + fixed mid-round)

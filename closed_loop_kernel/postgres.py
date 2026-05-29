@@ -233,6 +233,26 @@ ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS owner_team_id UUID REFERENCES tea
 ALTER TABLE failures ADD COLUMN IF NOT EXISTS detected_by_agent_id UUID REFERENCES agents(id);
 ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS proposed_by_agent_id UUID REFERENCES agents(id);
 
+-- V0.3 Phase 2 simple版 (Gary 2026-05-29 拍板;Round 4 codex conditional GO)
+-- gemma4 daily_curate 把 actionable 寫成可批准的候選 row。
+-- simple 版不走 artifact-patch 路線,所以既有 NOT NULL 欄位(假設 V0.2 OHYA-style
+-- failure-driven patch)放寬為 NULL-able;新加 4 個 op-assistant 專用欄位。
+ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS proposal_type TEXT;
+ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS typed_payload JSONB;
+ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS source_event_id UUID;
+ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS approved_by TEXT;
+
+ALTER TABLE improvement_candidates ALTER COLUMN failure_id DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN target_artifact_id DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN target_artifact_name DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN target_artifact_type DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN target_artifact_version DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN base_artifact_hash DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN patch_type DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN proposed_content DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN validation_assertions DROP NOT NULL;
+ALTER TABLE improvement_candidates ALTER COLUMN rollback_plan DROP NOT NULL;
+
 CREATE OR REPLACE VIEW view_orphan_attempts AS
 SELECT
     le.attempt_id,
