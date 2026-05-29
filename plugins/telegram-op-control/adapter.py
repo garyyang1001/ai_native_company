@@ -100,59 +100,111 @@ EVENT_TELEGRAM_MALFORMED = "telegram_malformed"
 # --- dedupe cache -----------------------------------------------------------
 
 class UpdateIdDedupe:
-    """In-memory ``update_id`` dedupe with TTL.
+    """Two-phase in-memory ``update_id`` dedupe with TTL.
 
-    Phase 1 simplicity (Karpathy 2): not persisted. Restart = clean cache.
-    Telegram only retries failed deliveries for a few minutes, so a TTL of
-    24hr is overkill but cheap. Lazy GC at every check once the dict grows
-    past ``max_entries``.
+    Codex xhigh review #1: we cannot mark an update as deduped *before* the
+    durable write succeeds. If we did, a writer crash would leave a pending
+    dedupe bit and the Telegram retry would be silently discarded — the
+    inbound event would be lost forever. So entries are written ``pending``
+    on ``begin()`` and promoted to ``committed`` only after ``commit()``.
+    A failed handler calls ``rollback()`` so the retry can re-process.
+
+    Restart-clean (Karpathy 2 Phase 1 simplicity); Phase 4 moves this into
+    a PostgreSQL unique-index claim (V0.3 R10/R11).
     """
+
+    _STATE_PENDING = "pending"
+    _STATE_COMMITTED = "committed"
 
     def __init__(self, ttl_seconds: int = DEDUPE_TTL_SECONDS,
                  max_entries: int = DEDUPE_MAX_ENTRIES) -> None:
-        self._seen: dict[int, float] = {}
+        # value = (mono_timestamp, state)
+        self._seen: dict[int, tuple[float, str]] = {}
         self._ttl = ttl_seconds
         self._max = max_entries
 
-    def seen_then_mark(self, update_id: int) -> bool:
-        """Return True if ``update_id`` was already seen within TTL."""
+    def begin(self, update_id: int) -> bool:
+        """Return True if ``update_id`` was already seen (pending or
+        committed) within TTL. Otherwise mark it pending and return False.
+        """
         now = time.monotonic()
         if len(self._seen) > self._max:
             self._gc(now)
         existing = self._seen.get(update_id)
-        if existing is not None and (now - existing) < self._ttl:
+        if existing is not None and (now - existing[0]) < self._ttl:
             return True
-        self._seen[update_id] = now
+        self._seen[update_id] = (now, self._STATE_PENDING)
         return False
+
+    def commit(self, update_id: int) -> None:
+        """Promote ``update_id`` from pending to committed."""
+        self._seen[update_id] = (time.monotonic(), self._STATE_COMMITTED)
+
+    def rollback(self, update_id: int) -> None:
+        """Drop a pending mark so a retry can re-process. No-op if the
+        entry is already committed (durable write already succeeded; the
+        retry should see duplicate)."""
+        existing = self._seen.get(update_id)
+        if existing is not None and existing[1] == self._STATE_PENDING:
+            self._seen.pop(update_id, None)
 
     def _gc(self, now: float) -> None:
         cutoff = now - self._ttl
-        self._seen = {k: t for k, t in self._seen.items() if t > cutoff}
+        self._seen = {k: v for k, v in self._seen.items() if v[0] > cutoff}
 
 
-# --- chat extraction (deterministic dispatcher, no LLM) ---------------------
+# --- chat / actor extraction (deterministic dispatcher, no LLM) -------------
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    """Codex xhigh review #2: defend every nesting level against forged
+    non-dict shapes (``{"message": "x"}`` or ``{"callback_query": []}``).
+    A signed request can still carry malformed JSON — wrong types must
+    produce an audit-logged 400, not a 500.
+    """
+    return value if isinstance(value, dict) else {}
+
 
 def extract_chat_id(update: dict[str, Any]) -> tuple[str | None, str]:
-    """Return (effective_chat_id, kind) from a Telegram update.
+    """Return ``(effective_chat_id, kind)`` from a Telegram update.
 
     Deterministic dispatch over the three update kinds we expect:
-    ``message``, ``callback_query``, ``edited_message``. Anything else
-    returns ``(None, "unknown")`` so the caller can audit-log and reject.
+    ``message``, ``callback_query``, ``edited_message``. Anything else,
+    or any layer that isn't actually a dict, returns ``(None, kind)``
+    so the caller can audit-log and reject.
 
     No LLM. No fallback heuristics. If Telegram introduces a new update
-    shape we treat it as malformed until V0.x adds explicit support.
+    shape we treat it as malformed until a later phase adds support.
     """
     if "message" in update:
-        chat = (update["message"] or {}).get("chat") or {}
+        chat = _safe_dict(_safe_dict(update.get("message")).get("chat"))
         return (str(chat["id"]) if "id" in chat else None, "message")
     if "callback_query" in update:
-        msg = (update["callback_query"] or {}).get("message") or {}
-        chat = msg.get("chat") or {}
+        cb = _safe_dict(update.get("callback_query"))
+        chat = _safe_dict(_safe_dict(cb.get("message")).get("chat"))
         return (str(chat["id"]) if "id" in chat else None, "callback_query")
     if "edited_message" in update:
-        chat = (update["edited_message"] or {}).get("chat") or {}
+        chat = _safe_dict(_safe_dict(update.get("edited_message")).get("chat"))
         return (str(chat["id"]) if "id" in chat else None, "edited_message")
     return None, "unknown"
+
+
+def extract_actor_user_id(update: dict[str, Any]) -> str | None:
+    """Return the effective acting user_id from a Telegram update.
+
+    Codex xhigh review #4: ``chat_id`` is not enough for Phase 4 action
+    authorization — a group chat (whose chat_id might be on the
+    allowlist for daily summaries) does **not** mean every member is
+    allowed to press KILL. We record the actor user_id at inbound so the
+    Phase 4 dispatcher can apply an action-level user allowlist without
+    re-parsing the raw update.
+    """
+    for key in ("message", "callback_query", "edited_message"):
+        if key not in update:
+            continue
+        from_user = _safe_dict(_safe_dict(update.get(key)).get("from"))
+        if "id" in from_user:
+            return str(from_user["id"])
+    return None
 
 
 # --- config -----------------------------------------------------------------
@@ -328,18 +380,26 @@ async def webhook_handler(request: web.Request) -> web.Response:
         })
         return web.json_response({"error": "chat not allowed"}, status=403)
 
-    # 7. Dedupe — only for *allowed* updates. Telegram retries an allowed
-    # update look like success on our end without double-logging.
-    if dedupe.seen_then_mark(update_id):
+    # 7. Dedupe (begin pending) — only for *allowed* updates. The mark is
+    # only promoted to committed after the durable write succeeds, so a
+    # writer crash leaves NO dedupe state and the Telegram retry will be
+    # processed (codex xhigh review #1).
+    if dedupe.begin(update_id):
         return web.json_response({"status": "duplicate"}, status=200)
 
-    # 8. Happy path — record the inbound update.
-    await _audit(EVENT_TELEGRAM_INBOUND, {
-        "update_id": update_id,
-        "effective_chat_id": chat_id,
-        "kind": kind,
-        "raw_update": update,
-    })
+    # 8. Happy path — record the inbound update, then commit the dedupe.
+    try:
+        await _audit(EVENT_TELEGRAM_INBOUND, {
+            "update_id": update_id,
+            "effective_chat_id": chat_id,
+            "actor_user_id": extract_actor_user_id(update),
+            "kind": kind,
+            "raw_update": update,
+        })
+    except Exception:
+        dedupe.rollback(update_id)
+        raise
+    dedupe.commit(update_id)
     return web.json_response({"status": "ok"}, status=200)
 
 

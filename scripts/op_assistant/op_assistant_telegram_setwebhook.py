@@ -97,14 +97,63 @@ def _get_webhook_info(token: str) -> dict:
         ) from None
 
 
-def run(dry_run: bool = False) -> int:
+def _delete_webhook(token: str) -> dict:
+    api = f"https://api.telegram.org/bot{token}/deleteWebhook"
+    try:
+        r = requests.post(api, json={"drop_pending_updates": True}, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        raise RuntimeError(
+            f"deleteWebhook failed: status={status} type={type(exc).__name__}"
+        ) from None
+
+
+def _print_info(token: str) -> int:
+    try:
+        info = _get_webhook_info(token)
+    except RuntimeError as exc:
+        print(_sanitize(str(exc)), file=sys.stderr)
+        return 1
+    info_view = info.get("result", info)
+    print("getWebhookInfo:")
+    print(_sanitize(json.dumps(info_view, ensure_ascii=False, indent=2)))
+    return 0
+
+
+def run(dry_run: bool = False,
+        delete: bool = False,
+        verify_only: bool = False) -> int:
     _load_env()
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+    if not token:
+        print("missing env: TELEGRAM_BOT_TOKEN", file=sys.stderr)
+        return 2
+
+    # --verify-only / --delete only need the token, not the public URL.
+    if verify_only:
+        return _print_info(token)
+
+    if delete:
+        try:
+            result = _delete_webhook(token)
+        except RuntimeError as exc:
+            print(_sanitize(str(exc)), file=sys.stderr)
+            return 1
+        if not result.get("ok"):
+            print(_sanitize(
+                f"deleteWebhook failed: {json.dumps(result, ensure_ascii=False)}"
+            ), file=sys.stderr)
+            return 1
+        print(f"deleteWebhook ok: {result.get('description')}")
+        return _print_info(token)
+
+    # Default path: set webhook. Requires secret + public URL.
     secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
     public_url = os.environ.get("TELEGRAM_PUBLIC_URL", "").rstrip("/")
-
     missing = [k for k, v in [
-        ("TELEGRAM_BOT_TOKEN", token),
         ("TELEGRAM_WEBHOOK_SECRET", secret),
         ("TELEGRAM_PUBLIC_URL", public_url),
     ] if not v]
@@ -124,31 +173,32 @@ def run(dry_run: bool = False) -> int:
             print(_sanitize(str(exc)), file=sys.stderr)
             return 1
         if not result.get("ok"):
-            # `result` is parsed JSON from Telegram — no token here, but
-            # sanitize defensively in case Telegram echoes the URL back.
             print(_sanitize(
                 f"setWebhook failed: {json.dumps(result, ensure_ascii=False)}"
             ), file=sys.stderr)
             return 1
         print(f"setWebhook ok: {result.get('description')}")
 
-    try:
-        info = _get_webhook_info(token)
-    except RuntimeError as exc:
-        print(_sanitize(str(exc)), file=sys.stderr)
-        return 1
-    info_view = info.get("result", info)
-    print("getWebhookInfo:")
-    print(_sanitize(json.dumps(info_view, ensure_ascii=False, indent=2)))
-    return 0
+    return _print_info(token)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true",
-                        help="skip setWebhook call, still print getWebhookInfo")
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--dry-run", action="store_true",
+                   help="skip setWebhook call, still print getWebhookInfo")
+    g.add_argument(
+        "--delete", action="store_true",
+        help="call deleteWebhook (drop_pending_updates=true) — use before "
+             "rotating the secret, then re-run without --delete"
+    )
+    g.add_argument(
+        "--verify-only", action="store_true",
+        help="only print getWebhookInfo, no setWebhook/deleteWebhook"
+    )
     args = parser.parse_args()
-    sys.exit(run(dry_run=args.dry_run))
+    sys.exit(run(dry_run=args.dry_run, delete=args.delete,
+                 verify_only=args.verify_only))
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ from adapter import (                                         # noqa: E402
     UpdateIdDedupe,
     WEBHOOK_PATH,
     create_app,
+    extract_actor_user_id,
     extract_chat_id,
 )
 
@@ -303,6 +304,54 @@ class TelegramWebhookTests(AioHTTPTestCase):
         # was created.
         assert self.fake_writer.by_type(EVENT_TELEGRAM_INBOUND) == []
 
+    async def test_malformed_message_as_string(self) -> None:
+        """Codex xhigh #2: signed-but-malformed nested types do not 500."""
+        resp = await self.client.post(
+            WEBHOOK_PATH,
+            headers={SECRET_TOKEN_HEADER: SECRET},
+            json={"update_id": 100, "message": "not-a-dict"},
+        )
+        assert resp.status == 400
+        malformed = self.fake_writer.by_type(EVENT_TELEGRAM_MALFORMED)
+        assert len(malformed) == 1
+        assert malformed[0]["reason"] == "no_extractable_chat_id"
+        assert malformed[0]["update_kind"] == "message"
+
+    async def test_malformed_callback_query_as_list(self) -> None:
+        resp = await self.client.post(
+            WEBHOOK_PATH,
+            headers={SECRET_TOKEN_HEADER: SECRET},
+            json={"update_id": 101, "callback_query": ["x"]},
+        )
+        assert resp.status == 400
+        malformed = self.fake_writer.by_type(EVENT_TELEGRAM_MALFORMED)
+        assert len(malformed) == 1
+        assert malformed[0]["update_kind"] == "callback_query"
+
+    async def test_actor_user_id_recorded_in_payload(self) -> None:
+        """Codex xhigh #4: Phase 4 will need actor-level allowlists."""
+        resp = await self.client.post(
+            WEBHOOK_PATH,
+            headers={SECRET_TOKEN_HEADER: SECRET},
+            json=make_update(update_id=120),
+        )
+        assert resp.status == 200
+        inbound = self.fake_writer.by_type(EVENT_TELEGRAM_INBOUND)
+        assert len(inbound) == 1
+        # Telegram fixture sets from.id == chat.id, but they are conceptually
+        # different and Phase 4 must use actor_user_id, not effective_chat_id.
+        assert inbound[0]["actor_user_id"] == "123456789"
+
+    async def test_callback_query_actor_extracted(self) -> None:
+        resp = await self.client.post(
+            WEBHOOK_PATH,
+            headers={SECRET_TOKEN_HEADER: SECRET},
+            json=make_update(update_id=121, kind="callback_query"),
+        )
+        assert resp.status == 200
+        inbound = self.fake_writer.by_type(EVENT_TELEGRAM_INBOUND)
+        assert inbound[0]["actor_user_id"] == "123456789"
+
 
 # --- empty allowlist (separate test class because get_application
 # is called once per AioHTTPTestCase) ---------------------------------------
@@ -347,20 +396,44 @@ class HealthTests(AioHTTPTestCase):
 # --- standalone unit tests --------------------------------------------------
 
 class DedupeTests(unittest.TestCase):
-    def test_first_is_fresh(self) -> None:
-        d = UpdateIdDedupe()
-        self.assertFalse(d.seen_then_mark(1))
+    """Two-phase dedupe API (codex xhigh review #1)."""
 
-    def test_repeat_within_ttl_is_duplicate(self) -> None:
+    def test_first_begin_is_fresh(self) -> None:
         d = UpdateIdDedupe()
-        d.seen_then_mark(1)
-        self.assertTrue(d.seen_then_mark(1))
+        self.assertFalse(d.begin(1))
+
+    def test_pending_counts_as_seen(self) -> None:
+        d = UpdateIdDedupe()
+        d.begin(1)
+        # second begin without commit must report duplicate
+        self.assertTrue(d.begin(1))
+
+    def test_committed_counts_as_seen(self) -> None:
+        d = UpdateIdDedupe()
+        d.begin(1)
+        d.commit(1)
+        self.assertTrue(d.begin(1))
+
+    def test_rollback_clears_pending(self) -> None:
+        d = UpdateIdDedupe()
+        d.begin(1)
+        d.rollback(1)
+        # rollback drops the pending mark → retry can re-process
+        self.assertFalse(d.begin(1))
+
+    def test_rollback_is_noop_on_committed(self) -> None:
+        d = UpdateIdDedupe()
+        d.begin(1)
+        d.commit(1)
+        d.rollback(1)
+        # committed entries are durable — rollback must not erase them
+        self.assertTrue(d.begin(1))
 
     def test_different_ids_independent(self) -> None:
         d = UpdateIdDedupe()
-        self.assertFalse(d.seen_then_mark(1))
-        self.assertFalse(d.seen_then_mark(2))
-        self.assertTrue(d.seen_then_mark(1))
+        self.assertFalse(d.begin(1))
+        self.assertFalse(d.begin(2))
+        self.assertTrue(d.begin(1))
 
 
 class ExtractChatTests(unittest.TestCase):
@@ -385,6 +458,126 @@ class ExtractChatTests(unittest.TestCase):
     def test_callback_query_without_message_chat(self) -> None:
         chat, kind = extract_chat_id({"callback_query": {"id": "cb"}})
         self.assertEqual((chat, kind), (None, "callback_query"))
+
+    def test_message_as_string_does_not_raise(self) -> None:
+        """Codex xhigh #2: defense against malformed nested types."""
+        chat, kind = extract_chat_id({"message": "not-a-dict"})
+        self.assertEqual((chat, kind), (None, "message"))
+
+    def test_callback_query_as_list_does_not_raise(self) -> None:
+        chat, kind = extract_chat_id({"callback_query": ["x"]})
+        self.assertEqual((chat, kind), (None, "callback_query"))
+
+    def test_chat_as_string_inside_message(self) -> None:
+        chat, kind = extract_chat_id({"message": {"chat": "weird"}})
+        self.assertEqual((chat, kind), (None, "message"))
+
+
+class ExtractActorTests(unittest.TestCase):
+    def test_message_from(self) -> None:
+        u = {"message": {"from": {"id": 42}, "chat": {"id": 99}}}
+        self.assertEqual(extract_actor_user_id(u), "42")
+
+    def test_callback_query_from(self) -> None:
+        u = {
+            "callback_query": {
+                "from": {"id": 42},
+                "message": {"chat": {"id": 99}},
+            },
+        }
+        self.assertEqual(extract_actor_user_id(u), "42")
+
+    def test_edited_message_from(self) -> None:
+        u = {"edited_message": {"from": {"id": 42}, "chat": {"id": 99}}}
+        self.assertEqual(extract_actor_user_id(u), "42")
+
+    def test_no_from(self) -> None:
+        self.assertIsNone(
+            extract_actor_user_id({"message": {"chat": {"id": 99}}})
+        )
+
+    def test_malformed_from_as_string(self) -> None:
+        self.assertIsNone(
+            extract_actor_user_id({"message": {"from": "alice"}})
+        )
+
+
+class FlakeyWriter:
+    """Writer that fails on its first telegram_inbound call, succeeds after."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.fail_next_inbound = True
+
+    def write(self, event_type: str, payload: dict[str, Any]) -> str:
+        # Raise BEFORE appending so by_type() counts only successful writes
+        # (the real EventWriter would raise inside KernelStore.execute and
+        # the row would never land).
+        if event_type == EVENT_TELEGRAM_INBOUND and self.fail_next_inbound:
+            self.fail_next_inbound = False
+            raise RuntimeError("simulated PG failure on first inbound")
+        self.calls.append((event_type, payload))
+        return f"fake-{len(self.calls)}"
+
+    def close(self) -> None:  # pragma: no cover
+        return None
+
+    def by_type(self, event_type: str) -> list[dict[str, Any]]:
+        # only count successful writes
+        return [p for t, p in self.calls if t == event_type]
+
+
+class WriterFailureRetryTests(AioHTTPTestCase):
+    """Codex xhigh review #1: a writer crash must NOT silently swallow the
+    Telegram retry. Two-phase dedupe (pending → committed) makes the retry
+    re-process and durably land the row.
+    """
+
+    async def get_application(self) -> web.Application:
+        self.flakey = FlakeyWriter()
+        self.config = AdapterConfig(
+            webhook_secret=SECRET,
+            allowed_chats=ALLOWED_CHATS,
+        )
+        return create_app(self.config, writer=self.flakey)
+
+    async def test_writer_crash_then_retry_eventually_writes(self) -> None:
+        u = make_update(update_id=200)
+
+        # First delivery — writer raises after dedupe.begin marks pending.
+        # aiohttp default error handler turns the unhandled exception into 500.
+        r1 = await self.client.post(
+            WEBHOOK_PATH,
+            headers={SECRET_TOKEN_HEADER: SECRET},
+            json=u,
+        )
+        assert r1.status == 500, "first attempt should surface writer error"
+        assert self.flakey.by_type(EVENT_TELEGRAM_INBOUND) == [], \
+            "first attempt must NOT count as a durable write"
+
+        # Telegram retries the SAME update_id. The pending mark was
+        # rolled back, so dedupe lets it through and the second write
+        # (no longer flakey) succeeds.
+        r2 = await self.client.post(
+            WEBHOOK_PATH,
+            headers={SECRET_TOKEN_HEADER: SECRET},
+            json=u,
+        )
+        assert r2.status == 200, "retry must succeed, not get swallowed"
+        inbound = self.flakey.by_type(EVENT_TELEGRAM_INBOUND)
+        assert len(inbound) == 1
+        assert inbound[0]["update_id"] == 200
+
+        # Third delivery (Telegram retry storm) — now dedupe is committed.
+        r3 = await self.client.post(
+            WEBHOOK_PATH,
+            headers={SECRET_TOKEN_HEADER: SECRET},
+            json=u,
+        )
+        assert r3.status == 200
+        assert (await r3.json())["status"] == "duplicate"
+        # Still one durable row — no double-write.
+        assert len(self.flakey.by_type(EVENT_TELEGRAM_INBOUND)) == 1
 
 
 class ConfigTests(unittest.TestCase):
