@@ -25,11 +25,40 @@ The current priority is not to build a generic SEO agent and not to copy the OHY
 
 ### 不可做
 
-- ❌ 把 function name 或 table name 當句子主詞(「`apply_candidate` 更新 artifacts 表 ...」)
+- ❌ 把 function name / table name / column name / commit sha / file path 當句子主詞或訊息開頭(「`apply_candidate` 更新 artifacts 表 ...」、「`b8aa5fa`:8 條 p0 collapse」)
+- ❌ 用 table、bullet list、code block、status grid 當訊息開頭 — 必先有 2-3 句白話 + 情境 + 流程
 - ❌ 整段技術名詞不解釋就丟過來
 - ❌ 引用程式碼貼大段 code 不寫做什麼
 - ❌ 用 `default to` / 「視情況」這類軟性語氣 — 本規則是硬規則
 - ❌ 認為「Gary 應該看得懂這個」就跳過情境段。看得懂跟需要重新建立 context 是兩件事
+- ❌ 寫「Phase 2 開工 ready」這類純狀態詞當主訊息,沒講「為什麼這代表 OK 動下一步、動下一步會發生什麼、Gary 該決定什麼」
+
+### Status report / 進度報告 / commit 摘要 場景(2026-05-29 強化)
+
+進度報告、commit chain 摘要、phase ship 通報、design iteration log 報告 是規則違反高發場景。**任何 table、bullet list、code block、commit sha 都不能當訊息開頭**。
+
+必先 2-3 句白話講清楚:
+
+1. **情境**:什麼事情發生了 / 為什麼要做 / 誰會受影響 / 跟前次 Gary 的指示有什麼關係
+2. **流程**:從哪裡開始 → 經過誰 / 哪個檔 / 哪段 → 最後落到哪 → Gary 該不該動 / 動什麼
+3. **然後才用 table / bullet 補細節**(細節是註腳)
+
+範例 — 「我把 R18 那條鏈斷掉的問題查清楚了」:
+
+✅ **可以這樣寫**:
+> 我剛剛去查我們在乎的那條線:「客戶 LINE 訊息進來 → bot 沒聽懂 → 紀錄一筆失敗 → 之後 gemma4 想推薦改進時要能回頭指出『就是那則訊息惹的禍』」。這條線**現在是斷的** — 我抽真實資料庫 5 筆 failure 出來看,中間那個指針位是空的。
+>
+> 兩條路:(A)現在去修 V0.2 已上線的 LINE bot 程式 — 但這代表動還在跑的東西,可能弄壞;(B)V0.3 先不靠這條線,改用「拿建議的關鍵字去 failure 訊息預覽裡找」這種弱對應,V0.4 再修。我選 B,你 OK 嗎?
+
+❌ **不可這樣寫**(就是我 2026-05-29 違規那則):
+> | Round | Commit | Summary |
+> | --- | --- | --- |
+> | 1 | e0f5257 | 41 unknowns enumerated + priority |
+> | 2 | b8aa5fa | 8 條 p0 spec collapse(codex 7 反提案全採納)|
+> 
+> Phase 2 開工 ready ...
+
+commit sha / round 編號 / column 名 / table 名 全是註腳,**不准開頭**。
 
 ### 範圍
 
@@ -37,9 +66,21 @@ The current priority is not to build a generic SEO agent and not to copy the OHY
 - 不適用於:純 agent-to-agent prompt(例如 `/codex consult` 給 codex 的 brief)— 內部溝通可以技術。
 - 但 agent-to-agent 的**最終輸出**如果會給 Gary 看(例如 codex review report 要 forward 給 Gary),整段 forward 之前要由 forwarder agent 改寫成符合本規則的格式。
 
-### 違反處理
+### 違反處理(2026-05-27 + 2026-05-29 強化)
 
-Gary 看到回覆**第一句不是情境** / **技術詞當主幹** 時,可直接回「白話」二字 → 收到的 agent 必須重寫該回覆,並把這次違規記到 `closed_loop_kernel.events` event_type=`agent_communication_violation`(將來可以做 retro)。
+Gary 看到回覆第一句不是情境 / 技術詞當主幹 / 用 table 或 bullet 或 commit sha 開頭 時,**下列任一訊號**都算違規 trigger,收到後 agent 必須重寫:
+
+- 「白話」
+- 「我看不懂」
+- 「你寫的這一長串我看不懂」
+- 「不要放技術名詞」
+- 「用情境跟流程」
+- 「太技術」
+- 直接指出「你寫的這段我不懂」即可
+
+違規 → agent 必先重寫成符合 § How To Talk With Gary 的版本 → Gary 接受後,將該次違規記到 `closed_loop_kernel.events` event_type=`agent_communication_violation`(將來可以做 retro)。
+
+**meta 原則**:這條規則是 strict 不是 soft。Agent 不能因為「Gary 是 product owner 假設懂技術」就跳過情境段;不能因為「table 比較整齊」就用 table 開頭;不能因為「commit sha 比 git log 看起來精確」就把 sha 當主訊息。 Gary 在路上、在手機、在累的時候,只看得進白話 + 情境 + 流程。
 
 ## Doc Discovery Protocol (2026-05-28)
 
