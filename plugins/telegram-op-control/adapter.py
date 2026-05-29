@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 from aiohttp import web
 
 logger = logging.getLogger("hermes_plugins.telegram_op_control.adapter")
@@ -389,7 +390,7 @@ async def webhook_handler(request: web.Request) -> web.Response:
 
     # 8. Happy path — record the inbound update, then commit the dedupe.
     try:
-        await _audit(EVENT_TELEGRAM_INBOUND, {
+        inbound_event_id = await _audit(EVENT_TELEGRAM_INBOUND, {
             "update_id": update_id,
             "effective_chat_id": chat_id,
             "actor_user_id": extract_actor_user_id(update),
@@ -400,7 +401,104 @@ async def webhook_handler(request: web.Request) -> web.Response:
         dedupe.rollback(update_id)
         raise
     dedupe.commit(update_id)
+
+    # Phase 4 dispatch — for callback_query updates, fan out into the
+    # dispatcher off-loop so the webhook returns 200 inside the 5-second
+    # Telegram budget and the slower work (sandbox replay, sendMessage
+    # reply) doesn't block the next inbound update.
+    if kind == "callback_query":
+        callback_query = update.get("callback_query") or {}
+        asyncio.create_task(
+            _run_dispatcher(request.app, inbound_event_id, callback_query)
+        )
+
     return web.json_response({"status": "ok"}, status=200)
+
+
+async def _run_dispatcher(app: web.Application, source_event_id: str,
+                           callback_query: dict[str, Any]) -> None:
+    """Background driver for Phase 4 callback dispatch + Telegram reply.
+
+    Exceptions land in events.dispatcher_error rather than propagating
+    into aiohttp's task warning channel — a dispatcher crash must not
+    take the whole webhook server down.
+    """
+    config: AdapterConfig = app["config"]
+    chat = (callback_query.get("message") or {}).get("chat") or {}
+    chat_id = chat.get("id")
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    kernel_url = config.kernel_url
+
+    try:
+        from . import dispatcher as dispatcher_mod  # noqa: WPS433
+    except Exception:
+        # When the plugin is imported via importlib (test path) the
+        # package context is missing; load by file path instead.
+        from importlib.util import module_from_spec, spec_from_file_location
+        dispatcher_path = Path(__file__).with_name("dispatcher.py")
+        spec = spec_from_file_location("telegram_op_control_dispatcher",
+                                        dispatcher_path)
+        assert spec is not None and spec.loader is not None
+        dispatcher_mod = module_from_spec(spec)
+        sys.modules[spec.name] = dispatcher_mod
+        spec.loader.exec_module(dispatcher_mod)
+
+    if kernel_url is None:
+        return
+
+    try:
+        result = await asyncio.to_thread(
+            _run_dispatch_blocking, dispatcher_mod, kernel_url,
+            source_event_id, callback_query,
+        )
+    except Exception as exc:
+        logger.exception("dispatcher background task crashed: %s", exc)
+        return
+
+    reply_text = result.get("reply_text")
+    if reply_text and bot_token and chat_id:
+        await _send_telegram_reply(bot_token, chat_id, reply_text,
+                                    callback_query.get("id"))
+
+    followup = result.get("sandbox_followup")
+    if followup and bot_token and chat_id:
+        await _send_telegram_reply(bot_token, chat_id, followup, None)
+
+
+def _run_dispatch_blocking(dispatcher_mod, kernel_url: str,
+                            source_event_id: str,
+                            callback_query: dict[str, Any]) -> dict[str, Any]:
+    """Synchronous wrapper executed inside ``asyncio.to_thread``."""
+    KernelStore = dispatcher_mod.KernelStore  # noqa: N806 — class alias
+    store = KernelStore.from_url(kernel_url)
+    try:
+        return dispatcher_mod.dispatch_callback(
+            store=store,
+            kernel_url=kernel_url,
+            source_event_id=source_event_id,
+            callback_query=callback_query,
+        )
+    finally:
+        store.close()
+
+
+async def _send_telegram_reply(bot_token: str, chat_id: int | str,
+                                text: str,
+                                callback_query_id: str | None) -> None:
+    """Best-effort Telegram sendMessage + optional answerCallbackQuery."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, data=payload, timeout=10)
+            if callback_query_id:
+                await session.post(
+                    f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery",
+                    data={"callback_query_id": callback_query_id},
+                    timeout=10,
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Telegram reply failed: %s", type(exc).__name__)
 
 
 async def health_handler(_request: web.Request) -> web.Response:
