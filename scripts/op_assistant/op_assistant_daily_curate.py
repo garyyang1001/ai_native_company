@@ -258,6 +258,7 @@ def _persist_candidates(store: KernelStore, summary_event_id: str,
     rejected = 0
     now = datetime.now(timezone.utc).isoformat()
 
+    persisted: list[dict] = []   # accepted candidates, in proposal_index order
     for index, actionable in enumerate(actionables):
         raw_type = (actionable.get("type") or "").strip().lower()
         if raw_type not in ALLOWED_PROPOSAL_TYPES:
@@ -316,11 +317,54 @@ def _persist_candidates(store: KernelStore, summary_event_id: str,
                 ],
             )
         created_attempted += 1
+        # Phase 3 needs the (id, label-index, type, value) list to build the
+        # Telegram inline_keyboard rows. Labels start at 1 for humans, not 0.
+        persisted.append({
+            "id": candidate_id,
+            "label_index": index + 1,
+            "proposal_type": proposal_type,
+            "value": actionable.get("value", ""),
+        })
 
-    return {"created_attempted": created_attempted, "rejected": rejected}
+    return {
+        "created_attempted": created_attempted,
+        "rejected": rejected,
+        "candidates": persisted,
+    }
 
 
-def _push_telegram(store: KernelStore, summary_event_id: str, summary: dict) -> None:
+def _render_inline_keyboard(candidates: list[dict]) -> dict | None:
+    """Build the Telegram inline_keyboard reply_markup for V0.3 Phase 3.
+
+    Per ``docs/contracts/op_assistant_v0.3/callback_data_v0.md``:
+    callback_data = ``<action>:<candidate_uuid_hex32>`` (UUID with dashes
+    stripped, all lowercase hex). One row per candidate, three buttons:
+    approve / reject / view-sandbox.
+
+    Phase 8 KILL buttons are NOT rendered yet (they require Phase 8
+    canary to have produced status='applied' candidates, which doesn't
+    exist until that phase ships).
+
+    Returns ``None`` for an empty candidate list — Phase 3 sender should
+    omit ``reply_markup`` entirely in that case so the daily summary
+    still posts cleanly when there's nothing to approve.
+    """
+    if not candidates:
+        return None
+    rows: list[list[dict[str, str]]] = []
+    for c in candidates:
+        cid_hex = c["id"].replace("-", "").lower()
+        n = c["label_index"]
+        rows.append([
+            {"text": f"✅ 批准 {n}", "callback_data": f"apv:{cid_hex}"},
+            {"text": f"❌ 拒絕 {n}", "callback_data": f"rej:{cid_hex}"},
+            {"text": f"🔍 看 {n} sandbox", "callback_data": f"vw:{cid_hex}"},
+        ])
+    return {"inline_keyboard": rows}
+
+
+def _push_telegram(store: KernelStore, summary_event_id: str, summary: dict,
+                    candidates: list[dict] | None = None) -> None:
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_HOME_CHANNEL")
 
@@ -342,10 +386,20 @@ def _push_telegram(store: KernelStore, summary_event_id: str, summary: dict) -> 
         return
 
     text = _render_telegram_text(summary, summary_event_id)
+    payload: dict[str, str] = {"chat_id": chat_id, "text": text}
+
+    # Phase 3 inline keyboard is gated by env so the buttons only ship
+    # once Phase 4 dispatcher is live to receive callback_query updates.
+    # Otherwise Gary would tap a button and Telegram would spin forever.
+    enable_keyboard = os.environ.get("OP_PHASE3_INLINE_KEYBOARD") == "1"
+    if enable_keyboard and candidates:
+        keyboard = _render_inline_keyboard(candidates)
+        if keyboard:
+            payload["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
-        r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=30)
+        r = requests.post(url, data=payload, timeout=30)
         r.raise_for_status()
     except requests.RequestException as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -429,7 +483,10 @@ def run() -> None:
             dry_run=dry_run,
         )
 
-        _push_telegram(store, summary_event_id, summary)
+        _push_telegram(
+            store, summary_event_id, summary,
+            candidates=cand_counts.get("candidates") or [],
+        )
 
         dry_label = " [DRY-RUN]" if dry_run else ""
         print(

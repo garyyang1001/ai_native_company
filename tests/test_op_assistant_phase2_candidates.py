@@ -89,7 +89,7 @@ class WhitelistTests(unittest.TestCase):
         counts = dc._persist_candidates(
             store, SUMMARY_EVENT_ID, [_kw_actionable()], dry_run=False,
         )
-        self.assertEqual(counts, {"created_attempted": 1, "rejected": 0})
+        self.assertEqual(counts["created_attempted"], 1); self.assertEqual(counts["rejected"], 0)
 
         inserts = store.by_sql_substring("INSERT INTO improvement_candidates")
         self.assertEqual(len(inserts), 1)
@@ -108,7 +108,7 @@ class WhitelistTests(unittest.TestCase):
         counts = dc._persist_candidates(
             store, SUMMARY_EVENT_ID, [_regex_actionable()], dry_run=False,
         )
-        self.assertEqual(counts, {"created_attempted": 1, "rejected": 0})
+        self.assertEqual(counts["created_attempted"], 1); self.assertEqual(counts["rejected"], 0)
         inserts = store.by_sql_substring("INSERT INTO improvement_candidates")
         self.assertEqual(inserts[0][2], "availability_regex")
 
@@ -117,7 +117,7 @@ class WhitelistTests(unittest.TestCase):
         counts = dc._persist_candidates(
             store, SUMMARY_EVENT_ID, [_intent_actionable()], dry_run=False,
         )
-        self.assertEqual(counts, {"created_attempted": 0, "rejected": 1})
+        self.assertEqual(counts["created_attempted"], 0); self.assertEqual(counts["rejected"], 1)
 
         # No candidate INSERT
         self.assertEqual(store.by_sql_substring("INSERT INTO improvement_candidates"), [])
@@ -141,7 +141,7 @@ class WhitelistTests(unittest.TestCase):
             {"value": "no type at all"},
         ]
         counts = dc._persist_candidates(store, SUMMARY_EVENT_ID, cases, dry_run=False)
-        self.assertEqual(counts, {"created_attempted": 0, "rejected": 4})
+        self.assertEqual(counts["created_attempted"], 0); self.assertEqual(counts["rejected"], 4)
         rejects = store.by_sql_substring(
             "INSERT INTO events (id, event_type, payload, created_at)"
         )
@@ -214,7 +214,7 @@ class DryRunTests(unittest.TestCase):
             dry_run=True,
         )
         # counters still tick so the run() print line is informative
-        self.assertEqual(counts, {"created_attempted": 2, "rejected": 1})
+        self.assertEqual(counts["created_attempted"], 2); self.assertEqual(counts["rejected"], 1)
         # but no execute() calls landed
         self.assertEqual(store.calls, [])
 
@@ -228,7 +228,7 @@ class MixedActionableTests(unittest.TestCase):
              {"type": "weird"}],
             dry_run=False,
         )
-        self.assertEqual(counts, {"created_attempted": 2, "rejected": 2})
+        self.assertEqual(counts["created_attempted"], 2); self.assertEqual(counts["rejected"], 2)
 
     def test_uppercase_type_is_normalised(self) -> None:
         store = FakeStore()
