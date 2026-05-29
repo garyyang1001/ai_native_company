@@ -1,0 +1,17 @@
+[Unit]
+Description=Hermes Telegram OP Control plane (V0.3 Phase 1+4 dispatcher)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/wannavegtour/.hermes/plugins/telegram-op-control
+ExecStart=/home/wannavegtour/.hermes/hermes-agent/venv/bin/python /home/wannavegtour/.hermes/plugins/telegram-op-control/adapter.py
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/home/wannavegtour/.hermes/.env
+EnvironmentFile=/home/wannavegtour/.hermes/profiles/op-assistant/.env
+Environment=HERMES_PROFILE=op-assistant
+Environment="WANNAVEGTOUR_REPO_PATH=/home/wannavegtour/Desktop/AI Native Company/Gary"
+
+[Install]
+WantedBy=default.target
