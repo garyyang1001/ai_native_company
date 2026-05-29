@@ -206,6 +206,12 @@ HELP_RE    = re.compile(r"^(HELP|\?|？|幫助)$", re.IGNORECASE)
 - 即使 Gary 打錯字「Ok 1.」(尾巴多個句點)也要 strict 拒絕(避免一旦開「智能修正」就漂向 LLM orchestrator)
 - 文字 fallback 走「老闆批准全 candidate (full payload_hash 對齊)」這條路,**不繞過 payload_hash check**(R6 緩解一致)
 
+**Phase 4 transactional claim**(codex xhigh review #5,補進 Phase 4 spec):
+- Phase 4 dispatcher 在「讀 inbound、寫 approval、更新 candidate」這條鏈上不能是三個獨立 INSERT — dispatcher 重啟可能會重複處理同一 callback
+- 解:`approvals` 表加 `source_event_id UUID UNIQUE`(指 events.id of telegram_inbound row),靠 PG unique constraint 保證冪等
+- dispatcher pipeline:讀 events.telegram_inbound → 同 transaction 內 INSERT approvals + UPDATE candidate.status → unique 衝突就 noop(已被先前 dispatch 處理過)
+- 這同時收尾 V0.3 R10/R11:dedupe 從 in-memory 移到 DB unique constraint
+
 ### Phase 5: Approval audit record(kernel = truth)
 
 (**使用**:既有 `approvals` 表 + 新欄位;**關聯**:Phase 4 解析結果寫入;**用途**:**這是 codex Q6 catch — Telegram 訊息不能當批准紀錄**)
@@ -407,6 +413,9 @@ ALTER TABLE approvals ADD COLUMN IF NOT EXISTS replay_result_hash TEXT;
 | R11 | In-memory dedupe 無法跨 process restart / 多 worker process | Phase 1 接受(Telegram retry window 數分鐘,restart 罕見);Phase 4 同 R10 改 DB |
 | R12 | Webhook secret 只證明「知道 secret」,public URL 暴露後 attacker spam 401 會產生 audit noise | V0.3 不修;部署層 Cloudflare / tailscale ACL + 後續 Phase 加 rate limit。記為 ops risk |
 | R13 | `raw_update` 含 Telegram user profile(name / username),retention 邊界沒定 | events 表 30 天 retention 已涵蓋(Phase 4 Gary Q5);但若 events 表延長 retention,要回頭加 redaction。Phase 4 dispatcher 寫 approvals 時要 redact user fields(只留 user_id_suffix) |
+| R14 | DB liveness / reconnect — KernelStore single connection;PG restart 後全服務 500 | Phase 1 standalone test 跑得起,但部署前必補;最簡單:catch psycopg.OperationalError 自動重建 connection + `/health` 拆 live/readiness(readiness 真碰 DB) |
+| R15 | LLM-import fence 目前只靠社交守則(README 註明、code review)。沒 technical guard | V0.3.5 加 pre-commit / pytest AST 規則,禁 `import (openai|anthropic|ollama)` 進 `plugins/telegram-op-control/`;Phase 7 patch_emitter 同樣禁 LLM import 進入 auto-patched data files |
+| R16 | Stale button replay — 舊 callback button 沒過期就一直能按,Phase 4 可能接受過期決策 | callback_data 已含 `payload_hash_prefix`(候選 payload 變了就對不上);Phase 4 dispatcher 額外查 `candidate.status in {'sandbox_verified'}` 才接受;成功處理後 edit_message 移除 keyboard |
 
 ## 10. 施工順序 + success criteria
 
@@ -444,6 +453,14 @@ ALTER TABLE approvals ADD COLUMN IF NOT EXISTS replay_result_hash TEXT;
   - codex 沒提到 `improvement_candidate_rejected` event 保留 V0.3 reject 的 actionable(我加進去,V0.4 開放後不丟失)
   - codex 沒提到 R2(候選 payload 被 gemma4 下一輪改寫),我加入
   - codex 沒提到 R7 over-greedy / R8 流量過低 canary 失效 / R9 LLM 自身錯誤,Gary 對話後加入
+
+### 2026-05-29 codex xhigh deeper Phase 1 review
+
+第二輪同份 code,改 xhigh effort(`-c model_reasoning_effort=xhigh`),要求不重複上輪 4 個 finding。xhigh 找 9 個 deeper issue(session 留 `.claude/jobs/1d06a75b/phase1_xhigh_review_output.md`):
+
+- **必修(commit `60016e1`)**:#1 dedupe-before-durable-write 真實資料遺失 → 兩階段 pending/committed;#2 nested payload 型別不防(`message:"x"` → 500)→ `_safe_dict` 每層守;#4 Phase 4 KILL 需要 actor user_id 而不只 chat_id → Phase 1 預存 `actor_user_id`;#7 setwebhook 加 `--delete` / `--verify-only` 給 secret rotate 用。新增 16 個 test。
+- **doc 補(本 commit)**:#5 Phase 4 transactional claim(`source_event_id UNIQUE`);#6 R14 DB liveness/reconnect;#8 R15 LLM-import AST guard fence;#9 R16 stale button replay 對應緩解。
+- **skip**:#3 oversized body test 鎖死 status code(test quality 議題,功能 OK,aiohttp framework 自擋 413)。
 
 ### 2026-05-29 codex Phase 1 post-hoc review
 
