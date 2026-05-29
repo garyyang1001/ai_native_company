@@ -330,7 +330,84 @@ def trigger_sandbox_replay(store: KernelStore, kernel_url: str,
                 datetime.now(timezone.utc).isoformat(),
             ],
         )
+
+    # Phase 6 → Phase 7 → Phase 8 chain: only fire on sandbox_verified.
+    if next_status == "sandbox_verified":
+        result["chain"] = _run_phase_7_and_8_chain(store, candidate_id)
     return result
+
+
+def _run_phase_7_and_8_chain(store: KernelStore,
+                               candidate_id: str) -> dict[str, Any]:
+    """Run Phase 7 (patch emitter) then Phase 8 (apply) inline. Each step
+    only fires if the previous step left the candidate in the right
+    next-state, so a Phase-7 failure (patch_too_invasive) cleanly stops
+    the chain without poking Phase 8.
+    """
+    from importlib.util import module_from_spec, spec_from_file_location
+    chain: dict[str, Any] = {}
+    scripts_dir = Path(REPO_PATH) / "scripts" / "op_assistant"
+
+    # ---- Phase 7 ----
+    try:
+        emit_spec = spec_from_file_location(
+            "op_patch_emitter_chain",
+            scripts_dir / "op_assistant_patch_emitter.py",
+        )
+        assert emit_spec is not None and emit_spec.loader is not None
+        emit_mod = module_from_spec(emit_spec)
+        sys.modules[emit_spec.name] = emit_mod
+        emit_spec.loader.exec_module(emit_mod)
+        chain["phase_7"] = emit_mod.emit_for_candidate(store, candidate_id)
+    except Exception as exc:
+        store.execute(
+            "INSERT INTO events (id, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                str(uuid.uuid4()),
+                "phase_7_chain_error",
+                json_param({
+                    "candidate_id": candidate_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:200],
+                }),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+        chain["phase_7"] = {"status": "error", "error": type(exc).__name__}
+        return chain
+
+    if chain["phase_7"].get("status") != "patch_emitted":
+        return chain  # too invasive / wrong state / missing — stop.
+
+    # ---- Phase 8 ----
+    try:
+        apply_spec = spec_from_file_location(
+            "op_apply_canary_chain",
+            scripts_dir / "op_assistant_apply_canary.py",
+        )
+        assert apply_spec is not None and apply_spec.loader is not None
+        apply_mod = module_from_spec(apply_spec)
+        sys.modules[apply_spec.name] = apply_mod
+        apply_spec.loader.exec_module(apply_mod)
+        chain["phase_8"] = apply_mod.apply_candidate(store, candidate_id)
+    except Exception as exc:
+        store.execute(
+            "INSERT INTO events (id, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                str(uuid.uuid4()),
+                "phase_8_chain_error",
+                json_param({
+                    "candidate_id": candidate_id,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:200],
+                }),
+                datetime.now(timezone.utc).isoformat(),
+            ],
+        )
+        chain["phase_8"] = {"status": "error", "error": type(exc).__name__}
+    return chain
 
 
 def render_sandbox_followup(result: dict[str, Any], summary: str) -> str:
@@ -442,32 +519,101 @@ def dispatch_callback(*,
                 )
         return result
 
-    if action in ("kill", "killall"):
-        # Phase 8 territory — not in scope this round. Audit-log and tell
-        # Gary the feature isn't online yet so he doesn't think he was
-        # ignored.
-        store.execute(
-            "INSERT INTO events (id, event_type, payload, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            [
-                str(uuid.uuid4()),
-                "telegram_callback_unsupported",
-                json_param({
-                    "action": action,
-                    "target_id_hex": target_id_hex,
-                    "source_event_id": source_event_id,
-                    "by_actor": actor,
-                }),
-                datetime.now(timezone.utc).isoformat(),
-            ],
+    if action == "kill":
+        candidate_uuid = hex32_to_uuid(target_id_hex)
+        from importlib.util import module_from_spec, spec_from_file_location
+        apply_spec = spec_from_file_location(
+            "op_apply_canary_kill",
+            Path(REPO_PATH) / "scripts" / "op_assistant"
+            / "op_assistant_apply_canary.py",
         )
+        assert apply_spec is not None and apply_spec.loader is not None
+        apply_mod = module_from_spec(apply_spec)
+        sys.modules[apply_spec.name] = apply_mod
+        apply_spec.loader.exec_module(apply_mod)
+        out = apply_mod.kill_candidate(
+            store, candidate_uuid, by_actor=actor,
+            reason="telegram_kill_button",
+        )
+        summary, status = _candidate_summary(store, candidate_uuid)
+        if out["status"] == "killed":
+            reply = (
+                f"💥 已 KILL{summary}\n\n"
+                f"接下來會發生:\n"
+                f"• 已套用的 patch 自動 git revert ({out.get('reverted_commit_sha', '?')})\n"
+                f"• bot 服務重啟,規則回到 KILL 前的狀態\n"
+                f"• candidate 狀態 → killed\n"
+                f"• 重啟結果: {'成功' if out.get('service_restart_ok') else '失敗'}"
+            )
+        elif out["status"] == "wrong_state":
+            reply = (
+                f"⏭ 無法 KILL({summary},目前狀態:{status})\n"
+                f"只有 applied / patch_emitted 狀態的候選才能 KILL。"
+            )
+        else:
+            reply = f"❓ KILL 失敗: {out['status']}"
         return {
             "action": action,
-            "claim": None,
+            "claim": "ok" if out["status"] == "killed" else None,
+            "reply_text": reply,
+            "kill_result": out,
+        }
+
+    if action == "killall":
+        # Per callback_data_v0.md §killall: dispatcher expands daily summary
+        # to its applied-candidate list and loops the kill transaction.
+        summary_uuid = hex32_to_uuid(target_id_hex)
+        applied = store.fetch_all(
+            "SELECT id::text AS id FROM improvement_candidates "
+            "WHERE source_event_id = ? AND status = 'applied'",
+            [summary_uuid],
+        )
+        if not applied:
+            return {
+                "action": action,
+                "claim": None,
+                "reply_text": (
+                    "⏭ 這份整理紙條目前沒有任何 applied 的候選需要 KILL。"
+                ),
+            }
+        from importlib.util import module_from_spec, spec_from_file_location
+        apply_spec = spec_from_file_location(
+            "op_apply_canary_killall",
+            Path(REPO_PATH) / "scripts" / "op_assistant"
+            / "op_assistant_apply_canary.py",
+        )
+        assert apply_spec is not None and apply_spec.loader is not None
+        apply_mod = module_from_spec(apply_spec)
+        sys.modules[apply_spec.name] = apply_mod
+        apply_spec.loader.exec_module(apply_mod)
+        killed_count = 0
+        skipped_count = 0
+        failed_count = 0
+        for row in applied:
+            out = apply_mod.kill_candidate(
+                store, row["id"], by_actor=actor,
+                reason="telegram_killall_button",
+            )
+            if out["status"] == "killed":
+                killed_count += 1
+            elif out["status"] == "wrong_state":
+                skipped_count += 1
+            else:
+                failed_count += 1
+        return {
+            "action": action,
+            "claim": "ok",
             "reply_text": (
-                "⚠️ KILL 還沒實作(Phase 8 才會開)。"
-                "如果真的需要緊急退回,先在電腦上 git revert。"
+                f"💥 KILL 結果:\n"
+                f"  ✅ 已 KILL: {killed_count} 條\n"
+                f"  ⏭ 已過期跳過: {skipped_count} 條\n"
+                f"  ❌ 系統失敗: {failed_count} 條"
             ),
+            "killall_counts": {
+                "killed": killed_count,
+                "skipped": skipped_count,
+                "failed": failed_count,
+            },
         }
 
     # Defensive default — should never reach here because parse_callback_data

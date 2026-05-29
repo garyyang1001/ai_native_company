@@ -402,7 +402,12 @@ class DispatchCallbackIntegrationTests(unittest.TestCase):
         ]
         self.assertEqual(len(malformed_events), 1)
 
-    def test_unsupported_kill_returns_phase8_message(self) -> None:
+    def test_kill_against_draft_returns_wrong_state(self) -> None:
+        """Round 11 wired kill to Phase 8 kill_candidate. A candidate
+        still in 'draft' (the seed state in this test fixture) is not
+        applied / patch_emitted, so kill responds with wrong_state and
+        does not touch git or the bot service.
+        """
         store = self._store()
         result = dp.dispatch_callback(
             store=store,
@@ -410,12 +415,10 @@ class DispatchCallbackIntegrationTests(unittest.TestCase):
             source_event_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
             callback_query=self._callback(f"kill:{self.CANDIDATE_HEX}"),
         )
-        self.assertIn("Phase 8", result["reply_text"])
-        unsupported_events = [
-            e for e in store.events
-            if e["event_type"] == "telegram_callback_unsupported"
-        ]
-        self.assertEqual(len(unsupported_events), 1)
+        self.assertEqual(result["action"], "kill")
+        self.assertIn("無法 KILL", result["reply_text"])
+        # kill_result carries the underlying Phase 8 status
+        self.assertEqual(result["kill_result"]["status"], "wrong_state")
 
 
 if __name__ == "__main__":

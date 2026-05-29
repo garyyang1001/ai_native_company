@@ -38,3 +38,5 @@ Gary chose "both" — process value (AI Native Company case study) **and** outco
 - [round-07.md](round-07.md) — 4 contracts locked(codex 兩輪 review:Round 7 給 4 全 No-Go 我全收,Round 7.5 給 2 Go + 2 small SQL/wording fix 我全修)
 - [round-08.md](round-08.md) — Phase 6 sandbox replay engine + Phase 3 inline keyboard + sandbox DB scaffold(3 commits / 45 tests pass / 2 production candidates replayed `passed`)
 - [round-09.md](round-09.md) — Phase 4 dispatcher + Phase 5 audit chain wire-up(atomic claim → sandbox trigger → Telegram reply;21 dispatcher tests + production `vw` smoke test passed;110 tests total)
+- [round-10.md](round-10.md) — Phase 7 patch emitter + AST guard(13 tests / production smoke wrong_state path / V0.3 simple skips regex → patch_too_invasive)
+- [round-11.md](round-11.md) — Phase 8 simple apply + KILL switch + dispatcher full chain wire-up(139 tests total)
