@@ -5,6 +5,15 @@
 **諮詢**:codex gpt-5.5 high-effort review(`019e6f2d-25b9-7f52-aeac-3e058d3f6b88`)+ karpathy-guidelines 4 原則 + Gary 自動度討論(2026-05-29)
 **Code is Rule 不能破**:routing / decision = deterministic Python;LLM 只能在「整理 / 建議」介入,絕不在「決策 / apply」做 orchestrator
 **自動度拍板(2026-05-29)**:D1-D5 dial 全拉到 1(半自動有護欄)+ canary 5 通/8 小時/30% threshold + Telegram inline keyboard + KILL 按鈕 + 自動 metric 異常 revert + 限 append data list
+**迭代設計**:Plan B karpathy-aligned per-phase ship loop;round-by-round log in [v0.3-iteration-log/](v0.3-iteration-log/)
+
+---
+
+> **V0.3 一句話 framing(codex Round 1 提案,2026-05-29):**
+>
+> **「V0.3 不是『AI 自動改規則』,是『AI 提案,人批准,系統可重播、可驗證、可回滾』。」**
+>
+> 任何 Phase 2-8 spec 違背這句話 → 重做。
 
 ---
 
@@ -107,33 +116,166 @@ graph TD
 
 ### Phase 2: gemma4 actionable → improvement_candidates 寫入
 
-(**使用**:`op_assistant_kernel.improvement_candidates`;**關聯**:`scripts/op_assistant/op_assistant_daily_curate.py` 加寫入;**用途**:把整理結果從「只存 events.payload」升級成「正式 candidate row」)
+(**使用**:`op_assistant_kernel.improvement_candidates`;**關聯**:`scripts/op_assistant/op_assistant_daily_curate.py` 加寫入 + `closed_loop_kernel/postgres.py` schema migration;**用途**:把整理結果從「只存 events.payload」升級成「契約級 candidate row,可追、可批准、可測試、可套用」)
 
-**目前**:gemma4 出的 actionable 只存在 `events.daily_curation_summary.payload.actionable`(JSON 陣列)。
-**V0.3**:每個 actionable 物件 = 一個 candidate row。
+**Round 2 spec collapsed 2026-05-29**(`v0.3-iteration-log/round-02.md` 完整 trail)。下面是 final spec,改自 Round 1 粗描述:codex xhigh Round 2 review 我 7 條反提案我全收。
 
-**需要的 schema 變動**(改 `closed_loop_kernel/postgres.py`):
+#### 2.1 schema 變動(改 `closed_loop_kernel/postgres.py`)
 
 ```sql
-ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS domain TEXT;
-ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS source_event_id UUID;
-ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS proposal_type TEXT;
-ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS typed_payload JSONB;
-ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS approval_channel TEXT;
-ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS approved_by TEXT;
-ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS payload_hash TEXT;
-ALTER TABLE improvement_candidates ADD COLUMN IF NOT EXISTS replay_result_hash TEXT;
+-- 既有 V0.2 schema 已有 status / target_artifact_id / patch_type /
+-- validation_assertions / rollback_plan,本 phase 加 12 個 NULL-able 欄位:
+
+ALTER TABLE improvement_candidates
+  ADD COLUMN IF NOT EXISTS domain TEXT,                     -- 'op-assistant' (V0.3) / 'marketing-agent' (V0.4)
+  ADD COLUMN IF NOT EXISTS source_event_id UUID,            -- events.daily_curation_summary.id (one per period_key)
+  ADD COLUMN IF NOT EXISTS curation_run_id UUID,            -- daily_curate 每次跑 new uuid4 — Round 2 U2 dedupe key
+  ADD COLUMN IF NOT EXISTS proposal_index INT,              -- 該 run 內 actionable list index
+  ADD COLUMN IF NOT EXISTS proposal_type TEXT,              -- 'availability_keyword' / 'availability_regex'
+  ADD COLUMN IF NOT EXISTS schema_version TEXT,             -- 'v0.3.0' — Round 2 U1 hash envelope 包進
+  ADD COLUMN IF NOT EXISTS typed_payload JSONB,             -- structured slot data
+  ADD COLUMN IF NOT EXISTS payload_hash TEXT,               -- Round 2 U1 sha256 over envelope
+  ADD COLUMN IF NOT EXISTS generator_metadata JSONB,        -- Round 2 U37 — model / prompt_artifact_id / git_sha / corpus window
+  ADD COLUMN IF NOT EXISTS candidate_sources JSONB
+        NOT NULL DEFAULT '[]'::jsonb,                       -- Round 2 U39 — trace back to inbound events
+  ADD COLUMN IF NOT EXISTS approval_channel TEXT,           -- 留接口 (V0.4 Slack/email)
+  ADD COLUMN IF NOT EXISTS approved_by TEXT,
+  ADD COLUMN IF NOT EXISTS replay_result_hash TEXT;         -- Phase 6 後 backfill
+
+-- Round 2 U2 idempotency — 同 curation run 同 index 不能雙寫:
+ALTER TABLE improvement_candidates
+  ADD CONSTRAINT IF NOT EXISTS candidates_run_proposal_unique
+    UNIQUE (curation_run_id, proposal_index);
+
+-- Round 2 U34 狀態 enum (PG 端硬擋):
+ALTER TABLE improvement_candidates
+  ADD CONSTRAINT IF NOT EXISTS candidates_status_check
+    CHECK (status IN ('created', 'pushed_to_telegram',
+                       'approved', 'rejected',
+                       'sandbox_pending', 'sandbox_verified', 'sandbox_failed',
+                       'patch_emitted', 'patch_too_invasive',
+                       'canary_running', 'applied', 'killed'));
 ```
 
-(codex Q4:加欄位,不另開表。`domain` 留接口給 marketing-agent。`approval_channel` 留接口給未來 Slack / email)
+**Karpathy 3 surgical**:既有 `target_artifact_id` / `patch_type` / `validation_assertions` / `rollback_plan` 欄位保留不動;`status` 加 CHECK 但既有值('draft' 等)需 migration 對應(計畫:既有 row alter 成 'created')。15+ V0.2 consumers 全部讀既有欄位 → 不受影響。
 
-**Karpathy 3 surgical**:既有 `target_artifact_id` / `patch_type` / `validation_assertions` / `rollback_plan` / `status` 欄位**保留不動**。新欄位 NULL-able,既有 15+ consumers 不受影響。
+#### 2.2 candidate lifecycle 狀態機(Round 2 U34)
 
-**proposal_type 嚴格 enum**(V0.3 只開兩種):
+```
+created → pushed_to_telegram → approved | rejected
+                                    ↓ (approved)
+                              sandbox_pending → sandbox_verified | sandbox_failed
+                                                       ↓ (sandbox_verified)
+                                                 patch_emitted | patch_too_invasive
+                                                       ↓ (patch_emitted)
+                                                 canary_running → applied | killed
+```
+
+每次 status update 必同 transaction 寫 `events.candidate_status_changed`:`{candidate_id, from_status, to_status, by_phase, by_actor}` — append-only,可重建時間線。
+
+Python module-level `CandidateStatus(StrEnum)` + `_VALID_TRANSITIONS: dict[CandidateStatus, set[CandidateStatus]]` 拒絕非法 jump;PG CHECK 是第二道防線。
+
+#### 2.3 payload_hash 演算法(Round 2 U1)
+
+```python
+def compute_payload_hash(proposal_type: str, typed_payload: dict,
+                          schema_version: str = "v0.3.0") -> str:
+    envelope = {
+        "proposal_type": proposal_type,
+        "schema_version": schema_version,
+        "typed_payload": typed_payload,
+    }
+    canon = json.dumps(envelope, sort_keys=True,
+                       ensure_ascii=False, separators=(',', ':'))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+```
+
+callback_data 用前 8 字。整個 approval/replay/audit chain 都以此為錨點。
+
+#### 2.4 typed_payload validator(Round 2 U3)
+
+```python
+class TypedPayloadError(ValueError): ...
+
+_FORBIDDEN_KW_METACHARS = set(".^$*+?{}[]\\|()")
+_MAX_KEYWORD_LEN = 50
+_MAX_REGEX_LEN = 200
+_FORBIDDEN_REGEX_PATTERNS = [
+    r"(?:.+){2,}",         # nested quantifier (catastrophic backtracking)
+    r"\(\?\:[^)]*\)\+",    # (?:...) +
+]
+
+def validate_typed_payload(proposal_type: str, payload: dict) -> None:
+    if proposal_type == "availability_keyword":
+        kw = payload.get("keyword")
+        if not isinstance(kw, str):
+            raise TypedPayloadError("keyword must be str")
+        if not (1 <= len(kw) <= _MAX_KEYWORD_LEN):
+            raise TypedPayloadError(f"keyword len must be 1-{_MAX_KEYWORD_LEN}")
+        if _FORBIDDEN_KW_METACHARS & set(kw):
+            raise TypedPayloadError("keyword contains regex metachars")
+    elif proposal_type == "availability_regex":
+        pat = payload.get("pattern")
+        if not isinstance(pat, str):
+            raise TypedPayloadError("pattern must be str")
+        if not (1 <= len(pat) <= _MAX_REGEX_LEN):
+            raise TypedPayloadError(f"pattern len must be 1-{_MAX_REGEX_LEN}")
+        for forbidden in _FORBIDDEN_REGEX_PATTERNS:
+            if re.search(forbidden, pat):
+                raise TypedPayloadError(f"pattern matches forbidden form: {forbidden}")
+        try:
+            re.compile(pat)
+        except re.error as exc:
+            raise TypedPayloadError(f"pattern not compilable: {exc}") from None
+    else:
+        raise TypedPayloadError(f"unsupported proposal_type: {proposal_type}")
+```
+
+**重點**:用 `raise TypedPayloadError`,不用 `assert`(`python -O` 會關 assert);regex 還禁 nested quantifier 防 catastrophic backtracking。V0.4 評估 RE2 取代 `re`。
+
+#### 2.5 generator_metadata 結構(Round 2 U37)
+
+```python
+generator_metadata = {
+    "generator_name": "op_assistant_daily_curate",
+    "generator_code_version": "<git rev-parse HEAD on daily_curate.py>",
+    "model": "gemma4:e4b",
+    "model_params": {"temperature": 0.2, "response_format": "json_object"},
+    "prompt_artifact_id": "<events.id of daily_curate_prompt_archive>",
+    "prompt_version": "v0.3.1",
+    "prompt_hash": "<sha256 of full prompt text>",
+    "schema_version": "v0.3.0",
+    "corpus_window_start_at": "ISO8601",
+    "corpus_window_end_at": "ISO8601",
+    "corpus_inbound_count": 0,
+    "corpus_failure_count": 0,
+}
+```
+
+完整 prompt 全文以 `events.daily_curate_prompt_archive` event 落地(uuid5 idempotent by `prompt_hash`);candidate 引用 `prompt_artifact_id`,Phase 6 replay 真正能找回當時 prompt。
+
+#### 2.6 candidate_sources 結構(Round 2 U39)
+
+```python
+# JSONB array, each entry:
+{
+    "source_type": "failure",            # | "inbound_event" | "manual"
+    "source_id": "<failures.id or events.id>",
+    "inbound_event_id": "<events.op_assistant_line_inbound.id>",
+    "match_reason": "curated_failure",   # | "substring_match" | "manual_pin"
+    "confidence": 1.0,                   # curated=1.0, heuristic<1.0
+}
+```
+
+**優先順序**:curated_failure(failures 表的 attempt_id → attempt_envelopes → events.inbound 鏈)> substring_match(fallback) > manual_pin。 **Round 3 必 spike** failures→inbound 鏈穩定性(R18)。
+
+#### 2.7 proposal_type 嚴格 enum
+
+V0.3 只開兩種:
 - `availability_keyword` — append 進 `_AVAILABILITY_KEYWORDS`
 - `availability_regex` — append 進 `_DATE_PATTERNS` 或自訂 list
 
-**V0.3 不開放** `new_intent`(會連動 worker,複雜度跳一級)。gemma4 給 `intent` 類 actionable 在 Phase 2 直接 reject 並寫進 `events.improvement_candidate_rejected`,日後 V0.4 再開。
+**V0.3 不開放** `new_intent`(連動 worker,複雜度跳一級)。gemma4 給 `intent` 類 actionable → Phase 2 寫 `events.improvement_candidate_rejected`(payload 完整保留 raw actionable + rejection_reason='intent_not_supported_v0.3')→ V0.4 開放後可回頭批次處理。
 
 ### Phase 3: Telegram daily 推 inline keyboard 按鈕
 
@@ -416,6 +558,8 @@ ALTER TABLE approvals ADD COLUMN IF NOT EXISTS replay_result_hash TEXT;
 | R14 | DB liveness / reconnect — KernelStore single connection;PG restart 後全服務 500 | Phase 1 standalone test 跑得起,但部署前必補;最簡單:catch psycopg.OperationalError 自動重建 connection + `/health` 拆 live/readiness(readiness 真碰 DB) |
 | R15 | LLM-import fence 目前只靠社交守則(README 註明、code review)。沒 technical guard | V0.3.5 加 pre-commit / pytest AST 規則,禁 `import (openai|anthropic|ollama)` 進 `plugins/telegram-op-control/`;Phase 7 patch_emitter 同樣禁 LLM import 進入 auto-patched data files |
 | R16 | Stale button replay — 舊 callback button 沒過期就一直能按,Phase 4 可能接受過期決策 | callback_data 已含 `payload_hash_prefix`(候選 payload 變了就對不上);Phase 4 dispatcher 額外查 `candidate.status in {'sandbox_verified'}` 才接受;成功處理後 edit_message 移除 keyboard |
+| R17 | **Reviewer separation rule**(Round 1 codex U35)— 同一個 AI 不能 propose + review + apply 同條改善,違反 human quality gate | 設計層強制:gemma4 只 propose;Gary explicit approve(deterministic dispatcher 不能代);sandbox replay 純 Python(無 LLM);AST guard 純 Python。Phase 6/7/8 任何 LLM 介入 = 違反 → V0.3.5 加 pre-commit AST 掃 LLM import |
+| R18 | **failures → inbound event 鏈穩定性**(Round 2 codex assumption #2)— U39 candidate_sources 取「curated_failure」優先,但 failures 表的 attempt_id → attempt_envelopes → events.inbound 鏈我們沒實證 | **Round 3 必 spike**:讀 `closed_loop_kernel/postgres.py` failures schema,抽 5 個 production failures row 跟 inbound 對照,確認 chain 可 reconstruct;不穩 → 加 `failures.inbound_event_id` direct FK 列 |
 
 ## 10. 施工順序 + success criteria
 
@@ -453,6 +597,29 @@ ALTER TABLE approvals ADD COLUMN IF NOT EXISTS replay_result_hash TEXT;
   - codex 沒提到 `improvement_candidate_rejected` event 保留 V0.3 reject 的 actionable(我加進去,V0.4 開放後不丟失)
   - codex 沒提到 R2(候選 payload 被 gemma4 下一輪改寫),我加入
   - codex 沒提到 R7 over-greedy / R8 流量過低 canary 失效 / R9 LLM 自身錯誤,Gary 對話後加入
+
+### 2026-05-29 接續設計 iteration loop(Round 1 + 2)
+
+Gary 2026-05-29 mandate「思考拉滿 + codex xhigh + 100 輪 iteration + 必要技能全開 + 範圍含 AI Native Company」。karpathy lens 後改 Plan B(per-phase ship loop)。Round-by-round artifact 在 [v0.3-iteration-log/](v0.3-iteration-log/)。
+
+**Round 1**(`round-01.md`):
+- Claude enumerate 33 條 architectural unknowns + codex xhigh 加 8 條 → 41 total
+- 15 p0 / 22 p1 / 3 p2 / 1 defer
+- codex 神 catch:U34 lifecycle / U35 reviewer separation(R17)/ U37 prompt-version pinning / U39 observation→candidate trace
+- 一句話 framing(已寫入本 doc 開頭):「V0.3 不是『AI 自動改規則』,是『AI 提案,人批准,系統可重播、可驗證、可回滾』」
+- codex demote U30 marketing handler / U31 V0.4 path / U23 author tag / U8 layout(scope creep)
+
+**Round 2**(`round-02.md`):
+- 8 條 p0 spec proposal vs codex xhigh
+- Claude 1 ✓ + 7 ✗(全反提案)→ **全 7 個反提案採納**
+  - U1 hash envelope 包 proposal_type + schema_version
+  - U2 `curation_run_id` 為 dedupe key,不用 LLM 排序 index
+  - U3 `raise TypedPayloadError` 不 `assert`(防 `-O`)+ regex 禁 nested quantifier
+  - U37 metadata 加 generator_name / prompt_artifact_id / git_sha / model_params
+  - U39 `candidate_sources` JSONB array of typed object,優先 curated failures inbound link
+  - U10 `TELEGRAM_ALLOWED_ACTORS` production 必填,dev 用 explicit escape hatch
+  - U11 三層防護:source_event_id UNIQUE + candidate UNIQUE final + guarded UPDATE
+- Phase 2 spec collapsed,Round 3 預備:Phase 2 brief 寫 + R18 spike + U35 enforcement spec
 
 ### 2026-05-29 codex xhigh deeper Phase 1 review
 

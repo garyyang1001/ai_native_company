@@ -30,3 +30,4 @@ Gary chose "both" — process value (AI Native Company case study) **and** outco
 ## Index
 
 - [round-01.md](round-01.md) — initial enumeration (41 unknowns) + priority + Round 2 plan
+- [round-02.md](round-02.md) — 8 條 p0 spec collapse (Claude 1 ✓ + 7 ✗ codex 反提案,全採納)
