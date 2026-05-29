@@ -253,6 +253,57 @@ ALTER TABLE improvement_candidates ALTER COLUMN proposed_content DROP NOT NULL;
 ALTER TABLE improvement_candidates ALTER COLUMN validation_assertions DROP NOT NULL;
 ALTER TABLE improvement_candidates ALTER COLUMN rollback_plan DROP NOT NULL;
 
+-- V0.3 Phase 4 dispatcher (Gary 2026-05-29 Round 7 contract approval_audit_v0.md):
+-- approvals 表加 4 NULL-able 欄位 + 兩個 unique index + 擴 decision enum 含 'killed'.
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS approval_channel TEXT;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS source_event_id UUID;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS channel_message_id TEXT;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS reject_reason TEXT;
+
+DO $$ BEGIN
+    ALTER TABLE approvals DROP CONSTRAINT IF EXISTS approvals_decision_check;
+    ALTER TABLE approvals ADD CONSTRAINT approvals_decision_v03_check
+        CHECK (decision IN ('approved', 'rejected', 'killed'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+-- Full unique index, not partial. PG NULLS DISTINCT default lets V0.2
+-- OHYA-demo rows with source_event_id IS NULL coexist; Phase 4 dispatcher
+-- always writes a non-NULL source_event_id so retry / restart is blocked.
+CREATE UNIQUE INDEX IF NOT EXISTS approvals_source_event_unique
+    ON approvals (source_event_id);
+
+-- One final decision per candidate; 'killed' lives outside this predicate
+-- so a killed-after-approved sequence still satisfies the index.
+CREATE UNIQUE INDEX IF NOT EXISTS approvals_candidate_final_unique
+    ON approvals (candidate_id) WHERE decision IN ('approved', 'rejected');
+
+-- V0.3 Phase 6 sandbox replay (Gary 2026-05-29 Round 7 contract
+-- sandbox_protocol_v0.md): sandbox_runs lives in both production
+-- op_assistant_kernel (so approved candidates from real Gary clicks get
+-- replay rows) AND op_assistant_sandbox_kernel (so the 1000-case sim
+-- writes its own runs there). Same schema in both places.
+CREATE TABLE IF NOT EXISTS sandbox_runs (
+    id UUID PRIMARY KEY,
+    candidate_id UUID NOT NULL,
+    seed BIGINT NOT NULL,
+    corpus_size INT NOT NULL,
+    corpus_snapshot_hash TEXT NOT NULL,
+    clock_started_at TIMESTAMPTZ NOT NULL,
+    model_digest TEXT NOT NULL,
+    metrics JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    status TEXT NOT NULL CHECK (status IN (
+        'running', 'passed', 'failed', 'orphaned'
+    )),
+    fail_reason TEXT,
+    duration_ms INT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS sandbox_runs_candidate
+    ON sandbox_runs (candidate_id, created_at DESC);
+
 CREATE OR REPLACE VIEW view_orphan_attempts AS
 SELECT
     le.attempt_id,
