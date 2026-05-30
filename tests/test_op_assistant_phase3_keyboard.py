@@ -14,7 +14,7 @@ import sys
 import unittest
 from pathlib import Path
 
-REPO = "/home/wannavegtour/Desktop/AI Native Company/Gary"
+REPO = str(Path(__file__).resolve().parents[1])
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 

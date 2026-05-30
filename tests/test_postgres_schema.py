@@ -1,6 +1,6 @@
 import unittest
 
-from closed_loop_kernel.postgres import render_postgres_schema
+from closed_loop_kernel.postgres import APPEND_ONLY_TABLES, render_postgres_schema
 
 
 class PostgresSchemaTests(unittest.TestCase):
@@ -17,15 +17,10 @@ class PostgresSchemaTests(unittest.TestCase):
         ddl = render_postgres_schema()
 
         self.assertIn("CREATE OR REPLACE FUNCTION prevent_mutation()", ddl)
-        for table in [
-            "events",
-            "attempt_lifecycle_events",
-            "attempts",
-            "tool_calls",
-            "decisions",
-            "approvals",
-        ]:
+        for table in APPEND_ONLY_TABLES:
             self.assertIn(f"BEFORE UPDATE OR DELETE ON {table}", ddl)
+        self.assertIn("DROP TRIGGER IF EXISTS trg_protect_events ON events", ddl)
+        self.assertNotIn("BEFORE UPDATE OR DELETE ON events", ddl)
 
     def test_schema_includes_orphan_attempt_view(self):
         ddl = render_postgres_schema()

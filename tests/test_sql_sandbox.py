@@ -5,10 +5,19 @@ import unittest
 from closed_loop_kernel import KernelEngine, SecurityError, SqlSandbox
 from tests.postgres_test_utils import build_postgres_store
 
+PLACEHOLDER_TEST_DATABASE_URL = "postgresql://test:test@localhost/none"
+
 
 def _skip_unless_postgres_available():
-    if not os.environ.get("KERNEL_DATABASE_URL"):
+    url = os.environ.get("KERNEL_DATABASE_URL")
+    if not url:
         raise unittest.SkipTest("KERNEL_DATABASE_URL is required for SqlSandbox tests")
+    if url == PLACEHOLDER_TEST_DATABASE_URL:
+        raise unittest.SkipTest("KERNEL_DATABASE_URL points at an op-assistant unit-test placeholder")
+    try:
+        import psycopg  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise unittest.SkipTest("psycopg is required for SqlSandbox tests") from exc
 
 
 class SqlSandboxTests(unittest.TestCase):

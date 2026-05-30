@@ -1,16 +1,14 @@
-import os
 import unittest
 import threading
 from urllib.request import urlopen
 
 from closed_loop_kernel.http_app import open_store, route_post, route_request, seed_demo_store, serve
-from tests.env_utils import enable_destructive_reset_for_test
+from tests.env_utils import enable_destructive_reset_for_test, skip_unless_real_postgres_url
 
 
 class HttpAppTests(unittest.TestCase):
     def setUp(self):
-        if not os.environ.get("KERNEL_DATABASE_URL"):
-            raise unittest.SkipTest("KERNEL_DATABASE_URL is required for PostgreSQL integration tests")
+        skip_unless_real_postgres_url(self)
         enable_destructive_reset_for_test(self)
         self.store = seed_demo_store()
         self.addCleanup(self.store.close)

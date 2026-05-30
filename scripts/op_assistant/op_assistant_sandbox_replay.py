@@ -68,7 +68,7 @@ def _load_env() -> None:
 
 REPO_PATH = os.environ.get(
     "WANNAVEGTOUR_REPO_PATH",
-    "/home/wannavegtour/Desktop/AI Native Company/Gary",
+    str(Path(__file__).resolve().parents[2]),
 )
 if REPO_PATH not in sys.path:
     sys.path.insert(0, REPO_PATH)
