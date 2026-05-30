@@ -18,3 +18,5 @@ venv/
 *.lock
 .prototype-*.png
 
+.claude/
+.gstack/

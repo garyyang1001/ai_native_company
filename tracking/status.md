@@ -6,8 +6,8 @@
 
 ## 1. 核心狀態摘要 (Status Summary)
 
-*   **目前整體狀態**：`ohya-cms-draft-executor-slice-in-progress` (PostgreSQL-backed KernelStore、Python subprocess sandbox、SQL DDL sandbox、HTTP UI approve/reject、Scenario 1/2 demo 仍可重跑；Hermes 整合路線已從 Daguantech 改為 OHYA profile-level slice，第一個驗證對象是 `cms-draft-executor`；EventReporter 支援 `profile_filter` 與 dirty-row reason；`ohya_demo` 預設不再寫入傳入的 kanban.db；仍非正式生產部署級)
-*   **最近一次修改時間**：2026-05-25T02:23:26+08:00
+*   **目前整體狀態**：`ohya-cms-draft-executor-slice-in-progress` (PostgreSQL-backed KernelStore、Python subprocess sandbox、SQL DDL sandbox、HTTP UI approve/reject、Scenario 1/2 demo 仍可重跑；Hermes 整合路線已清理為 OHYA-only profile-level slice，第一個驗證對象是 `cms-draft-executor`；EventReporter 支援 `profile_filter` 與 dirty-row reason；`ohya_demo` 預設不再寫入傳入的 kanban.db；仍非正式生產部署級)
+*   **最近一次修改時間**：2026-05-30T00:00:00+08:00
 *   **剩餘 Open Issues**：
     *   **Blocker/High**: 0
     *   **Deferred Medium/Low (已知風險)**: 2（原 3 已收斂 1：ISSUE-002 並行 apply race condition 已修為 FIX-005，詳見 tracking/open-issues.md）
@@ -31,7 +31,7 @@
 | **研究自檢** | [source-alignment.md](notes/source-alignment.md) | YC 逐字稿概念對齊與玩具 Demo 陷阱剖析 | `Reviewed` |
 | **研究自檢** | [research-findings.md](notes/research-findings.md) | 5 個真實、具體的外部技術來源與啟發 | `Reviewed` |
 | **研究自檢** | [self-review.md](notes/self-review.md) | 務實自檢、剔除自嗨詞、詳列 3 大殘留風險 | `Reviewed` |
-| **整合評估** | [hermes-integration-assessment-v0.md](docs/hermes-integration-assessment-v0.md) | Hermes 10 個兄弟資料夾完整掃描、事業/客戶地圖、多租戶 FK 計畫、三條落地路線（2026-05-24） | `Awaiting Gary Decision` |
+| **整合評估** | [hermes-integration-assessment-v0.md](docs/hermes-integration-assessment-v0.md) | OHYA-only 整合評估，聚焦 `cms-draft-executor` 切片、dirty-row 隔離與下一個 isolated snapshot runner | `In Progress` |
 | **整合切片** | [ohya-cms-draft-executor-slice-v0.md](docs/ohya-cms-draft-executor-slice-v0.md) | OHYA 第一個 profile-level 驗證切片，只接 `cms-draft-executor` 並隔離髒資料 | `In Progress` |
 | **本地 prototype** | [PROTOTYPE.md](PROTOTYPE.md) | 本地可跑 prototype 範圍、命令與邊界 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/](closed_loop_kernel/) | PostgreSQL store 與核心 engine 初版 | `In Progress` |

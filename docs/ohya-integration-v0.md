@@ -152,7 +152,7 @@ reporter = EventReporter(
 2. **唯讀打開 kanban.db** — 用 `?mode=ro` URI 防誤寫
 3. **讀 checkpoint** — 從 `events` 表找 `event_type='kanban_sync_checkpoint'` 最新一筆
 4. **掃 task_events** — `WHERE id > checkpoint.last_event_id ORDER BY id ASC`
-5. **掃 task_runs** — `WHERE ended_at IS NOT NULL AND ended_at > checkpoint.last_sync_at`（已完成的 run）
+5. **掃 task_runs** — 依 checkpoint 讀取新增 run；缺 `ended_at`、缺必要欄位或不支援 outcome 的 row 會進 `skipped_rows`，不寫成正式 attempts
 6. **批次寫入 ohya_kernel** — 每批 100 筆走 transaction、失敗整批 rollback
 7. **更新 checkpoint** — 成功後寫新一筆 `kanban_sync_checkpoint`
 
@@ -168,13 +168,13 @@ reporter = EventReporter(
 ## 階段 4 - 6 概要（後續 commits）
 
 - **階段 4**：第一個閉環 demo — 從 OHYA task_runs 抓到 `outcome='crashed'` → 自動 propose `improvement_candidates` → 跑 sandbox replay → 標 `approval_required`
-- **階段 5**：Telegram bot 中介 — 偵測 `approval_required` → 推 inline button 訊息 → 收到回應寫回 `approvals` 表
-- **階段 6**：1 週觀察期 — 跑真實事件流、看 schema / 對映 / sandbox 還缺什麼
+- **階段 5**：isolated snapshot runner — 複製 OHYA `kanban.db` 到隔離位置，只讀跑 `cms-draft-executor` profile slice，輸出 JSON + Markdown 報告
+- **階段 6**：觀察報告 — Gary 看同步數量、dirty-row 原因、failure/candidate 狀態後，再決定是否擴到第二個 OHYA profile
 
 ---
 
 ## 待 Gary 確認的事項
 
-1. OHYA kanban.db 已知損毀，要不要在 EventReporter 跑起來之前先做一次完整性檢查 + VACUUM / REINDEX？
-2. Telegram bot 用哪個 token？OHYA 既有的 coordinator bot 嗎？還是另開一支專門做批准的 bot？
-3. EventReporter 跑的頻率？每分鐘？每 5 分鐘？事件驅動（kanban.db 寫入時主動推）？
+1. OHYA kanban.db 已知損毀，snapshot runner 要不要先執行唯讀 `PRAGMA integrity_check` 並把結果寫進報告？
+2. isolated snapshot 報告要放在哪個 repo 內路徑，例如 `reports/ohya/`？
+3. Gary 看完第一份 snapshot 報告後，再決定是否做排程、外部通知或第二個 OHYA profile。
