@@ -135,12 +135,12 @@ data_flow_policy:
 *   **資料流邊界**：產出 `ga4_traffic_analysis` 產物，必須引用 GA4 報表雜湊作為 `source_refs`。
 
 ### 4.4 `seo-content-strategist` (SEO 內容規劃師)
-*   **職責**：接收分析師報告，設計關鍵字覆蓋策略、規劃文章結構大綱、撰寫 SEO 內容 Brief，維護全站 Brand Voice 與 Brand Rules。
+*   **職責**：接收 GSC、GA4、社群海巡、競品觀測與研究報告，設計 AI Native SEO 策略、關鍵字覆蓋策略、文章結構大綱、SEO 內容 Brief，維護全站 Brand Voice 與 Brand Rules。
 *   **工具限制**：擁有讀取機會報告與歷史 Content Brief 的權限。禁止操作發布與調試代碼工具。
-*   **資料流邊界**：產出 `seo_content_strategy` 與 `content_brief`，其 `data_flow_policy.memory_candidate_allowed` 可設為 `true`（SOP 規則類別）。
+*   **資料流邊界**：產出 `ai_search_visibility_report`、`seo_content_strategy` 與 `content_brief`，其 `data_flow_policy.memory_candidate_allowed` 可設為 `true`（SOP 規則類別）。
 
 ### 4.5 `reviewer` (內容與合規審核員)
-*   **職責**：作為一等公民的防禦角色。對分析報告、代碼補丁、文案草稿進行事實核對（Fact Check）、風險評估與 Brand Voice 對齊。
+*   **職責**：作為一等公民的防禦角色。對分析報告、代碼補丁、文案草稿、社群海巡報告與回文建議進行事實核對（Fact Check）、風險評估與 Brand Voice 對齊。
 *   **工具限制**：唯讀存取當次 Task 產生的所有 Envelope 與 Artifact。
 *   **資料流邊界**：產出 `review_report`。
 
@@ -160,7 +160,7 @@ data_flow_policy:
 *   **資料流邊界**：產出 `profile_update_proposal`。
 
 ### 4.9 `outcome-monitor` (成效監控員)
-*   **職責**：異步追蹤任務落地後的數據反饋。例如在內容更新 14 天與 30 天後，自動拉取 GSC 數據核對點擊數是否顯著改善，若成效衰退則自動拋出 `outcome_failure` 紀錄。
+*   **職責**：異步追蹤任務落地後的數據反饋。例如在內容更新 14 天與 30 天後，自動拉取 GSC 數據核對點擊數是否顯著改善，或追蹤社群回應後的公開互動變化，若成效衰退則自動拋出 `outcome_failure` 紀錄。
 *   **工具限制**：擁有 GSC/GA4 定時唯讀查詢權限。
 *   **資料流邊界**：產出 `outcome_report`。
 
@@ -180,7 +180,8 @@ data_flow_policy:
 > 4. **無全域記憶權限**：不允許直接推選、申請或變更公司全域記憶 (`promoted_memory_allowed: false`)。
 
 ### 5.1 `social-listener` (社群聆聽工具)
-*   **定位**：短期 API 抓取工具。抓取特定社群論壇有關關鍵字的討論，輸出必須包成 Source Reference 與 Machine Record，抓取完畢即釋放。
+*   **定位**：短期 API 抓取工具。抓取特定社群論壇、公開討論、新聞與品牌提及訊號，輸出必須包成 Source Reference 與 Machine Record，抓取完畢即釋放。
+*   **資料流邊界**：產出 `social_listening_digest`、`social_patrol_report` 或 `brand_presence_signal`。禁止直接回覆、私訊、發文或把 raw social data 推進長期記憶。
 
 ### 5.2 `competitor-monitor` (競品觀測器)
 *   **定位**：網頁爬蟲技能。對指定競品網站進行單次 HTML 抓取與變更對比，產出差異報告後釋放。
@@ -195,7 +196,12 @@ data_flow_policy:
 *   **定位**：大語言模型寫作技能。依據 Content Brief 產生文章草稿。其生成過程高度依賴 prompt 樣板，不具有自主決策權限。
 
 ### 5.6 `social-operator` (社群發文小幫手)
-*   **定位**：格式化包裝工具。將文章草稿轉化為適合 Facebook、Threads 或 LINE 的貼文格式。
+*   **定位**：格式化包裝工具。將文章草稿轉化為適合 Facebook、Threads 或 LINE 的貼文格式；或在 reviewer 與 Gary 批准後，把回文建議整理成 `human_reply_handoff`。
+*   **資料流邊界**：可產出 `social_post_draft` 或 `human_reply_handoff`。禁止自動發布、禁止自動回覆、禁止把未批准建議包裝成可發布內容。
+
+### 5.7 `social-reply-advisor` (社群回文建議工具)
+*   **定位**：根據 `social_patrol_report`、`brand_presence_signal`、品牌語氣與任務目標，產出可審核的回文建議。
+*   **資料流邊界**：產出 `social_reply_recommendation`。必須標註來源、建議回不回、建議回覆內容、風險、平台、需要的審核層級。禁止發布或傳送。
 
 ---
 
