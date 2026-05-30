@@ -280,12 +280,17 @@ Growth Intelligence v0 預留：
 gsc_opportunity_report
 ga4_traffic_analysis
 social_listening_digest
+social_patrol_report
+brand_presence_signal
 competitor_change_report
 youtube_transcript_summary
+ai_search_visibility_report
 seo_content_strategy
 content_brief
 content_draft
 social_post_draft
+social_reply_recommendation
+human_reply_handoff
 review_report
 sandbox_verification_report
 memory_promotion_note
@@ -635,6 +640,7 @@ growth-coordinator
 gsc-analyst
 ga4-analyst
 social-listener
+social-reply-advisor
 competitor-monitor
 research-analyst
 youtube-transcript-agent
@@ -660,7 +666,10 @@ ga4-analyst
   output_type: ga4_traffic_analysis
 
 social-listener
-  output_type: social_listening_digest
+  output_type: social_listening_digest / social_patrol_report / brand_presence_signal
+
+social-reply-advisor
+  output_type: social_reply_recommendation
 
 competitor-monitor
   output_type: competitor_change_report
@@ -669,10 +678,13 @@ youtube-transcript-agent
   output_type: youtube_transcript_summary
 
 seo-content-strategist
-  output_type: seo_content_strategy / content_brief
+  output_type: ai_search_visibility_report / seo_content_strategy / content_brief
 
 content-producer
   output_type: content_draft / social_post_draft
+
+social-operator
+  output_type: social_post_draft / human_reply_handoff
 
 reviewer
   output_type: review_report
@@ -713,6 +725,25 @@ Failure Record
   -> resolution type
   -> retry / data fix / artifact revision / workflow fix / profile update / system bug
 ```
+
+AI Native SEO 模組的第一個部門應用流程：
+
+```text
+Gary or intake channel creates SEO task
+  -> growth-coordinator creates Task Record
+  -> gsc-analyst produces gsc_opportunity_report
+  -> ga4-analyst produces ga4_traffic_analysis
+  -> social-listener produces social_patrol_report / brand_presence_signal
+  -> competitor-monitor produces competitor_change_report
+  -> seo-content-strategist produces ai_search_visibility_report / seo_content_strategy
+  -> social-reply-advisor produces social_reply_recommendation
+  -> reviewer produces review_report
+  -> Gary approves or rejects
+  -> social-operator produces human_reply_handoff only after approval
+  -> outcome-monitor checks GSC / GA4 / social results
+```
+
+白話說：社群海巡與回文建議可以變成 SEO 模組的正式工作產物，但 v0 不允許 agent 自動發布或自動回覆。
 
 只有真的需要修改 profile 時，才進：
 

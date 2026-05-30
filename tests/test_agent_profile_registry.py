@@ -49,6 +49,7 @@ class AgentProfileRegistryTests(unittest.TestCase):
             registry.dynamic_profile_ids(),
             [
                 "social-listener",
+                "social-reply-advisor",
                 "competitor-monitor",
                 "research-analyst",
                 "youtube-transcript-agent",
@@ -349,12 +350,69 @@ class AgentProfileRegistryTests(unittest.TestCase):
     def test_seo_content_strategist_can_write_strategy_and_brief(self):
         registry = AgentProfileRegistry.from_path(REGISTRY_PATH)
 
-        for output_type in ["seo_content_strategy", "content_brief"]:
+        for output_type in ["ai_search_visibility_report", "seo_content_strategy", "content_brief"]:
             with self.subTest(output_type=output_type):
                 registry.validate_output_envelope(
                     "seo-content-strategist",
                     valid_envelope("seo-content-strategist", output_type),
                 )
+
+    def test_social_listener_can_write_patrol_and_brand_signals(self):
+        registry = AgentProfileRegistry.from_path(REGISTRY_PATH)
+
+        for output_type in ["social_listening_digest", "social_patrol_report", "brand_presence_signal"]:
+            with self.subTest(output_type=output_type):
+                registry.validate_output_envelope(
+                    "social-listener",
+                    valid_envelope("social-listener", output_type),
+                )
+
+    def test_social_reply_advisor_can_recommend_but_not_prepare_handoff(self):
+        registry = AgentProfileRegistry.from_path(REGISTRY_PATH)
+
+        registry.validate_output_envelope(
+            "social-reply-advisor",
+            valid_envelope(
+                "social-reply-advisor",
+                "social_reply_recommendation",
+                machine_record={
+                    "summary": "Recommend replying with a low-risk correction",
+                    "approval_required": True,
+                },
+            ),
+        )
+
+        with self.assertRaisesRegex(ProfileRegistryError, "not allowed for profile 'social-reply-advisor'"):
+            registry.validate_output_envelope(
+                "social-reply-advisor",
+                valid_envelope("social-reply-advisor", "human_reply_handoff"),
+            )
+
+    def test_social_operator_can_prepare_handoff_but_not_recommend_reply(self):
+        registry = AgentProfileRegistry.from_path(REGISTRY_PATH)
+
+        for output_type in ["social_post_draft", "human_reply_handoff"]:
+            with self.subTest(output_type=output_type):
+                registry.validate_output_envelope(
+                    "social-operator",
+                    valid_envelope("social-operator", output_type),
+                )
+
+        with self.assertRaisesRegex(ProfileRegistryError, "not allowed for profile 'social-operator'"):
+            registry.validate_output_envelope(
+                "social-operator",
+                valid_envelope("social-operator", "social_reply_recommendation"),
+            )
+
+    def test_reviewer_can_read_social_patrol_and_reply_recommendations(self):
+        registry = AgentProfileRegistry.from_path(REGISTRY_PATH)
+
+        reviewer = registry.get_profile("reviewer")
+        readable_inputs = set(reviewer["data_flow_policy"]["readable_inputs"])
+        self.assertGreaterEqual(
+            readable_inputs,
+            {"social_patrol_report", "social_reply_recommendation", "human_reply_handoff"},
+        )
 
     def test_content_producer_can_still_write_drafts(self):
         registry = AgentProfileRegistry.from_path(REGISTRY_PATH)

@@ -31,6 +31,7 @@
 | **研究自檢** | [source-alignment.md](notes/source-alignment.md) | YC 逐字稿概念對齊與玩具 Demo 陷阱剖析 | `Reviewed` |
 | **研究自檢** | [research-findings.md](notes/research-findings.md) | 5 個真實、具體的外部技術來源與啟發 | `Reviewed` |
 | **研究自檢** | [self-review.md](notes/self-review.md) | 務實自檢、剔除自嗨詞、詳列 3 大殘留風險 | `Reviewed` |
+| **部門模組** | [ai-native-seo-module-v0.md](docs/ai-native-seo-module-v0.md) | AI Native SEO 模組，涵蓋官網/GSC/GA4、社群海巡、回文建議、審核與 OHYA 乾淨接法 | `Drafted` |
 | **整合評估** | [hermes-integration-assessment-v0.md](docs/hermes-integration-assessment-v0.md) | OHYA-only 整合評估，聚焦 `cms-draft-executor` 切片、dirty-row 隔離與下一個 isolated snapshot runner | `In Progress` |
 | **整合切片** | [ohya-cms-draft-executor-slice-v0.md](docs/ohya-cms-draft-executor-slice-v0.md) | OHYA 第一個 profile-level 驗證切片，只接 `cms-draft-executor` 並隔離髒資料 | `In Progress` |
 | **本地 prototype** | [PROTOTYPE.md](PROTOTYPE.md) | 本地可跑 prototype 範圍、命令與邊界 | `In Progress` |
