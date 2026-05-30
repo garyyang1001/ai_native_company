@@ -21,9 +21,11 @@
 
 ---
 
-## 1.1 下一個可自主開發目標
+## 1.1 已完成的自主開發目標
 
 **目標名稱**：OHYA AI Native SEO clean profile scaffold
+
+**狀態**：已完成 2026-05-30；實作位置為 `closed_loop_kernel/ohya_seo_profile_scaffold.py`，測試位置為 `tests/test_ohya_seo_profile_scaffold.py`。
 
 **白話目的**：不要清掉 live OHYA，也不要複製舊 OHYA 髒資料。先在隔離位置做一組乾淨 Hermes profile scaffold，讓 `growth-coordinator`、`social-listener`、`social-reply-advisor` 可以照 `docs/ai-native-seo-module-v0.md` 的合約跑。
 
@@ -53,6 +55,8 @@
 5. `rg` 確認 scaffold output 沒有 credentials / sessions / memories / logs / kanban state。
 
 ---
+
+## 1.2 下一個可自主開發目標
 
 **目標名稱**：OHYA `cms-draft-executor` isolated snapshot runner
 

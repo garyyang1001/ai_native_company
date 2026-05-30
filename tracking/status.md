@@ -6,7 +6,7 @@
 
 ## 1. 核心狀態摘要 (Status Summary)
 
-*   **目前整體狀態**：`ohya-cms-draft-executor-slice-in-progress` (PostgreSQL-backed KernelStore、Python subprocess sandbox、SQL DDL sandbox、HTTP UI approve/reject、Scenario 1/2 demo 仍可重跑；Hermes 整合路線已清理為 OHYA-only profile-level slice，第一個驗證對象是 `cms-draft-executor`；EventReporter 支援 `profile_filter` 與 dirty-row reason；`ohya_demo` 預設不再寫入傳入的 kanban.db；仍非正式生產部署級)
+*   **目前整體狀態**：`ai-native-seo-clean-scaffold-ready` (PostgreSQL-backed KernelStore、Python subprocess sandbox、SQL DDL sandbox、HTTP UI approve/reject、Scenario 1/2 demo 仍可重跑；Hermes 整合路線已清理為 OHYA-only profile-level slice，第一個驗證對象是 `cms-draft-executor`；AI Native SEO 模組與 clean profile scaffold generator 已落地；EventReporter 支援 `profile_filter` 與 dirty-row reason；`ohya_demo` 預設不再寫入傳入的 kanban.db；仍非正式生產部署級)
 *   **最近一次修改時間**：2026-05-30T00:00:00+08:00
 *   **剩餘 Open Issues**：
     *   **Blocker/High**: 0
@@ -36,6 +36,7 @@
 | **整合切片** | [ohya-cms-draft-executor-slice-v0.md](docs/ohya-cms-draft-executor-slice-v0.md) | OHYA 第一個 profile-level 驗證切片，只接 `cms-draft-executor` 並隔離髒資料 | `In Progress` |
 | **本地 prototype** | [PROTOTYPE.md](PROTOTYPE.md) | 本地可跑 prototype 範圍、命令與邊界 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/](closed_loop_kernel/) | PostgreSQL store 與核心 engine 初版 | `In Progress` |
+| **本地 prototype** | [closed_loop_kernel/ohya_seo_profile_scaffold.py](closed_loop_kernel/ohya_seo_profile_scaffold.py) | OHYA AI Native SEO clean profile scaffold 產生器，只輸出隔離 profile 檔，不寫 live HermesRuntime | `Passing` |
 | **本地 prototype** | [closed_loop_kernel/postgres.py](closed_loop_kernel/postgres.py) | PostgreSQL DDL renderer 初版 | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/sandbox.py](closed_loop_kernel/sandbox.py) | Python subprocess sandbox（含 POSIX rlimit / isolated mode / env 隔離 / wall-clock timeout） | `In Progress` |
 | **本地 prototype** | [closed_loop_kernel/sql_sandbox.py](closed_loop_kernel/sql_sandbox.py) | SQL DDL sandbox（`sandbox_runner` role + 動態 `sandbox_temp_*` schema + `SET LOCAL ROLE` 隔離） | `In Progress` |
