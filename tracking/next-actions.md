@@ -23,6 +23,37 @@
 
 ## 1.1 下一個可自主開發目標
 
+**目標名稱**：OHYA AI Native SEO clean profile scaffold
+
+**白話目的**：不要清掉 live OHYA，也不要複製舊 OHYA 髒資料。先在隔離位置做一組乾淨 Hermes profile scaffold，讓 `growth-coordinator`、`social-listener`、`social-reply-advisor` 可以照 `docs/ai-native-seo-module-v0.md` 的合約跑。
+
+**可以自主開發的範圍**：
+
+1. 新增一個本地 scaffold 產生器，例如 `closed_loop_kernel/ohya_seo_profile_scaffold.py`。
+2. 產生到隔離輸出目錄，不寫入 HermesRuntime live profiles。
+3. 從 approved Hermes profile template 複製 model / provider baseline，不另外硬編模型。
+4. 每個 profile 產生乾淨 `SOUL.md` 與 `config.yaml`。
+5. 產出繁中 Markdown 報告，列出 profile 名稱、角色、允許輸出、禁止行為與下一步。
+6. 加測試確認輸出不含 credentials、不含舊 sessions/logs/memories、不含 live kanban state。
+
+**禁止事項**：
+
+1. 不讀 `.env`、credentials、tokens 或 production databases。
+2. 不修改 HermesRuntime live profiles。
+3. 不複製舊 OHYA memories、sessions、logs、cache 或 kanban state。
+4. 不啟動 agent、不發 Telegram / LINE / Email、不接外部 API。
+5. 不讓 `social-reply-advisor` 或 `social-operator` 自動發布或自動回覆。
+
+**完成標準**：
+
+1. `python3 -m unittest discover -s tests` 通過或因缺少 PostgreSQL 正確 skip。
+2. `git diff --check` 通過。
+3. 產出的每個 profile 都能對應 `data/agent-profile-registry-v0.json` 的合法 output type。
+4. 報告中每個技術欄位旁邊都有白話解釋。
+5. `rg` 確認 scaffold output 沒有 credentials / sessions / memories / logs / kanban state。
+
+---
+
 **目標名稱**：OHYA `cms-draft-executor` isolated snapshot runner
 
 **白話目的**：不要直接動 OHYA live runtime。先複製一份 OHYA `kanban.db` 到隔離位置，讓 Gary kernel 在安全快照上跑一次 `cms-draft-executor` 切片，產出 Gary 看得懂的報告。
