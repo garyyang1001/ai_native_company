@@ -26,6 +26,23 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+# 問句 / 請求訊號:命中才送去標記(砍掉確認/閒聊/資料,降量+提升 gold 品質)
+_QUERY_SIGNALS = re.compile(
+    r"[?？]|嗎|呢|請問|想問|請教|有沒有|有無|可以|可不可以|能不能|是不是|是否|"
+    r"怎麼|如何|多少|幾|哪|什麼|要不要|需不需要|"
+    r"報名|候補|名額|還有沒有|還有位|費用|價格|價錢|多錢|行程|出發|成團|"
+    r"想訂|要訂|預訂|取消|改期|退費|退訂|可否"
+)
+
+
+def looks_like_query(text: str) -> bool:
+    """是不是值得標記的「問句或請求」。非問句的確認/閒聊/資料 → False。"""
+    t = normalize(text)
+    if len(t) < 2:
+        return False
+    return bool(_QUERY_SIGNALS.search(t))
+
+
 def is_noise(text: str) -> bool:
     t = normalize(text)
     if not t:

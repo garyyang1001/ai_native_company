@@ -157,6 +157,7 @@ def label_stage(limit_files: int | None = None) -> int:
         ((PIPELINE_VERSION, limit_files) if limit_files else (PIPELINE_VERSION,)),
     ).fetchall()
     units = 0
+    BATCH = 10
     for fid, fname in files:
         _, tdate, tdest = _parse_filename(fname)
         turns = conn.execute(
@@ -164,9 +165,10 @@ def label_stage(limit_files: int | None = None) -> int:
             "JOIN raw_turns rt ON ct.raw_turn_id=rt.id "
             "WHERE rt.source_file_id=%s AND ct.pipeline_version=%s ORDER BY rt.seq",
             (fid, PIPELINE_VERSION)).fetchall()
-        # 配對:每個 customer 非 noise turn → 之後第一個 agent 非 noise turn
-        for i, (cid, role, text, noise, seq) in enumerate(turns):
-            if role != "customer" or noise or not text:
+        # 候選:customer 非 noise 且「像問句/請求」→ 配之後第一個 agent 非 noise 答
+        cands = []  # (cid, text, answer, ans_id)
+        for i, (cid, role, text, noise, _seq) in enumerate(turns):
+            if role != "customer" or noise or not text or not C.looks_like_query(text):
                 continue
             answer, ans_id = None, None
             for cid2, role2, text2, noise2, _s2 in turns[i + 1:]:
@@ -174,28 +176,33 @@ def label_stage(limit_files: int | None = None) -> int:
                     answer, ans_id = text2, cid2
                     break
                 if role2 == "customer" and not noise2:
-                    break  # 客人連發,先不跨過去
-            lab = L.label(text)
-            if lab["is_noise"]:
-                continue
-            chash = _sha(f"{text}||{answer or ''}||{lab['intent']}")
-            quality = round(min(1.0, (lab["confidence"] * 0.6) +
-                                (0.4 if answer and len(answer) > 4 else 0.0)), 3)
-            sids = [cid] + ([ans_id] if ans_id else [])
-            try:
-                cur = conn.execute(
-                    "INSERT INTO knowledge_units (source_file_id, question, answer, intent, "
-                    "confidence, parser_missed, tour_destination, tour_date, quality, "
-                    "source_turn_ids, pipeline_version, label_model, content_hash) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-                    "ON CONFLICT (content_hash) DO NOTHING",
-                    (fid, text, answer, lab["intent"], lab["confidence"], lab["parser_missed"],
-                     tdest, tdate, quality, sids, PIPELINE_VERSION, lab["model"], chash))
-                if cur.rowcount and cur.rowcount > 0:
-                    units += 1
-            except Exception as e:  # noqa: BLE001
-                conn.rollback()
-                continue
+                    break
+            cands.append((cid, text, answer, ans_id))
+        # 批次標記(一次 BATCH 則,大幅降低 gpt-oss 呼叫數)
+        for b in range(0, len(cands), BATCH):
+            chunk = cands[b:b + BATCH]
+            labs = L.batch_label([c[1] for c in chunk])
+            for (cid, text, answer, ans_id), lab in zip(chunk, labs):
+                if lab["is_noise"]:
+                    continue
+                chash = _sha(f"{text}||{answer or ''}||{lab['intent']}")
+                quality = round(min(1.0, (lab["confidence"] * 0.6) +
+                                    (0.4 if answer and len(answer) > 4 else 0.0)), 3)
+                sids = [cid] + ([ans_id] if ans_id else [])
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO knowledge_units (source_file_id, question, answer, intent, "
+                        "confidence, parser_missed, tour_destination, tour_date, quality, "
+                        "source_turn_ids, pipeline_version, label_model, content_hash) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (content_hash) DO NOTHING",
+                        (fid, text, answer, lab["intent"], lab["confidence"], lab["parser_missed"],
+                         tdest, tdate, quality, sids, PIPELINE_VERSION, lab["model"], chash))
+                    if cur.rowcount and cur.rowcount > 0:
+                        units += 1
+                except Exception:  # noqa: BLE001
+                    conn.rollback()
+                    continue
         conn.commit()
     finish_run(conn, run, units)
     conn.close()
