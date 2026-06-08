@@ -26,7 +26,6 @@ def stats() -> None:
     print(f"  silver clean_turns  : {q('SELECT count(*) FROM clean_turns')}")
     print(f"    其中 noise        : {q('SELECT count(*) FROM clean_turns WHERE is_noise')}")
     print(f"  gold knowledge_units: {q('SELECT count(*) FROM knowledge_units')}")
-    print(f"    parser 漏接       : {q('SELECT count(*) FROM knowledge_units WHERE parser_missed')}")
     rows = conn.execute("SELECT intent, count(*) FROM knowledge_units GROUP BY intent ORDER BY 2 DESC").fetchall()
     if rows:
         print("  意圖分布:", {r[0]: r[1] for r in rows})

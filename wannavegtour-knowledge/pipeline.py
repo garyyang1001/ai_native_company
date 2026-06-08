@@ -192,11 +192,11 @@ def label_stage(limit_files: int | None = None) -> int:
                 try:
                     cur = conn.execute(
                         "INSERT INTO knowledge_units (source_file_id, question, answer, intent, "
-                        "confidence, parser_missed, tour_destination, tour_date, quality, "
+                        "confidence, tour_destination, tour_date, quality, "
                         "source_turn_ids, pipeline_version, label_model, content_hash) "
-                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                         "ON CONFLICT (content_hash) DO NOTHING",
-                        (fid, text, answer, lab["intent"], lab["confidence"], lab["parser_missed"],
+                        (fid, text, answer, lab["intent"], lab["confidence"],
                          tdest, tdate, quality, sids, PIPELINE_VERSION, lab["model"], chash))
                     if cur.rowcount and cur.rowcount > 0:
                         units += 1

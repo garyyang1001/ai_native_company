@@ -11,7 +11,8 @@ INTENTS = [
     "availability_check", "historical_lookup", "price_inquiry",
     "itinerary_detail", "booking_action", "complaint", "unclear", "noise",
 ]
-PARSER_KNOWN = {"availability_check", "historical_lookup"}
+# parser_missed / PARSER_KNOWN 已移除:客戶知識庫與 op-assistant(內部 bot)解耦,
+# 只保留 bot 無關的意圖視角。要評估某支 bot 的涵蓋率是另一條獨立工作線。
 
 _SYSTEM = (
     "你是阿玩旅遊客服訊息分類器。輸入一句客人訊息,只輸出一個 JSON 物件,無多餘文字。\n"
@@ -49,7 +50,7 @@ def _coerce(raw: str) -> dict:
 
 
 def label(text: str) -> dict:
-    """回 {intent, is_noise, confidence, parser_missed, model}。失敗退 unclear。"""
+    """回 {intent, is_noise, confidence, model}。失敗退 unclear。"""
     try:
         d = _coerce(_chat(text))
         intent = d.get("intent", "unclear")
@@ -61,9 +62,8 @@ def label(text: str) -> dict:
         conf = float(d.get("confidence", 0.0))
     except Exception as e:  # noqa: BLE001
         intent, is_noise, conf = "unclear", False, 0.0
-    parser_missed = (not is_noise) and intent not in PARSER_KNOWN and intent != "unclear"
     return {"intent": intent, "is_noise": is_noise, "confidence": conf,
-            "parser_missed": parser_missed, "model": LABEL_MODEL}
+            "model": LABEL_MODEL}
 
 
 # ---- 批次標記:一次一個 prompt 標多則,吞吐 ~批量倍 -------------------------
@@ -82,9 +82,8 @@ def _norm(intent, is_noise, conf):
     is_noise = bool(is_noise) or intent == "noise"
     if is_noise:
         intent = "noise"
-    parser_missed = (not is_noise) and intent not in PARSER_KNOWN and intent != "unclear"
     return {"intent": intent, "is_noise": is_noise, "confidence": float(conf or 0.0),
-            "parser_missed": parser_missed, "model": LABEL_MODEL}
+            "model": LABEL_MODEL}
 
 
 def batch_label(texts: list[str], timeout: float = 120.0) -> list[dict]:

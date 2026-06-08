@@ -61,7 +61,6 @@ CREATE TABLE IF NOT EXISTS knowledge_units (
     answer          text,                          -- 客服答(已去識別)
     intent          text NOT NULL,                 -- 意圖標籤(對齊 taxonomy)
     confidence      real NOT NULL DEFAULT 0,
-    parser_missed   boolean NOT NULL DEFAULT false,-- 即時 parser 會漏接 → 改進訊號
     tour_destination text,                         -- 從對話/檔名抽的行程資訊
     tour_date       text,
     tour_code       text,
@@ -78,7 +77,6 @@ CREATE TABLE IF NOT EXISTS knowledge_units (
 );
 CREATE INDEX IF NOT EXISTS ku_intent_idx ON knowledge_units(intent, status);
 CREATE INDEX IF NOT EXISTS ku_tour_idx   ON knowledge_units(tour_destination);
-CREATE INDEX IF NOT EXISTS ku_missed_idx ON knowledge_units(parser_missed) WHERE parser_missed;
 
 -- ---------- 維護 / 稽核:每次 pipeline 跑都留帳 ---------------------------
 CREATE TABLE IF NOT EXISTS pipeline_runs (

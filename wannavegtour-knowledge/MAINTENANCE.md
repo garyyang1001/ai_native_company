@@ -123,7 +123,6 @@ bronze 含 PII,備份檔請存本機受限位置,勿上雲。
 ```sql
 SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT 10;   -- 每次跑的帳
 SELECT intent, count(*) FROM knowledge_units GROUP BY intent;     -- 意圖分布
-SELECT count(*) FROM knowledge_units WHERE parser_missed;         -- parser 漏接(改進訊號)
 SELECT avg(redaction_count) FROM clean_turns;                     -- 去識別密度
 ```
 
