@@ -57,6 +57,25 @@ def embed_one(text: str) -> list[float]:
     return embed([text])[0]
 
 
+def embed_resilient(texts: list[str]) -> list:
+    """整批嵌入;失敗先重試一次,再不行逐筆嵌入(壞的回 None,不擋整批)。"""
+    import time
+    try:
+        return embed(texts)
+    except Exception:
+        try:
+            time.sleep(2)
+            return embed(texts)
+        except Exception:
+            out = []
+            for t in texts:
+                try:
+                    out.append(embed_one(t))
+                except Exception:
+                    out.append(None)   # 這筆跳過
+            return out
+
+
 # ---- 檢索文字組裝 ---------------------------------------------------------
 def _retrieval_text(question: str, answer: str | None, intent: str,
                     tour_destination: str | None, tour_date: str | None) -> str:
@@ -101,14 +120,31 @@ def export(batch: int = 32) -> int:
     client = _client()
     _ensure_collection(client)
 
-    done = 0
+    # 續傳:跳過 Qdrant 已有的 point(中斷重跑只補沒進的)
+    existing = set()
+    try:
+        off = None
+        while True:
+            pts, off = client.scroll(collection_name=COLLECTION, limit=10000,
+                                     offset=off, with_payload=False, with_vectors=False)
+            existing.update(int(p.id) for p in pts)
+            if off is None:
+                break
+    except Exception:
+        pass
+    rows = [r for r in rows if int(r[0]) not in existing]
+
+    done = failed = 0
     try:
         for i in range(0, len(rows), batch):
             chunk = rows[i:i + batch]
             texts = [_retrieval_text(r[1], r[2], r[3], r[4], r[5]) for r in chunk]
-            vecs = embed(texts)
+            vecs = embed_resilient(texts)
             points = []
             for r, v in zip(chunk, vecs):
+                if v is None:            # 嵌入失敗的那筆跳過
+                    failed += 1
+                    continue
                 uid, question, answer, intent, dest, tdate, quality = r
                 points.append(PointStruct(
                     id=int(uid),            # 冪等:unit_id 當 point id
@@ -123,13 +159,16 @@ def export(batch: int = 32) -> int:
                         "quality": float(quality),
                     },
                 ))
-            client.upsert(collection_name=COLLECTION, points=points)
-            done += len(points)
-        finish_run(conn, run, done, notes=f"{COLLECTION} @ {QDRANT_URL}")
+            if points:
+                client.upsert(collection_name=COLLECTION, points=points)
+                done += len(points)
+        finish_run(conn, run, done,
+                   notes=f"{COLLECTION} done={done} skipped_existing={len(existing)} failed={failed}")
     except Exception as e:  # noqa: BLE001
         finish_run(conn, run, done, status="failed", notes=f"{type(e).__name__}: {e}")
         conn.close()
         raise
+    print(f"[export] 新增 {done} 筆,跳過已存在 {len(existing)} 筆,嵌入失敗 {failed} 筆")
     conn.close()
     return done
 
