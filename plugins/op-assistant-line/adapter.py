@@ -1333,9 +1333,20 @@ class LineAdapter(BasePlatformAdapter):
             chat_name=chat_id,
         )
 
+        # Hermes renamed MessageType.IMAGE → PHOTO upstream; map LINE types
+        # explicitly so non-text messages don't crash before kernel logging.
+        _line_msg_type_map = {
+            "text": MessageType.TEXT,
+            "image": MessageType.PHOTO,
+            "video": MessageType.VIDEO,
+            "audio": MessageType.AUDIO,
+            "file": MessageType.DOCUMENT,
+            "sticker": MessageType.STICKER,
+            "location": MessageType.LOCATION,
+        }
         event_obj = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT if msg_type == "text" else MessageType.IMAGE,
+            message_type=_line_msg_type_map.get(msg_type, MessageType.TEXT),
             source=source_obj,
             raw_message=event,
             message_id=message_id,
